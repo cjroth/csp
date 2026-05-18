@@ -1,0 +1,6 @@
+vault_id = "v-tofu"
+peers = []
+tier = "full"
+no_tofu = false
+allow_binary = false
+include = ["**"]

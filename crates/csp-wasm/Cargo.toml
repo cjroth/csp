@@ -1,0 +1,32 @@
+[package]
+name = "csp-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WebAssembly bindings for csp-core (reduced thin-node surface — §4, §7)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The SDK is NOT a reimplementation (§16): there is exactly one protocol
+# implementation (csp-core). We depend on it with the merge/odb engine
+# compiled OUT (`default-features = false` → no `full`): object encode/decode,
+# identity/auth, and wire framing only (§4/§7/§13.2 wasm spike).
+[dependencies]
+csp-core = { path = "../csp-core", default-features = false }
+wasm-bindgen = "0.2"
+serde_json.workspace = true
+hex.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
+
+# wasm-opt is run separately when binaryen is available; disable the
+# automatic download so offline / restricted builds work.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false

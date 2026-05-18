@@ -615,12 +615,18 @@ deferred, not a v1 concern.
   than resume authoring under a possibly-live key. Correctness survives a
   violation (strict total order + signatures), but history becomes confusing —
   this protection keeps it clean.
-- **Transport confidentiality.** On untrusted networks, terminate TLS at a
-  fronting proxy holding a CA-trusted certificate, with CSP speaking plaintext
-  behind it; on a trusted/local network plaintext is acceptable. CSP ships no
-  embedded certificate authority. Protocol-level mutual auth and content
-  integrity hold regardless of transport TLS; TLS adds confidentiality and
-  channel binding.
+- **Transport confidentiality.** The default transport is **`wss://`**: a
+  listener serves TLS using a **self-signed certificate it generates and
+  persists** under the never-synced `.context/` (CSP ships **no embedded
+  certificate authority**, so the X.509 layer is *not* the trust boundary).
+  Connectors accept any server certificate at the TLS layer; trust is
+  established by the ed25519 mutual-auth handshake (§10), which binds the
+  channel and enables listener-key pinning. TLS therefore adds confidentiality
+  only — protocol-level mutual auth and content integrity hold regardless.
+  **`--no-tls` / `CTX_NO_TLS`** opts a listener out into plaintext `ws://`,
+  for running behind a fronting proxy that already terminates TLS (optionally
+  with a CA-trusted cert) or on a trusted/local network. Connectors select
+  TLS by URL scheme (`wss://` vs `ws://`).
 - **Integrity.** Every object is verified against its SHA on receipt;
   unverifiable or unauthorized data is dropped.
 
@@ -889,15 +895,24 @@ the protocol can do may be CLI-inaccessible. Command sketch (final names TBD):
 
 - `ctx init` — create a new, empty scoped vault and this node's SSH key
   identity here.
-- `ctx clone <url> [dir]` — bootstrap a new node from an existing vault served
-  by a listening node: authenticate, full catch-up (download the primitive DAG
-  + objects), materialize the working tree, write local identity + config.
+- `ctx clone <url> [into]` — bootstrap a new node from an existing vault
+  served by a listening node: authenticate, full catch-up (download the
+  primitive DAG + objects), materialize the working tree, write local
+  identity + config. **Target directory:** with no `[into]` it creates
+  `./<vault-id>/` (so cloning never silently litters the current folder);
+  `.` clones into the current folder; an explicit path uses that path. It
+  refuses to clobber an existing vault.
 - `ctx watch [--listen [addr]]` — **the primary long-running command.** Open
   the configured vault, watch the scoped tree (debounced auto-commit, with
   self-write suppression per §5.6), connect to its configured peer(s), and run
   the continuous realtime sync loop until stopped. `--listen` additionally
-  accepts inbound peers (acts as a relay/hub). This is the everyday "keep this
-  folder synced" daemon.
+  accepts inbound peers (acts as a relay/hub). Bare `--listen` binds
+  `0.0.0.0:9000` (an unprivileged default — *not* 443, which implies TLS the
+  engine does not originate and is privileged); override with an explicit
+  `addr`, `--port`, or `PORT`. Default transport is `wss://` (§10);
+  `--no-tls` serves plaintext `ws://`. This is the everyday "keep this folder
+  synced" daemon, and it emits operator-visible logging (peer connect /
+  handshake outcome with reason / catch-up / integrate / commit) at `INFO`.
 - `ctx key` — generate / show the node SSH key; print the public key in
   OpenSSH format; use an SSH agent if available.
 - `ctx authorize <pubkey>` / `ctx revoke <pubkey>` — manage `authorized_keys`.
@@ -949,18 +964,22 @@ config file):
   somewhere other than where the process starts — the classic cause of "state
   silently re-initialized on every deploy." Must always resolve to the
   persistent volume, never an ephemeral path.
-- `--no-tls` / `CTX_NO_TLS` — bind a plaintext WebSocket instead of expecting
-  TLS, for running behind a reverse proxy / edge that already terminates TLS
-  (§10).
+- `--no-tls` / `CTX_NO_TLS` — serve a plaintext `ws://` listener instead of
+  the default self-signed `wss://` (§10), for running behind a reverse proxy
+  / edge that already terminates TLS, or on a trusted/local network.
 - `--listen [addr]` / `--port <n>` / `PORT` — listen address/port for a full
-  node (`ctx watch --listen`); managed platforms inject `PORT`.
+  node (`ctx watch --listen`). Bare `--listen` defaults to `0.0.0.0:9000`
+  (unprivileged; deliberately not 443); `--port` / `PORT` (managed platforms
+  inject `PORT`) or an explicit `addr` override it.
+- `--log <level>` / `CTX_LOG` — log level / filter. Default surfaces
+  operator-visible `INFO` (connections, handshake outcomes, catch-up,
+  integrate, commits); `csp_core=debug` for protocol detail.
 - `--authorized-keys <keys|file>` / `CTX_AUTHORIZED_KEYS` — public keys
   (newline- or comma-separated, or a file path) merged into this node's
   **local** `authorized_keys` (`.context/authorized_keys`, never synced — §10)
   on startup, idempotently. The supported way to pre-seed trust on a fresh
   hosted listener so the TOFU window never opens (§10).
 - `--no-tofu` / `CTX_NO_TOFU` — disable trust-on-first-use entirely (§10).
-- `--log <level>` / `CTX_LOG` — log level / filter.
 - **General rule:** every config-file key has *both* a `--flag` and a `CTX_*`
   env var. This three-way parity is a requirement, not a coincidence — no
   deployment knob is env-only or flag-only.

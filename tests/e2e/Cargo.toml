@@ -1,0 +1,68 @@
+[package]
+name = "csp-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+csp-core = { path = "../../crates/csp-core" }
+tokio = { workspace = true }
+anyhow.workspace = true
+tempfile.workspace = true
+serde_json.workspace = true
+
+[[test]]
+name = "two_peer_sync"
+path = "tests/two_peer_sync.rs"
+
+[[test]]
+name = "concurrent_merge"
+path = "tests/concurrent_merge.rs"
+
+[[test]]
+name = "offline_reconnect"
+path = "tests/offline_reconnect.rs"
+
+[[test]]
+name = "relay_mesh"
+path = "tests/relay_mesh.rs"
+
+[[test]]
+name = "same_nodeid"
+path = "tests/same_nodeid.rs"
+
+[[test]]
+name = "unauthorized_relay"
+path = "tests/unauthorized_relay.rs"
+
+[[test]]
+name = "snapshot_restore"
+path = "tests/snapshot_restore.rs"
+
+[[test]]
+name = "tofu_bootstrap"
+path = "tests/tofu_bootstrap.rs"
+
+[[test]]
+name = "cli_surface"
+path = "tests/cli_surface.rs"
+
+[[test]]
+name = "scope_filtering"
+path = "tests/scope_filtering.rs"
+
+[[test]]
+name = "git_coherence"
+path = "tests/git_coherence.rs"
+
+[[test]]
+name = "clone_sync"
+path = "tests/clone_sync.rs"
+
+[[test]]
+name = "tls_default"
+path = "tests/tls_default.rs"

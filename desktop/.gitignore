@@ -1,0 +1,14 @@
+node_modules
+dist
+*.log
+
+# Rust build artifacts (engine crate + Tauri binary)
+target
+engine/target
+src-tauri/target
+
+# Tauri generated schemas/permissions
+src-tauri/gen
+
+# Bun
+.bun

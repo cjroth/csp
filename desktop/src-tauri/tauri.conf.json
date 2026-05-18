@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Context Desktop",
+  "version": "0.1.0",
+  "identifier": "com.cjroth.context-desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "bun run dev:web",
+    "beforeBuildCommand": "bun run build:web"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Context Desktop",
+        "width": 1080,
+        "height": 740,
+        "minWidth": 820,
+        "minHeight": 560,
+        "resizable": true,
+        "decorations": true,
+        "alwaysOnTop": false,
+        "center": true,
+        "visible": true,
+        "fullscreen": false
+      }
+    ],
+    "trayIcon": {
+      "id": "main-tray",
+      "iconPath": "icons/tray-template.png",
+      "iconAsTemplate": true,
+      "menuOnLeftClick": true,
+      "tooltip": "Context Desktop"
+    },
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}

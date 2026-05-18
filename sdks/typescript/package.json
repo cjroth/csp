@@ -1,0 +1,39 @@
+{
+  "name": "@csp/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK seam for the Context Sync Protocol. Types + helpers + an in-memory mock; the real csp-wasm bindings land here later behind the same API (CSP spec.md §16).",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "module": "./src/web-init.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./web-init": {
+      "types": "./src/web-init.ts",
+      "default": "./src/web-init.ts"
+    }
+  },
+  "files": ["src", "README.md"],
+  "scripts": {
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "lint": "biome check src test",
+    "lint:fix": "biome check --write src test",
+    "format": "biome format --write src test",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/bun": "^1.1.13",
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "bun": ">=1.1",
+    "node": ">=18"
+  }
+}

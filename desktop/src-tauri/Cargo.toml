@@ -1,0 +1,41 @@
+# Standalone crate (own [workspace]) — keeps Tauri's heavy, platform-specific
+# dep tree (wry/tao/webkit2gtk on Linux, objc2 on macOS) out of the repo-root
+# Cargo workspace that builds the core protocol crates.
+#
+# NOTE: on Linux this crate links `webkit2gtk-4.1`/`libsoup` via the `tauri`
+# sys-crates; `cargo check` here needs those system libs. The dev box does
+# not have them and macOS is the v1 target, so native build/run is verified
+# on macOS. The engine logic itself lives in the sibling `engine` crate,
+# which `cargo check`s cleanly on Linux without webkit.
+[workspace]
+
+[package]
+name = "context-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Context Desktop — Tauri v2 shell over the CSP engine"
+
+[lib]
+name = "context_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+context-desktop-engine = { path = "../engine" }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-clipboard-manager = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

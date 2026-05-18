@@ -1,0 +1,12 @@
+{
+  "vault_id": "v-tofu",
+  "counter": 0,
+  "observed": 1,
+  "known": [
+    "b99962d8460a0cceee26cd06ee2b6e239048d2f1"
+  ],
+  "materialized": {
+    "seed.md": "4f2fced2e72d70cdaf695d9ba317a33120060e19"
+  },
+  "snapshots": {}
+}

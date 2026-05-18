@@ -1,0 +1,27 @@
+# Standalone crate — its own [workspace] detaches it from the repo-root
+# Cargo workspace so the heavy Tauri/platform dep tree never touches the
+# core protocol build. This crate has NO `tauri` dependency, so it
+# `cargo check`s on a plain Linux box (no webkit2gtk needed).
+#
+# This is the seam where the real `csp-core` engine plugs in later:
+# add a `native` module implementing `Engine` over `csp-core` and select
+# it instead of `StubEngine`. The trait IS the spec §13 embedding contract.
+[workspace]
+
+[package]
+name = "context-desktop-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Stubbed CSP engine (embedding contract) for Context Desktop"
+
+[lib]
+name = "context_desktop_engine"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde", "clock"] }

@@ -1,0 +1,196 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@fontsource-variable/inter";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/600.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ---- Light (kept sane, but the app runs dark) ---- */
+:root {
+  --radius: 0.75rem;
+  --background: oklch(0.99 0.002 264);
+  --foreground: oklch(0.21 0.013 264);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.21 0.013 264);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.21 0.013 264);
+  --primary: oklch(0.55 0.2 277);
+  --primary-foreground: oklch(0.99 0.01 277);
+  --secondary: oklch(0.96 0.004 264);
+  --secondary-foreground: oklch(0.27 0.013 264);
+  --muted: oklch(0.965 0.004 264);
+  --muted-foreground: oklch(0.53 0.012 264);
+  --accent: oklch(0.95 0.01 277);
+  --accent-foreground: oklch(0.27 0.013 264);
+  --destructive: oklch(0.58 0.22 17);
+  --border: oklch(0.91 0.005 264);
+  --input: oklch(0.89 0.005 264);
+  --ring: oklch(0.55 0.2 277 / 50%);
+  --chart-1: oklch(0.55 0.2 277);
+  --chart-2: oklch(0.6 0.13 200);
+  --chart-3: oklch(0.65 0.16 145);
+  --chart-4: oklch(0.7 0.16 70);
+  --chart-5: oklch(0.6 0.22 17);
+  --sidebar: oklch(0.975 0.003 264);
+  --sidebar-foreground: oklch(0.21 0.013 264);
+  --sidebar-primary: oklch(0.55 0.2 277);
+  --sidebar-primary-foreground: oklch(0.99 0.01 277);
+  --sidebar-accent: oklch(0.95 0.01 277);
+  --sidebar-accent-foreground: oklch(0.27 0.013 264);
+  --sidebar-border: oklch(0.91 0.005 264);
+  --sidebar-ring: oklch(0.55 0.2 277 / 50%);
+}
+
+/* ---- Dark (the real experience) ---- */
+.dark {
+  --background: oklch(0.165 0.012 264);
+  --foreground: oklch(0.965 0.004 264);
+  --card: oklch(0.202 0.013 264);
+  --card-foreground: oklch(0.965 0.004 264);
+  --popover: oklch(0.224 0.014 264);
+  --popover-foreground: oklch(0.965 0.004 264);
+  --primary: oklch(0.655 0.19 277);
+  --primary-foreground: oklch(0.99 0.012 277);
+  --secondary: oklch(0.255 0.013 264);
+  --secondary-foreground: oklch(0.965 0.004 264);
+  --muted: oklch(0.238 0.012 264);
+  --muted-foreground: oklch(0.715 0.013 264);
+  --accent: oklch(0.285 0.018 277);
+  --accent-foreground: oklch(0.975 0.004 264);
+  --destructive: oklch(0.635 0.21 18);
+  --border: oklch(1 0 0 / 9%);
+  --input: oklch(1 0 0 / 13%);
+  --ring: oklch(0.655 0.19 277 / 65%);
+  --chart-1: oklch(0.655 0.19 277);
+  --chart-2: oklch(0.7 0.13 215);
+  --chart-3: oklch(0.72 0.16 150);
+  --chart-4: oklch(0.78 0.15 75);
+  --chart-5: oklch(0.66 0.21 18);
+  --sidebar: oklch(0.152 0.012 264);
+  --sidebar-foreground: oklch(0.92 0.005 264);
+  --sidebar-primary: oklch(0.655 0.19 277);
+  --sidebar-primary-foreground: oklch(0.99 0.012 277);
+  --sidebar-accent: oklch(0.255 0.016 277);
+  --sidebar-accent-foreground: oklch(0.975 0.004 264);
+  --sidebar-border: oklch(1 0 0 / 7%);
+  --sidebar-ring: oklch(0.655 0.19 277 / 60%);
+}
+
+@theme inline {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    overflow: hidden;
+    font-synthesis-weight: none;
+    text-rendering: optimizeLegibility;
+    /* Layered depth: faint accent glows over the deep base. */
+    background-image:
+      radial-gradient(
+        58rem 38rem at 12% -8%,
+        oklch(0.655 0.19 277 / 0.1),
+        transparent 60%
+      ),
+      radial-gradient(
+        46rem 34rem at 108% 4%,
+        oklch(0.7 0.13 215 / 0.08),
+        transparent 55%
+      );
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    background: oklch(0.655 0.19 277 / 0.35);
+  }
+
+  /* Slim, unobtrusive scrollbars (OrbStack/Linear feel). */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: oklch(1 0 0 / 0.14) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: oklch(1 0 0 / 0.12);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: oklch(1 0 0 / 0.22);
+    background-clip: content-box;
+  }
+}
+
+@layer components {
+  /* Frosted elevated surface used by cards/panels. */
+  .surface {
+    @apply rounded-xl border bg-card/70 backdrop-blur-xl;
+    box-shadow:
+      0 1px 0 0 oklch(1 0 0 / 0.04) inset,
+      0 1px 2px 0 oklch(0 0 0 / 0.3),
+      0 8px 24px -12px oklch(0 0 0 / 0.5);
+  }
+  .surface-hover {
+    @apply transition-all duration-200;
+  }
+  .surface-hover:hover {
+    @apply border-primary/30 bg-card/90;
+    box-shadow:
+      0 1px 0 0 oklch(1 0 0 / 0.05) inset,
+      0 2px 4px 0 oklch(0 0 0 / 0.3),
+      0 16px 40px -16px oklch(0.655 0.19 277 / 0.35);
+  }
+  .text-balance {
+    text-wrap: balance;
+  }
+}

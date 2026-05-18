@@ -1,0 +1,59 @@
+[package]
+name = "csp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Context Sync Protocol engine: deterministic fold, object store, sync state machine"
+
+# The merge/fold engine + on-disk odb are behind `full`, enabled for the
+# native/full-node profile and compiled OUT of the wasm/thin profile (§4,
+# §7, §16). The reduced surface (object codec, identity/auth, wire framing,
+# thin |F|=1 wrapper, frontier math) is always available.
+[features]
+default = ["full"]
+full = []
+
+# Wasm-safe deps only. Anything pulling tokio sockets / OS fs / native crypto
+# RNG must be behind the cfg(not(target_arch = "wasm32")) block below so the
+# wasm32 build of the reduced surface (§4, §7) stays buildable.
+[dependencies]
+sha1.workspace = true
+flate2.workspace = true
+ed25519-dalek.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_bytes.workspace = true
+rmp-serde.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+base64.workspace = true
+similar.workspace = true
+regex.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rand_core.workspace = true
+rand.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+notify.workspace = true
+walkdir.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+fs2.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+rcgen.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile.workspace = true
+rand.workspace = true
+rand_core.workspace = true
