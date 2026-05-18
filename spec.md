@@ -1,0 +1,1002 @@
+# Context Sync Protocol (CSP) — Design Specification
+
+> Status: draft / greenfield design. Nothing here is implemented yet.
+> This document supersedes any earlier draft.
+> The reference implementation ships as a single CLI, `ctx`.
+
+---
+
+## 1. Summary
+
+CSP keeps a designated set of files **byte-identical across many devices**, in
+near real time, while every full participant retains a complete, **stock-git-
+compatible** history with fully local point-in-time recovery.
+
+Files live on the real filesystem as ordinary files, so any program reads and
+writes them directly with no adapter or special client. The history is a real,
+stock-git-compatible repository — but CSP **never plants a `.git` at the scope
+root** (so it can coexist with a user's own git repo in the same project). The
+repository lives at `<scope>/.context/git/` with a decoupled worktree; `ctx git …`
+runs unmodified git against it **read-only** for inspection (the repo is
+engine-owned; §4, §17), and every full node sees the *same* history.
+
+There is **no central server**. Every node runs the same engine; any node may
+accept connections and relay. Nodes are symmetric peers.
+
+Concurrent edits are merged with **real git three-way merge**: edits to
+different regions of a file both survive; a true overlapping conflict is
+resolved automatically and deterministically (never with conflict markers,
+never by a human). Simultaneous co-editing of the *same region* of one file is
+not a supported workflow — one side deterministically wins (and the other
+remains in history).
+
+---
+
+## 2. Goals
+
+1. **Files on disk.** Synced data is materialized as plain files at natural
+   paths. Any tool reads/edits them without going through CSP.
+2. **Near-real-time propagation.** While connected, a change reaches other
+   connected devices well under a second. No polling.
+3. **Stock-git-compatible history, everywhere.** A full node holds a real
+   `.git`. `git log`/`checkout` work with unmodified git and show identical
+   history on every full node. Point-in-time recovery is fully local.
+4. **Decentralized & symmetric.** No privileged server. Any node may listen and
+   relay. Topology is arbitrary.
+5. **Automatic, deterministic merge.** Real 3-way merge; non-overlapping
+   concurrent edits both survive; overlaps auto-resolved by a fixed total
+   order. No markers, no human resolution.
+6. **Compact history.** Storing N edits costs ≈ the N distinct contents
+   (content-addressed git objects), not N tree copies.
+7. **Coexists in a shared directory.** CSP manages an explicit subtree;
+   never touches anything outside its scope.
+8. **One engine, everywhere.** Pure-Rust core compiled to a single wasm module
+   shared by all clients; thin TypeScript only for host file I/O, transport
+   plumbing, and UI.
+
+## 3. Non-goals
+
+- Simultaneous co-editing of the same region of one file (one side wins
+  deterministically; the loser stays in history but not in the working tree).
+- Conflict markers or any human conflict-resolution step.
+- Git’s network protocols (smart HTTP/SSH), refs negotiation, or pull/poll
+  workflow — replaced entirely by the realtime transport (§6).
+- Being a developer VCS workflow tool (branching/PR/rebase UX). Git here is a
+  storage + merge + history *substrate*, exercised programmatically.
+
+---
+
+## 4. Engine
+
+- **`gitoxide` (`gix`)**, pure Rust, is the only git engine. Native nodes and
+  the wasm module share one codebase. No `git` binary dependency. Not
+  isomorphic-git (JS), not libgit2 (C; will not wasm).
+- **On-disk format is real, stock-git-compatible — but not at `.git`.** Object
+  encoding, repository layout (`objects/`, `refs/`, `HEAD`, `config`, packs),
+  and refs are exactly what unmodified git expects, but the git directory is
+  `<scope>/.context/git/` with a decoupled worktree (`GIT_DIR=<scope>/.context/git`,
+  `GIT_WORK_TREE=<scope>`) — **never a `.git` at the scope root**. This is what
+  lets CSP coexist with a user's own git repo in the same project (§11). It is
+  still genuine stock git for *reading*: `ctx git <args>` is a **read-only**
+  passthrough (§17). The repository is **engine-owned** — `refs/heads/main`,
+  `refs/heads/node/*`, `refs/tags/snap/*` are engine-managed; CSP force-
+  recomputes `main`, owns the refs, and GCs. **Out-of-band writes via raw
+  `GIT_DIR=… git …` are unsupported and will be clobbered without warning.**
+- **Hash: SHA-1 (sha1dc).** Chosen for maximum compatibility with stock git,
+  hosts, and tooling. Git’s hashing is *not* CSP’s security boundary (that is
+  node-key auth + transport content verification, §10), so SHA-1’s weakness is
+  not load-bearing here. **v1 is SHA-1, period;** SHA-256 is explicitly out of
+  scope for v1 (a different hash = a different repository — no in-place
+  migration) and revisited post-v1 only if ecosystem support warrants.
+- **The merge engine is native/full-node only.** Per §7, thin/wasm nodes do
+  not compute the merge — so the wasm build needs only object encode/decode,
+  the sync state machine, auth, and framing; **not** diff / 3-way merge, and
+  not the on-disk odb/packfiles (native, full-node only). This makes the
+  gitoxide-in-wasm question low-stakes: the wasm surface is small and the merge
+  (the part most at risk) never runs there. Validating that reduced wasm
+  surface is still an explicit pre-build spike (§13), not an assumption.
+
+---
+
+## 5. History model
+
+### 5.1 Identity, signing, and the strict total order
+
+- Each node has a stable **NodeId** derived from an ed25519 keypair (the same
+  key used for transport auth and authorization, §10).
+- Each node keeps a monotonic **logical counter** (u64): a new local commit's
+  counter = `max(every counter the node has observed) + 1`. The counter is
+  **durably persisted in `.context/state`** and survives restart.
+- **Strict total order** on commits: `(counter, NodeId, commitSHA)` — compare
+  counter, then NodeId bytewise, then commit SHA bytewise. The SHA tiebreaker
+  makes this a *true total order with no ties ever* — even if two replicas
+  share a NodeId and independently choose the same counter. It is the sole
+  basis for fold order and conflict tiebreak; never wall-clock dependent.
+- **Every primitive commit is signed** by its author's NodeId key (§5.2); the
+  signature is part of the authored-once object. Synthetic fold commits (§5.3)
+  are **unsigned** — derived and verified by recomputation, not authored.
+- **Single-writer-per-vault (operational invariant, not a correctness
+  precondition).** A NodeId SHOULD be an active writer in at most one replica
+  of a given vault at a time. Reusing one key across *different* vaults is
+  fine; the hazard is the *same key actively writing two replicas of the same
+  vault* (same-NodeId concurrent primitives, possibly equal counter).
+  Correctness does **not** depend on this — the SHA tiebreaker keeps the order
+  total and signed primitives keep authorship sound — but such history is
+  semantically confusing, so the counter is durably persisted and `ctx clone`
+  / restore MUST fork a fresh NodeId or warn rather than silently resume
+  authoring under a key that may be live elsewhere.
+
+### 5.2 Primitive commits and synthetic fold commits
+
+Two object kinds: **primitive commits** (a node's own authored, *signed* edit)
+and **synthetic fold commits** (derived, *unsigned*, deterministic — §5.3).
+`refs/heads/main` is always a synthetic fold commit.
+
+**Primitive commit** — a node's own change.
+
+- Genesis `M₀` is a deterministic root synthetic fold commit over the empty
+  tree (no parents, fixed identity §5.4); globally identical SHA.
+- A primitive's git **parent is the synthetic fold commit the author held**
+  when authoring — a real commit object, **not** the node's own previous
+  primitive. Its tree is the new in-scope working tree.
+- It is **signed by the author's NodeId key** and authored exactly once;
+  replicated **verbatim** (the signature is in the object, so the SHA is
+  stable). Carries author identity + wall-clock time + `(counter, NodeId)`
+  trailer (order §5.1; PITR §8).
+- Successive edits each branch from the latest synthetic fold commit the node
+  holds — **no private linear lineage off a node's own previous primitive**.
+  (On an offline thin node that fold commit is the trivial `|F|=1`
+  self-wrapper over its own previous tip — §7 — keeping its run linear.)
+
+**Synthetic fold commit** — converged state, a first-class history object.
+
+- Built by §5.3. A real git commit (deterministic identity/time §5.4),
+  **always distinct, never collapsed to a primitive**. The *final* synthetic
+  fold commit of the fold is `refs/heads/main`.
+- **The fold-chain structurally encodes the frontier.** Its parents are
+  `[previous synthetic fold commit, next tip]` (§5.3); the primitive tips it
+  folded are exactly those reachable through the chain and not below an earlier
+  fold commit. The input set is recoverable from the graph — not from any
+  trailer.
+- **Replicated as ordinary reachable objects, verifiable not trusted.** A
+  primitive's parent is a synthetic fold commit; a dangling parent is an
+  invalid git DAG; reachable-object replication therefore carries the parent
+  fold commit → its parents → … → `M₀`. Any received fold commit is checked by
+  recomputing the fold over *its own* parent list and asserting the SHA
+  matches (recursively to primitives/`M₀`; §5.4 determinism makes this exact).
+  A node recomputes only the **current** `main`; received historical fold
+  commits are objects it may verify but need not recompute.
+- `git log main` is identical on every node holding the same primitive set.
+
+### 5.3 The deterministic fold (the central algorithm)
+
+> The single most important algorithm in CSP. Get the per-step **merge base**
+> and **fold order** exactly right → real 3-way merge (disjoint concurrent
+> edits both survive) *and* byte-determinism; get them wrong → either add/add
+> LWW (feature gutted) or divergence. Headline gate, §13.2.
+
+**Frontier.** Over the node's known primitives, the frontier is the set not an
+ancestor of any other known primitive (the un-merged tips), computed over the
+*complete* DAG — complete because every parent fold commit is itself a
+replicated reachable object (§5.2/§6.3), so no ancestry query hits a dangling
+parent.
+
+**Binary left-fold into synthetic fold commits.** `main` is a chain of real
+deterministic commits, **not** a flat octopus:
+
+1. Sort the frontier tips by the strict total order `(counter, NodeId, SHA)`
+   (§5.1).
+2. `acc₀` = the lowest-ordered tip (a real commit).
+3. For each next tip `Tₖ` in order:
+   - `base = git-merge-base(accₖ₋₁, Tₖ)` over the real DAG — well-defined
+     because `accₖ₋₁` is a real commit whose ancestry bottoms out at fold
+     commits / `M₀` (no synthetic-acc hand-waving: every step's base is the
+     graph merge-base of two real objects).
+   - `tree = 3way-merge(base.tree, accₖ₋₁.tree, Tₖ.tree)`: disjoint regions
+     both survive; an overlapping hunk resolves to the operand later in the
+     strict order; **no conflict markers ever**; binary / non-mergeable files
+     fall back to whole-file total-order selection.
+   - `accₖ` = a **synthetic fold commit**: that `tree`, parents
+     `[accₖ₋₁, Tₖ]` (canonical), byte-pinned identity (§5.4) ⇒ deterministic
+     SHA.
+4. `main` = the final `accₙ`. Degenerate cases: `|F|=0` → `M₀`; `|F|=1` → one
+   synthetic fold commit `(tree = the tip's tree, parent = [tip])` — the
+   trivial self-wrapper, **not a 3-way merge** (no merge-base, no diff3;
+   thin-node safe, §7). Update `refs/heads/main`; materialize (§5.6).
+
+Every intermediate `accₖ` is a real, persisted, content-addressed,
+deterministic, **verifiable** object (reproducible by recomputing the fold
+over its own parent list; replicated like any reachable object). A node with
+only a subset computes an earlier but still deterministic `main` and converges
+on catch-up; it never recomputes historical fold commits.
+
+Determinism rests on four **co-equal, hard** requirements (§5.4): (i) the DAG
+is complete (every parent fold commit replicated → no dangling parent);
+(ii) per-step base = `git-merge-base(accₖ₋₁, Tₖ)` over the real graph, never
+per-node "last converged" state; (iii) the strict total order fixes both fold
+order and conflict tiebreak with no ties; (iv) the fold commit object is
+byte-pinned. **Order-only associativity must hold:** the result must depend on
+nothing but the DAG and the strict order — the §13.2 reference fold must
+property-test exactly that.
+
+### 5.4 HARD INVARIANT — byte-deterministic synthetic fold commits
+
+Stock-git compatibility *requires* `main` (and every synthetic fold commit) to
+converge to one SHA everywhere given the same primitive set. Each synthetic
+fold commit object is **byte-for-byte pinned**:
+
+- **tree** — the §5.3 fold result, deterministic;
+- **parents** — `[accₖ₋₁, Tₖ]` (the binary left-fold; `M₀`: none; `|F|=1`
+  wrapper: `[tip]`), exact, canonical;
+- **author & committer** — a fixed constant identity (`csp <csp@localhost>`),
+  never the local node;
+- **author & committer time** — `max(committer time of all parents)`; because
+  `accₖ₋₁` is always a parent, this is **monotone non-decreasing along the
+  spine** (so `git log` / `--since` over `main` are sound under author skew;
+  primitive author-time skew only affects time-restore §8);
+- **message & encoding** — fixed template, fixed bytes;
+- **unsigned** — only *primitives* are signed (§5.1/§5.2). A signature on a
+  fold commit would be node-local non-determinism; fold commits must be
+  reproducible byte-identically by any node.
+
+Any leak of local/non-deterministic state silently re-diverges every node.
+The invariant has **four co-equal, hard parts** — all must hold, and the
+§13.2 conformance suite (CI-blocking) must exercise all four:
+
+1. **Complete DAG** — every parent fold commit is a real replicated object
+   (§5.2/§6.3); no dangling parent, ever.
+2. **Deterministic per-step base** — `git-merge-base(accₖ₋₁, Tₖ)` over the
+   real graph; never per-node "last converged" state.
+3. **Strict total order** — `(counter, NodeId, SHA)` fixes fold order *and*
+   conflict tiebreak with no ties (incl. same-NodeId concurrency, §5.1).
+   3-way merge is non-associative, so this is load-bearing, not an
+   optimization.
+4. **Byte-pinned fold commit object** — the field list above.
+
+### 5.5 Refs summary
+
+- **Primitive commits** — replicated, content-addressed, authored-once,
+  **signed** objects (§5.1/§5.2), each parented on a synthetic fold commit —
+  not a private lineage. `refs/heads/node/<NodeId>` MAY point at a node's
+  latest primitive for discovery / `git log --all`.
+- **`refs/heads/main`** — the **final synthetic fold commit** of the §5.3
+  binary left-fold; recomputed locally; identical SHA on every node with the
+  same primitive set; inspected read-only via `ctx git log`/`show`/`diff`
+  (§17). Restore is `ctx restore`, never `git checkout`.
+- Intermediate synthetic fold commits are history objects reachable through
+  the fold-chain spine from `main` (GC-safe — §9.2).
+- `refs/tags/snap/<name>` — named snapshots (§8), deterministic commits.
+
+### 5.6 Materialization vs. user edits — no feedback loop
+
+CSP both **writes** the working tree (materialize, §5.3 step 5) and **watches**
+it for user edits (`ctx watch`, §17). Without an explicit rule these feed back:
+every received merge → watcher fires → spurious primitive commit → re-fold →
+unbounded churn. This is the single most common file-sync bug class; it is
+specified here, not left to implementers.
+
+**Reconcile by content, never by intercepting writes.**
+
+- For every in-scope path CSP records the **content hash it last
+  materialized** (the hash from the current `main` tree), persisted in
+  `.context/state`. This is the authoritative "what CSP put there" record.
+- An FS event alone never creates a commit. On each debounced settle CSP
+  rescans in-scope paths and compares each file's current content hash to its
+  last-materialized hash:
+  - **equal** → CSP's own write (or a no-op touch) → ignore; no commit.
+  - **different** → genuine user edit → include in the next primitive commit,
+    then update the last-materialized record.
+- Materialization writes are **atomic** (temp + rename): readers never see a
+  torn file and the watcher sees one event per path.
+
+Because a self-write's resulting hash equals what CSP just recorded, self-
+writes are inherently non-events — no fragile path/timestamp suppression, and
+it is race-tolerant.
+
+**The genuine race — user edits a file while CSP is materializing it.**
+
+- The filesystem is the source of truth for "what the user currently has."
+  After settle, the hash compare runs as above; an edit made during
+  materialization has on-disk hash ≠ materialized hash → correctly taken as a
+  user edit and committed **parented on the just-applied `main`**, then folded
+  in by §5.3 against the proper DAG base. The guarantee is exactly §12's, no
+  stronger: a disjoint region survives; a *same-region* collision with a
+  concurrent remote change is resolved deterministically by the strict total
+  order — the losing side (possibly the user's deferred edit) is **not in the
+  working tree but is durably in history and recoverable**. It is *not* "no
+  edit is ever lost"; it is "no *silent* loss — deterministic resolution, loser
+  retained in history."
+- Materialization **MUST NOT clobber a contended path**: if a path's on-disk
+  hash differs from its last-materialized hash (a pending user edit) *and*
+  the new `main` wants yet different content, CSP **defers** that path —
+  leaves the user's bytes, lets them become a primitive commit, and
+  re-materializes from the next `main`. Disjoint files materialize normally;
+  only the contended path defers.
+
+---
+
+## 6. Replication protocol
+
+### 6.1 Topology
+
+A **full** node — run via the `ctx` CLI — may enter **listen mode**
+(`ctx watch --listen`), accepting inbound connections and **relaying** objects
+between its peers (only full nodes may listen — §7). A listener is an ordinary
+full peer with good connectivity — **not** a merge authority and owning no
+canonical state: every full node derives the *identical* deterministic `main`,
+so no listener is privileged. Because object integration is idempotent and the
+merge deterministic, any topology (star, mesh, chain, gossip) converges to the
+same `main`.
+
+**Relays confer no trust.** A relay forwards objects but its having forwarded
+them grants them nothing. Authorization is **per primitive author, not per
+connection** (§10): a receiver accepts a primitive only if (a) its author
+signature verifies and (b) the author NodeId key is in the *receiver's own*
+local authorized set — regardless of which peer relayed it. So `A` trusting
+`B`, and `B` trusting `C`, does **not** make `A` accept `C`-authored content
+relayed via `B`; content does not gain trust transitively. Synthetic fold
+commits are unsigned and instead admitted only if they recompute-verify
+(§5.2) from already-accepted primitives.
+
+### 6.2 Transport
+
+A persistent, reliable, ordered, message-oriented, bidirectional channel
+(WebSocket). Binary length-delimited frames. Fully symmetric. **Git’s smart
+protocol is not used. There is no polling.**
+
+### 6.3 What is replicated
+
+**Primitive commits and every object reachable from them.** A primitive's
+parent is a synthetic fold commit (§5.2), so reachable-object replication
+carries that fold commit, its parents, transitively to `M₀`: synthetic fold
+commits **are** transmitted as ordinary reachable git objects (a dangling
+parent is an invalid DAG). They are **verified, not trusted** — each
+recompute-verifies from its own parent list (§5.2). Primitive commits are
+**accepted only if the author signature verifies and the author key is in the
+receiver's local authorized set** (§6.1/§10), independent of the relaying
+peer; unauthorized or unverifiable objects are dropped and not forwarded. A
+node recomputes only the **current** `main`; a **thin** node recomputes none —
+after catch-up it receives the current merged tree from a full node (§7).
+Snapshots (§8) replicate as small records.
+
+### 6.4 Catch-up
+
+Catch-up is **frontier-set anti-entropy**, not a scalar version vector. On
+connect each side advertises a compact **digest of its current frontier**
+(the set of un-merged primitive tip SHAs — small: one per concurrent
+lineage). Each side requests the tip SHAs it lacks, then pulls each tip's
+reachable closure (which backfills its parent fold commits → `M₀`); objects
+are content-addressed, deduplicated, idempotent, hash-verified, and
+authorized per-author (§6.3). Then both sides recompute `main` and
+materialize.
+
+A scalar per-NodeId version vector is **unsound as the correctness
+mechanism** under arbitrary gossip/mesh topology and same-NodeId concurrency
+(§5.1): a high-water counter cannot express "missing a below-high-water
+concurrent sibling," and a frontier tip is no one's parent so SHA-reachability
+never requests it. The protocol therefore reconciles the *frontier set
+directly* (SHA-exact, topology- and author-behaviour-agnostic). A version
+vector MAY still be exchanged as an *optimization hint* to skip the common
+fast path, but it is never the thing correctness depends on.
+
+### 6.5 Live
+
+After catch-up, each new local primitive commit is pushed immediately to all
+connected peers (commit + missing objects). **Full** receivers integrate and
+recompute `main`; **thin** receivers integrate the primitive commit and apply
+the merged tree served by a full peer; both materialize. Relay (full) nodes
+forward onward. On disconnect, a node simply reconnects and re-runs catch-up —
+there is no separate resync path.
+
+### 6.6 Message kinds (sketch)
+
+`Hello`, `AuthChallenge`, `AuthProof`, `FrontierDigest`, `WantTips`,
+`Commits`, `WantObjects`, `Objects`, `Live(signed primitive)`, `Snapshot`,
+`Ping`, `Pong`. (`HaveVV` MAY be sent as an optional fast-path hint — §6.4 —
+but `FrontierDigest`/`WantTips` is the authoritative reconciliation.)
+
+---
+
+## 7. Node tiers
+
+Every node runs the same engine and protocol and is **offline-first regardless
+of tier**: it always has a complete local working copy, reads and writes
+entirely offline, records its own edits locally, and reconciles on reconnect.
+Tier governs only how much *history* a node retains and whether it *computes*
+the merge — never whether it works offline.
+
+- **Full node.** Retains the entire primitive-commit DAG and all objects in a
+  real on-disk `.git`. Runs the gitoxide 3-way merge and computes the
+  deterministic `main` (§5.3). Offers point-in-time recovery, bootstraps
+  others, and is the **only tier that may listen/relay**. Default retention:
+  complete history. Desktop / server / always-on.
+- **Thin node.** Offline-first, but does **not** retain deep history and does
+  **not** run the 3-way merge engine. It holds a full local working copy and
+  appends its own **primitive commits**. **Self-collapse rule:** between
+  reconnects a thin node advances its *own* spine by computing the trivial
+  `|F|=1` **synthetic fold commit** over its own single latest tip (tree = that
+  tip's tree, parent = [tip], deterministic — §5.3). This is **not a 3-way
+  merge** (no merge-base, no diff3, no merge engine, wasm-safe) — it is just a
+  deterministic wrapper — so each subsequent offline edit is parented on the
+  thin node's *own previous fold commit*, keeping its offline run **linear
+  (O(1) frontier contribution)** instead of N concurrent siblings. It still
+  never computes a real (`|F|≥2`) merge. On reconnect it catches up and
+  receives the merged tree from a connected full node; it never computes the
+  multi-tip `main`. Local history bounded by a retention horizon (§9); deep
+  PITR delegated to full nodes. Suitable for storage-constrained / wasm
+  clients (mobile, browser/WebView, editor plugins).
+
+**HARD INVARIANT — listen/relay ⇒ full node.** A node in listen/relay mode MUST
+be a full node: a listener serves the deterministic merged state to thin peers,
+which requires the merge engine and full history. Thin nodes never listen.
+
+**Deployment requirement.** Every deployment MUST contain at least one full
+node (it is where listeners and deep PITR live). A mesh of *only* thin nodes is
+explicitly unsupported and will not converge concurrent edits — by design:
+supporting it would require a second merge implementation that would endanger
+§5.4.
+
+**Still fully offline-first.** No node of any tier can merge changes it has not
+received — convergence inherently requires connectivity for *everyone*. A thin
+node authors and reads entirely offline and converges on reconnect; the only
+things it delegates are *computing* the merge and *retaining* deep history,
+never its ability to work disconnected.
+
+---
+
+## 8. Point-in-time recovery
+
+Every **full node** can recover prior state with no network, because it holds
+every primitive commit (each carrying its author wall-clock time and version
+trailer, §5.2).
+
+- **Restore to time T:** take the *set* of primitive commits with author-time
+  ≤ T and run the deterministic fold (§5.3) over that subset's frontier → the
+  historical tree. (Same algorithm as `main`, just over a time-filtered
+  subset; deterministic for the same reason.)
+- **Restore to a named snapshot:** a snapshot records the **frontier
+  primitive-commit SHA set** at creation plus a label; it replicates as a
+  small record and is materialized as a deterministic commit under
+  `refs/tags/snap/<name>` — inspectable read-only (`ctx git show`/`ls-tree`);
+  to actually restore it use `ctx restore <name>` (never `git checkout`).
+- **Applying a restore** is just editing: the restoring node writes the
+  historical tree into its working files and commits it onto its own primitive
+  lineage. It then propagates and converges through the normal protocol. The
+  pre-restore state remains fully in history and is itself restorable. There is
+  no special “rewind” message and no possibility of divergence.
+
+Time-based restore is *approximate* under author-clock skew (it relies on the
+advisory wall-clock trailer). The logical total order remains authoritative for
+correctness; only the “which moment” selection uses wall time. Snapshots give
+exact, skew-free recovery points.
+
+---
+
+## 9. Storage & compaction
+
+### 9.1 On-disk layout (full node)
+
+```
+<scope-root>/                 # materialized working files (real, what tools read)
+<scope-root>/.context/            # CSP's ENTIRE footprint — one dir; gitignore this
+<scope-root>/.context/git/        #   the real stock-git-compatible repo (GIT_DIR)
+<scope-root>/.context/config          #   scope, peers, listen settings, tier
+<scope-root>/.context/authorized_keys #   admitted peer keys — LOCAL, NOT synced (§10)
+<scope-root>/.context/snapshots       #   named snapshot records
+<scope-root>/.context/state           #   sync/peer state, last-materialized hashes
+<scope-root>/.contextignore           # user exclude file (synced); see §11
+~/.context/id_ed25519             # device identity (default; see §10) — NOT per-vault
+```
+
+There is deliberately **no `.git` at `<scope-root>`** — the git directory is
+`<scope-root>/.context/git/` with the worktree being `<scope-root>` itself. This is
+what lets CSP live in a project that also has its own user-owned git repo
+(§11). CSP's whole on-disk footprint is the single `<scope-root>/.context/`
+directory (plus the synced `.contextignore`).
+
+**Naming principle (two distinct layers).**
+
+- **Protocol / on-disk format → protocol-anchored, frozen.** `.context/`,
+  `.contextignore`, `~/.context/…`, and the merge-commit identity constant
+  (§5.4) are part of the CSP format, written/read identically by *every*
+  implementation (Rust core, wasm/TS SDK, host plugins). The `ctx` CLI is just
+  one front-end and MUST NOT lend its name to the format. Changing any of
+  these is an on-disk format break.
+- **CLI / launcher surface → tool-anchored.** CLI flags, environment
+  variables (`CTX_*`), and the config file are read by the **`ctx` CLI /
+  native launcher only** — the engine (csp-core) does not read process env,
+  the SDK does not, and host plugins use host settings, not `CTX_CWD`. They
+  are configuration of one front-end, exactly parallel to CLI flags (a flag is
+  not "part of the spec"; neither is an env var). Hence the tool-anchored
+  `CTX_` prefix, not `CSP_`. (`PORT` is kept as the platform convention.)
+
+`<scope-root>/.context/` is the default per-vault state directory; a host (e.g. a
+browser/mobile thin node) may override it to use host-provided storage instead.
+The **device identity (private key) is device-global by default** — `~/.context/
+id_ed25519`, or a reused `~/.ssh` key / SSH agent (§10) — *not* stored inside a
+vault's `.context/`: one device may join several vaults with one key, the key must
+survive deleting a vault's `.context/`, and keeping the most sensitive file out of
+the synced subtree minimizes blast radius. Per-vault identity is an opt-in for
+stronger isolation. `.context/` holds only a *reference* to which identity to use,
+never the private key by default.
+
+A working node keeps its identity reference, `config`, the working files, and
+only the objects backing current `main`.
+
+### 9.2 Packing, GC & retention
+
+- **Packing/GC (automatic hygiene, non-negotiable).** Debounced auto-commits
+  create many small loose objects; full nodes auto-pack (gitoxide
+  pack-objects) on a size/count threshold or on idle, and GC unreachable
+  objects. Required maintenance, not a policy choice. **GC-safety:**
+  historical synthetic fold commits and primitives are reachable through the
+  fold-chain spine from `refs/heads/main` (and from snapshot tags), so a
+  correct reachability GC already retains them — an implementer must **not**
+  special-case "prune synthetic fold commits": they are load-bearing history
+  (parent edges of later primitives/folds), not garbage.
+- **Full nodes keep complete history by default** — this *is* the PITR
+  guarantee and the durable archive. An optional configurable retention
+  horizon lets an operator bound disk (collapse pre-horizon primitive history).
+- **Thin nodes are bounded by a retention horizon by default** — recent
+  history + working state kept; deeper history pruned locally and fetched from
+  a full node on demand. This horizon is exactly what lets a phone/plugin be a
+  real offline-first node without unbounded growth.
+- **Snapshots are never pruned by truncation.** Snapshot-reachable states
+  survive any horizon, so named recovery points stay exact and durable even on
+  thin nodes.
+
+Compaction is local and uncoordinated; nodes may run different policies.
+**Deliberately low priority:** at the markdown/text scale CSP targets,
+content-addressed history packs so tightly that growth is a non-issue for a
+long time — the simple defaults above suffice and the thin-node horizon is a
+safety valve, not an aggressive policy. Aggressive compaction is explicitly
+deferred, not a v1 concern.
+
+---
+
+## 10. Security & authentication
+
+- **Node identity is an SSH key.** Every node has an ed25519 keypair; the
+  public key is its durable identity, in standard OpenSSH public-key format
+  (`ssh-ed25519 AAAA… [comment]`). An existing user SSH key may be reused, and
+  signing MAY be delegated to a running SSH agent rather than holding the
+  private key in process.
+- **Key location is device-global by default.** The private key defaults to
+  `~/.context/id_ed25519` (or a reused `~/.ssh` key / SSH agent) — a per-*device*
+  identity reusable across every vault the device joins, surviving deletion of
+  any vault's `.context/`. It is **never** stored in a vault's `.context/` by default
+  and is never synced. A per-vault key is an opt-in for stronger isolation
+  (a compromised vault dir can't then expose a key used elsewhere), at the
+  cost of key sprawl.
+- **Authorization via node-local `authorized_keys`.** A listening (full) node
+  admits only peers whose public key appears in
+  `<scope-root>/.context/authorized_keys` — one key per line, `#` comments, same
+  syntax/semantics as SSH's. It is **node-local and NOT synced** (it is under
+  `.context/`, which §11's HARD INVARIANT excludes from replication entirely):
+  authorization is per-node config, never propagated. Managed via
+  `ctx authorize <pubkey>` / `ctx revoke <pubkey>`, the `CTX_AUTHORIZED_KEYS`
+  env var (merge-on-start, idempotent), or seeding at `ctx init`. `ctx key`
+  prints a node's own public key for sharing. (Trade-off, chosen
+  deliberately: adding a key must be done on each listener and does not
+  propagate — simpler and removes the "a peer pushes a malicious key to every
+  node" vector; acceptable because listeners are few full nodes, §7.)
+- **Bootstrap: trust-on-first-use, bounded to the empty-set window.** When a
+  listening node has **no** local authorized set yet (genuine first-peer
+  bootstrap), it MAY trust-on-first-use: the first connecting key is recorded
+  into `.context/authorized_keys`, and from then on the local authorized set is
+  authoritative. TOFU applies *only* while the set is empty/absent — never as
+  an ongoing admission policy. `CTX_AUTHORIZED_KEYS` (or `ctx authorize` /
+  seeding at `ctx init`) may pre-populate the set so the TOFU window never
+  opens. A `--no-tofu` switch (and config equivalent) disables TOFU entirely
+  for hardened or internet-exposed deployments. **Honest caveat:** an
+  internet-reachable listener with an empty authorized set and TOFU enabled
+  trusts whichever key connects first — operators exposing a fresh listener
+  publicly must pre-seed keys or disable TOFU.
+- **Mutual authentication.** The handshake requires each side to sign, with its
+  ed25519 key, a transcript covering both nonces and a binding to the
+  underlying transport, so a captured handshake cannot be replayed or relayed
+  onto another channel. Both directions authenticate: a connecting node also
+  verifies the listener's key, enabling key pinning.
+- **Per-author authorization (not per-connection).** Transport auth alone is
+  insufficient in a relay protocol. Every **primitive commit is signed by its
+  author NodeId key** (§5.1/§5.2). A node accepts a primitive only if (a) the
+  author signature verifies and (b) the author key is in *its own* local
+  `authorized_keys` — **regardless of which peer relayed it**. Relays forward
+  but confer no trust (§6.1); content does not gain trust transitively.
+  Synthetic fold commits are unsigned and admitted only by recompute-
+  verification (§5.2). Bootstrap of a new replica: `ctx clone` conveys the
+  source's authorized-key set for the user to accept (or TOFU /
+  `CTX_AUTHORIZED_KEYS` seeds it) — a freshly cloned node thus starts with a
+  workable authorized set rather than rejecting everything.
+- **Identity / single-writer protection.** A NodeId is the ed25519 key.
+  Reusing it across *different* vaults is fine; the *same key actively writing
+  two replicas of one vault* is the hazard (§5.1). The counter is durably
+  persisted; `ctx clone` / restore MUST fork a fresh NodeId or warn rather
+  than resume authoring under a possibly-live key. Correctness survives a
+  violation (strict total order + signatures), but history becomes confusing —
+  this protection keeps it clean.
+- **Transport confidentiality.** On untrusted networks, terminate TLS at a
+  fronting proxy holding a CA-trusted certificate, with CSP speaking plaintext
+  behind it; on a trusted/local network plaintext is acceptable. CSP ships no
+  embedded certificate authority. Protocol-level mutual auth and content
+  integrity hold regardless of transport TLS; TLS adds confidentiality and
+  channel binding.
+- **Integrity.** Every object is verified against its SHA on receipt;
+  unverifiable or unauthorized data is dropped.
+
+---
+
+## 11. Scope & coexistence
+
+- The synced set is an **explicit allowlist scope**: a configured subtree
+  and/or include patterns, plus exclusions. CSP must never read or write
+  outside scope. An allowlist (not “everything minus a denylist”) makes the
+  default failure mode *syncing too little*, never exfiltrating secrets or
+  build output.
+- **Text-only by default; binaries are opt-in and never merged.** v1 syncs
+  only text/mergeable files. Binary / non-text files are excluded by the
+  allowlist unless explicitly opted into the scope; when opted in they
+  replicate as **whole-file, last-writer-wins by total order** (no 3-way
+  merge — binary merge is undefined), with no chunking. Content-defined
+  chunking/dedup for large binaries is explicitly out of scope for v1.
+- **`.contextignore` — the user exclude file.** A gitignore-syntax file at
+  `<scope-root>/.contextignore`, scope-relative, applied as exclusions *under* the
+  allowlist scope (allowlist decides what's eligible; `.contextignore` removes
+  patterns from it). It sits at the scope root as ordinary user-managed
+  content and **is itself synced** (it is *not* under `.context/`), so the
+  exclusion policy is shared across nodes. An optional node-local
+  `<scope-root>/.context/exclude` (gitignore syntax, never synced — it is under
+  `.context/`) adds machine-only excludes — the analog of git's
+  `.git/info/exclude`.
+- **Coexistence with a user-owned git repo (no collision by construction).**
+  CSP plants **no `.git` at the scope root**; its repository is
+  `<scope-root>/.context/git/` with the worktree being `<scope-root>` (§4, §9).
+  So a user's own git repo can own the surrounding project (prompts,
+  instructions, code) while CSP owns the context/memory subtree, with zero
+  `.git` conflict. **Default model:** CSP's scope is a dedicated subtree
+  (e.g. `project/context/`); the enclosing project repo gitignores that
+  subtree; the two never overlap. Same-directory interleaving of git-tracked
+  and CSP-managed files is possible only because there is no `.git` at the
+  root, but it additionally requires the allowlist scope to precisely
+  partition ownership and is an advanced configuration with sharper edges —
+  the supported default is the dedicated subtree.
+- **HARD INVARIANT — CSP never replicates, commits, or exposes its own state.**
+  `<scope-root>/.context/` is unconditionally excluded from the sync scope and
+  from any enclosing repo's tracked content, regardless of include patterns;
+  CSP must never transmit, materialize from a peer, or commit anything under
+  `.context/`. This keeps the device key reference, peer list, and local state out
+  of history and off other nodes — the same secrets-safety reasoning as the
+  allowlist, applied to CSP's own footprint. (There is no `.git` at the scope
+  root to exclude — CSP doesn't create one.)
+
+---
+
+## 12. Consistency model & guarantees
+
+- **Convergence.** Given the same set of primitive commits, every node computes
+  the identical `main` SHA and working tree, regardless of delivery order or
+  topology — provided the §5.4 byte-determinism invariant and canonical fold
+  order hold. Integration is idempotent.
+- **Eventual consistency.** Connected nodes converge within a round trip;
+  disconnected nodes converge on reconnect via catch-up.
+- **Merge behavior.** Concurrent edits to *different regions* of a file both
+  survive (real 3-way merge). Concurrent edits to the *same region* are
+  resolved deterministically by total order — the losing edit is not in the
+  working tree but **remains in history** (its primitive commit and objects
+  persist on full nodes) and is recoverable via §8. This is intentional;
+  same-region co-editing is out of scope (§3).
+- **Offline writes** are first-class: a node edits locally, commits to its
+  lineage, and reconciles on reconnect; whether a contested region “wins” is
+  decided by the total order, not arrival time.
+
+---
+
+## 13. Resolved decisions & residual gates
+
+### 13.1 Resolved decisions
+
+- **Binary/large files:** text-only by default; binaries excluded by the
+  allowlist unless explicitly opted in, then whole-file LWW by total order, no
+  chunking. No content-defined chunking in v1. (§11)
+- **Trust bootstrap:** `authorized_keys` is **node-local, NOT synced** (lives
+  in `.context/`, §10/§11); authorization is per-node config and does not
+  propagate. TOFU only while a node's local set is empty (genuine first-peer
+  bootstrap); thereafter the local set is authoritative. Managed via `ctx
+  authorize`/`revoke`/`key`, `CTX_AUTHORIZED_KEYS` (merge-on-start), or
+  `ctx init` seeding; `--no-tofu` disables TOFU. (§10) *(Reverses the earlier
+  interview lean toward a synced authorized_keys — chosen for simplicity and
+  to remove the malicious-key-propagation vector.)*
+- **Clock skew:** snapshots are the exact, skew-free recovery mechanism;
+  `ctx restore <time>` is best-effort and warns on detected skew. (§8)
+- **Auto-commit debounce:** default ~1 s, configurable. (§14)
+- **Hash:** SHA-1 (sha1dc) for v1. SHA-256 explicitly out of scope (no in-place
+  migration — a different hash is a different repo); revisit post-v1 only if
+  ecosystem support warrants. (§4)
+- **git coexistence:** CSP never plants a `.git` at the scope root; the repo is
+  `<scope>/.context/git/` with a decoupled worktree, accessed via `ctx git`.
+  Default model: a dedicated subtree the enclosing project repo gitignores.
+  (§4, §9, §11)
+- **User excludes:** a synced, gitignore-syntax `.contextignore` (plus optional
+  node-local `.context/exclude`) layered under the allowlist scope. (§11)
+- **Node tiers / wasm:** thin nodes are offline-first but never run the merge
+  engine and never listen; only full nodes merge and listen; ≥1 full node
+  required; all-thin meshes unsupported. The wasm build therefore needs only
+  object encode/decode + sync + auth + framing — **not** the merge engine — so
+  gitoxide-in-wasm is low-stakes. (§7, §4)
+- **CTX_\* env surface:** full deployment knobs (`CTX_CWD`, `CTX_NO_TLS`,
+  `CTX_AUTHORIZED_KEYS`, `CTX_LOG`, `PORT`, generic `CTX_*` overrides). (§17.1)
+- **Conflict representation:** jj-style commutative conflicts evaluated and
+  declined for v1; deterministic 3-way merge + total-order tiebreak retained;
+  suppressed sides surfaced as a derived view over the DAG, not a stored
+  layer. (A clean single materialized version per file is required, which
+  nullifies jj's main payoff while adding cost and weakening git compat.)
+- **Watcher ↔ materialize feedback loop:** specified in §5.6 — reconcile by
+  last-materialized content hash (persisted in `.context/state`), atomic writes,
+  and a defined no-clobber rule for the user-edits-during-materialization
+  race. Self-writes are non-events by construction.
+
+### 13.2 Residual gates & risks (must hold before/at release)
+
+- **THE HEADLINE GATE — the binary-left-fold protocol (§5.1–§5.4, §6.3–§6.4,
+  §10), as one interlocking unit.** CSP's single highest-risk, make-or-break
+  property. The fold-chain, frontier anti-entropy, the strict total order, and
+  per-author signatures share invariants and must be validated *together*, not
+  as independent pieces. Correctness hinges, co-equally, on:
+  1. **Complete DAG** — synthetic fold commits are transmitted as reachable
+     objects; no node ever has a dangling parent (§5.2/§6.3).
+  2. **Deterministic per-step base** — `git-merge-base(accₖ₋₁, Tₖ)` over the
+     real graph; never per-node "last converged" state (§5.3).
+  3. **Strict total order** `(counter, NodeId, SHA)` — fixes fold order *and*
+     conflict tiebreak with no ties, including same-NodeId concurrency (§5.1).
+  4. **Byte-pinned, unsigned fold commit object** (§5.4).
+  5. **Frontier-set anti-entropy** delivers the full primitive set under
+     arbitrary gossip/mesh; a scalar VV does not (§6.4).
+  6. **Per-author signature + local authorization** so relays confer no trust
+     (§6.1/§10).
+  **Conformance suite (hard, CI-blocking).** N simulated independent nodes;
+  scenarios MUST include: concurrent commits with *differing parent fold
+  commits* and multi-tip frontiers; the **offline-then-merge** case (A authors
+  off a fold commit B never computed; B resolves it from the transmitted
+  object); **same-NodeId concurrent authoring** (two replicas of one vault,
+  equal counter → SHA tiebreak keeps a strict total order, convergence holds);
+  a **relay delivering an unauthorized-author primitive** (dropped, not
+  forwarded, not trusted via the relaying peer); and **gossip/mesh delivery**
+  that would defeat a scalar VV. Assert: (a) identical `main` SHA *and* tree
+  across all nodes and all delivery orders; (b) every received synthetic fold
+  commit **recursively recompute-verifies** from its own parent list to its
+  exact SHA. Build a small reference fold and property-test exactly this
+  (order-only associativity, recursive verification) **before anything else is
+  built** — if it cannot be made deterministic in practice, the architecture
+  does not work. Non-negotiable.
+- **gitoxide-wasm spike — low-stakes but still required.** Validate that the
+  *reduced* wasm surface (object encode/decode, sync state machine, auth,
+  framing — no merge, no on-disk odb/packfiles) compiles and runs under
+  `wasm32` in a browser/WebView before committing the SDK build. De-risked
+  because the merge engine never runs in wasm (§4, §7), not eliminated.
+- **TOFU exposure — operational caveat, not a code gate.** An internet-
+  reachable listener with an empty authorized set and TOFU enabled trusts the
+  first connector. Deployments exposing a fresh listener publicly MUST
+  pre-seed `CTX_AUTHORIZED_KEYS` or run `--no-tofu`. Document prominently;
+  consider auto-disabling TOFU when the listen address is non-loopback. (§10)
+- **`ctx git` read-only allowlist — data-loss-critical guard.** The repo is
+  engine-owned; a write reaching it (e.g. a mis-allowlisted mutating verb, or
+  an agent invoking `ctx git commit`/`checkout`) is silent corruption or loss
+  (force-recomputed `main`, stomped worktree → §5.6 mass-commit). The
+  allowlist is therefore **deny-by-default** and conservative — unknown/
+  ambiguous verbs and any write-capable flags are refused, not best-guessed —
+  and has its own test suite asserting every mutating verb is rejected (§17).
+  Raw-`GIT_DIR` bypass remains explicitly unsupported and clobberable (§4).
+
+---
+
+## 14. Latency & performance
+
+End-to-end (file saved on A → visible on B), with the dominant terms:
+
+| Stage | Cost |
+|---|---|
+| Auto-commit **debounce** on A | **default ~1 s; configurable (≈200 ms–1 s)** |
+| Hash + commit locally on A | ~1–5 ms |
+| Serialize + WebSocket send | sub-ms |
+| Network A→(relay)→B | LAN ~5–30 ms; cross-region ~30–150 ms; far geo 200 ms+ |
+| Integrate + deterministic head-fold + write on B | ~5–10 ms (no concurrent conflict; more with many concurrent heads) |
+| Receiving host re-reads / re-renders | tens–low-hundreds ms (host-dependent) |
+
+- Propagation itself (commit → wire → applied on B’s disk) is **sub-100 ms on a
+  decent network**. The connection is persistent, so there is no per-message
+  handshake; one small text edit is a few KB of objects.
+- Perceived latency is dominated by the **debounce you choose** and the
+  **receiving host’s own file-reload/redraw**, not the protocol.
+- Realistic end-to-end: ~**300–450 ms** (LAN, tight debounce, desktop) to
+  ~**0.7–1.2 s** (cross-region relay, conservative debounce, host refresh).
+- Tradeoffs / honest caveats: tighter debounce → snappier but more commits,
+  more concurrent heads, heavier folds, noisier history. A burst of many nodes
+  editing at once makes the head-fold non-trivial (bounded, not free). Mobile
+  OSes suspend sockets when backgrounded → not realtime until resumed
+  (catch-up on wake). “Same instant on both screens” is not achievable by any
+  system; sub-second on desktop/good-network is the target, gated by debounce +
+  host redraw, not the protocol.
+- **Thin vs full asymmetry (acknowledged).** A full node collapses its own
+  edits into a linear spine each tick (it folds). A thin node cannot 3-way
+  merge — without mitigation a long offline editing run (the
+  editor-plugin/mobile case) would emit O(n) sibling tips, an O(n) fold on
+  reconnect. The §7 self-collapse rule (thin nodes compute the trivial
+  non-merge `|F|=1` wrapper over their own tip) removes this: an offline run
+  contributes a single linear chain, O(1) to the frontier. Real-merge cost
+  still lands on the full node it reconnects to, which is the intended place
+  for it.
+
+---
+
+## 15. Why this shape
+
+- **Real git, programmatically driven.** Git is battle-tested for content-
+  addressed storage, 3-way merge, and history/PITR. We use exactly those,
+  expose a real `.git` for transparency and stock tooling, and drive it
+  automatically — without git’s slow/pull-based network layer.
+- **Replicate the commit DAG, derive current state deterministically.**
+  Authored-once, **signed** primitive commits replicate verbatim; their parent
+  **synthetic fold commits** replicate as ordinary reachable, deterministic,
+  recompute-*verifiable* objects (DAG never dangling); only the *current*
+  `main` is recomputed, byte-identically, everywhere (convergent, no authority,
+  stock-git-coherent). Frontier-set anti-entropy and per-author signatures keep
+  this sound under gossip topology and untrusted relays.
+- **Realtime transport, not git’s.** Persistent push + delta catch-up gives
+  near-real-time sync with zero polling and no commit-then-wait latency.
+- **One Rust/wasm engine; tiered nodes.** The same core runs everywhere;
+  storage-constrained clients participate as thin working nodes while desktop/
+  server full nodes carry git-compatible history and PITR.
+
+---
+
+## 16. Implementation architecture & SDK layering
+
+The protocol is implemented **exactly once**, in Rust. Everything else is thin
+bindings or host glue. This is a hard structural rule, not a preference.
+
+- **`csp-core` (Rust crate).** The entire engine: object store, commit DAG,
+  deterministic fold/merge, sync protocol state machine, identity & auth,
+  scope/ignore. *All* protocol, merge, and convergence logic lives here and
+  nowhere else — **one codebase, conditionally compiled**: the merge/fold
+  engine and on-disk odb/packfiles are behind a build feature enabled for the
+  native/full-node profile and **compiled out of the wasm/thin profile** (thin
+  nodes never call them — §7, §4). It is not "merge logic also lives
+  elsewhere"; it is the same source feature-gated by node profile. Pure Rust;
+  I/O injected via traits (storage, transport, clock).
+- **`ctx` (native CLI).** A thin wrapper over `csp-core`: argument parsing,
+  process lifecycle, the filesystem watcher, the listen socket, native git
+  on-disk odb/packing. **No protocol logic.**
+- **TypeScript SDK.** `csp-core` compiled to a single **wasm** module plus
+  thin TS bindings and injected host adapters (filesystem, WebSocket). It is
+  **not a reimplementation** — there is exactly one protocol implementation
+  (Rust); the SDK is a typed surface over it.
+- **Host plugins (first target: an Obsidian plugin).** As thin as possible over
+  the TS SDK: host file I/O via the host's storage adapter, transport plumbing,
+  UI, lifecycle. **No protocol or merge logic.** Behavior parity with the CLI
+  is *structural* (shared core), never hand-maintained.
+- **Invariant — “one core, thin bindings.”** Any behavioral difference between
+  the CLI and a host plugin is a bug, because both drive the identical
+  `csp-core`. New capabilities land in Rust once and are exposed through every
+  surface; a feature is not “done” until it is reachable from both the CLI and
+  the SDK and covered by §18 tests.
+
+---
+
+## 17. `ctx` CLI surface & ergonomics
+
+A single binary, `ctx`, exposes the **full** engine capability set — nothing
+the protocol can do may be CLI-inaccessible. Command sketch (final names TBD):
+
+- `ctx init` — create a new, empty scoped vault and this node's SSH key
+  identity here.
+- `ctx clone <url> [dir]` — bootstrap a new node from an existing vault served
+  by a listening node: authenticate, full catch-up (download the primitive DAG
+  + objects), materialize the working tree, write local identity + config.
+- `ctx watch [--listen [addr]]` — **the primary long-running command.** Open
+  the configured vault, watch the scoped tree (debounced auto-commit, with
+  self-write suppression per §5.6), connect to its configured peer(s), and run
+  the continuous realtime sync loop until stopped. `--listen` additionally
+  accepts inbound peers (acts as a relay/hub). This is the everyday "keep this
+  folder synced" daemon.
+- `ctx key` — generate / show the node SSH key; print the public key in
+  OpenSSH format; use an SSH agent if available.
+- `ctx authorize <pubkey>` / `ctx revoke <pubkey>` — manage `authorized_keys`.
+- `ctx status` — node identity, peers, sync state, head/`main` SHA.
+- `ctx snapshot <name>` / `ctx restore <name|time>` — point-in-time recovery.
+- `ctx log` — history (wraps / defers to the underlying git history).
+- `ctx git <args…>` — **read-only** git inspection of CSP's engine-owned
+  repository: a passthrough that sets `GIT_DIR=<scope>/.context/git` +
+  `GIT_WORK_TREE=<scope>` and execs git, but **deny-by-default**: only an
+  allowlist of read-only subcommands runs (`log`, `show`, `diff`, `status`,
+  `blame`, `cat-file`, `ls-tree`, `ls-files`, `rev-list`, `rev-parse`, `grep`,
+  `for-each-ref`, `describe`, `shortlog`, `reflog show`, …). Any mutating verb
+  (`commit`, `checkout`, `switch`, `reset`, `merge`, `rebase`, `branch`/`tag`
+  create, `gc`, `prune`, `update-ref`, `apply`, `cherry-pick`, `restore`,
+  `clean`, `stash`, `fetch`, `push`, `filter-branch`, config writes, …) is
+  **refused** with a pointer to the proper `ctx` command. Rationale: the repo
+  is engine-owned (§4) — there is no legitimate write workflow through git
+  (commit = edit files + `ctx watch`; restore = `ctx restore`; tag a point =
+  `ctx snapshot`; gc is engine-internal, §9.2). The repo discovery path is
+  `ctx git`, since there is no `.git` at the scope root (§4, §11). A user who
+  bypasses this with raw `GIT_DIR=… git …` is unsupported and **will be
+  clobbered** (§4).
+- `ctx scope` — show / edit the synced scope and `.contextignore`.
+- `ctx completions <bash|zsh|fish|powershell>` — emit shell completion.
+
+Ergonomic requirements (treated as acceptance criteria, not nice-to-haves):
+
+- `--help` on every command and subcommand; generated, accurate.
+- Shell completion for bash, zsh, fish, and powershell.
+- `--json` machine-readable output on read/status commands so agents and
+  scripts can drive CSP non-interactively.
+- No required interactive prompts; sensible, documented exit codes. Every
+  deployment knob has **all three** forms — a CLI flag, a `CTX_*` env var, and
+  a config-file key — with precedence **flag > env > config file** (§17.1). No
+  knob is env-only or flag-only.
+- Every engine capability (init, clone, watch/relay, identity, auth, status,
+  snapshot, restore, scope) is reachable from the CLI.
+
+### 17.1 Environment & deployment knobs
+
+For headless / container / managed-platform deployment the CLI honors these
+environment variables (CLI flags override env; env overrides the config file):
+
+Each is settable as a CLI flag **or** the equivalent env var (flag > env >
+config file):
+
+- `--dir <path>` / `CTX_CWD` — the vault/scope root, **decoupled from the
+  process working directory**. Set when the platform mounts persistent storage
+  somewhere other than where the process starts — the classic cause of "state
+  silently re-initialized on every deploy." Must always resolve to the
+  persistent volume, never an ephemeral path.
+- `--no-tls` / `CTX_NO_TLS` — bind a plaintext WebSocket instead of expecting
+  TLS, for running behind a reverse proxy / edge that already terminates TLS
+  (§10).
+- `--listen [addr]` / `--port <n>` / `PORT` — listen address/port for a full
+  node (`ctx watch --listen`); managed platforms inject `PORT`.
+- `--authorized-keys <keys|file>` / `CTX_AUTHORIZED_KEYS` — public keys
+  (newline- or comma-separated, or a file path) merged into this node's
+  **local** `authorized_keys` (`.context/authorized_keys`, never synced — §10)
+  on startup, idempotently. The supported way to pre-seed trust on a fresh
+  hosted listener so the TOFU window never opens (§10).
+- `--no-tofu` / `CTX_NO_TOFU` — disable trust-on-first-use entirely (§10).
+- `--log <level>` / `CTX_LOG` — log level / filter.
+- **General rule:** every config-file key has *both* a `--flag` and a `CTX_*`
+  env var. This three-way parity is a requirement, not a coincidence — no
+  deployment knob is env-only or flag-only.
+
+A hosted listener is thus fully configurable by flags *or* env, with no file
+editing or container-command override — e.g.
+`ctx watch --listen --no-tls --dir /data/vol --authorized-keys "$KEYS"`, or the
+exact `CTX_*` equivalents.
+
+---
+
+## 18. Testing, verification & cross-surface parity
+
+Correctness here is a release gate, not aspirational. CI must run all of the
+below green before any release.
+
+- **Unit tests (`csp-core`).** Object model, total order, version vectors,
+  deterministic fold, conflict resolution, scope filtering, the auth handshake,
+  catch-up.
+- **Determinism conformance suite** (guards §5.4 / §13.2). N simulated
+  independent nodes; identical primitive commits fed in shuffled orders; assert
+  identical `main` SHA *and* identical tree. A hard build gate.
+- **End-to-end tests.** Spawn multiple real `ctx` processes including a
+  listening relay; exercise create / modify / delete / rename, empty
+  directories, disjoint *and* overlapping concurrent edits, offline→reconnect
+  catch-up, snapshot/restore. Assert convergence (identical `main` SHA and
+  byte-identical working trees on every node), PITR correctness, and that the
+  result is genuinely git-coherent (an unmodified `git` can `log`/`checkout`
+  it).
+- **Cross-surface interop.** A wasm/TS node must interoperate with a native
+  node — handshake, replication, identical convergence and SHAs. This is the
+  guarantee that the wasm path is bindings over the same core, not a divergent
+  reimplementation. Host-plugin behavior is validated through the TS SDK e2e
+  harness.
+- **No-regression / parity requirement.** The CLI + SDK must be at least as
+  capable and ergonomic as a mature reference sync tool: full command coverage,
+  scriptable (`--json`), shell completions, robust SSH-key auth, snapshot/
+  restore. This is verified by the e2e suite exercising the *entire* command
+  surface — “we didn't lose anything” must be a passing test, not an assertion.
