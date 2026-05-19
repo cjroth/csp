@@ -82,7 +82,7 @@ impl Peer {
     fn base_cmd(&self) -> Command {
         let mut c = Command::new(ctx_bin());
         c.env("HOME", self.home.path());
-        c.env("CTX_CWD", self.dir.path());
+        c.env("CTX_DIR", self.dir.path());
         c.env("CTX_LOG", "ctx=info,csp_core=warn");
         if let Some(idp) = &self.identity_override {
             c.arg("--identity").arg(idp);

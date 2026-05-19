@@ -7,7 +7,9 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use crate::error::{CspError, CspResult};
-use crate::fold::{compute_main, frontier, genesis, parse_primitive_meta, reachable};
+use crate::fold::{
+    compute_main, frontier, genesis, parse_primitive_meta, reachable, verify_fold_commit,
+};
 use crate::identity::{build_primitive, parse_ssh_pubkey, verify_primitive, Identity};
 use crate::object::{read_tree_to_files, write_tree_from_files, GitObject};
 use crate::oid::Oid;
@@ -99,8 +101,10 @@ impl Vault {
             name: String::new(),
             peers: Vec::new(),
             listen: None,
-            tier: "full".into(),
             no_tofu: false,
+            no_tls: false,
+            log: None,
+            debounce_ms: 1000,
             allow_binary: false,
             include: vec!["**".into()],
         };
@@ -293,6 +297,10 @@ impl Vault {
             if let Ok(disk) = std::fs::read(&abs) {
                 if blob_hash(&disk) == self.state.materialized[&p] {
                     let _ = std::fs::remove_file(&abs);
+                    // A folder rename is N per-file renames in the
+                    // file-only model; without this the emptied old
+                    // directory lingers on disk on the receiving node.
+                    prune_empty_dirs(&self.root, abs.parent());
                 }
             }
             self.state.materialized.remove(&p);
@@ -336,6 +344,27 @@ impl Vault {
         for r in raws {
             // Content-addressed + hash-verified on put.
             self.repo.store.put_raw(r)?;
+        }
+        // "Verified, not trusted": recompute-verify every received synthetic
+        // fold commit (recursively to primitives/M₀), exactly once, on
+        // receipt. A peer that sends an unreproducible fold commit has an
+        // invalid/forged DAG → drop the whole batch (admit nothing, relay
+        // nothing); honest peers' folds always reproduce byte-identically by
+        // construction.
+        for r in raws {
+            if let Ok(GitObject::Commit(c)) = GitObject::decompress_and_parse(r) {
+                if parse_primitive_meta(&c).is_none() {
+                    let oid = GitObject::Commit(c).oid();
+                    if verify_fold_commit(&mut self.repo.store, oid).is_err() {
+                        tracing::warn!(
+                            oid = %oid,
+                            "rejected object batch: synthetic fold commit failed \
+                             recompute-verification"
+                        );
+                        return Ok(0);
+                    }
+                }
+            }
         }
         let authorized = self.authorized_node_ids()?;
         let mut admitted = 0;
@@ -543,7 +572,9 @@ impl Vault {
         let cur = self.scan()?;
         for p in cur.keys() {
             if !tree.contains_key(p) {
-                let _ = std::fs::remove_file(self.root.join(p));
+                let abs = self.root.join(p);
+                let _ = std::fs::remove_file(&abs);
+                prune_empty_dirs(&self.root, abs.parent());
             }
         }
         self.commit_local_changes()?;
@@ -604,6 +635,33 @@ fn load_ignore(root: &Path, context: &Path) -> Vec<String> {
     globs
 }
 
+/// Drop now-empty ancestor directories of a just-removed file, up to (but
+/// not including) `root`. Stops at the first non-empty / unreadable dir.
+/// The engine models files only — a folder rename is N per-file renames —
+/// so the emptied source directory must be reaped here or it lingers.
+fn prune_empty_dirs(root: &Path, start: Option<&Path>) {
+    let mut cur = match start {
+        Some(p) => p.to_path_buf(),
+        None => return,
+    };
+    while cur != root && cur.starts_with(root) {
+        let mut rd = match std::fs::read_dir(&cur) {
+            Ok(rd) => rd,
+            Err(_) => break,
+        };
+        if rd.next().is_some() {
+            break; // not empty — stop climbing
+        }
+        if std::fs::remove_dir(&cur).is_err() {
+            break;
+        }
+        match cur.parent() {
+            Some(parent) => cur = parent.to_path_buf(),
+            None => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,6 +717,41 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(tb.path().join("a.md")).unwrap(),
             "from A"
+        );
+    }
+
+    #[test]
+    fn folder_rename_reaps_empty_source_dir_on_receiver() {
+        let ta = tempdir().unwrap();
+        let tb = tempdir().unwrap();
+        let mut a = Vault::create(ta.path(), id(1), "v").unwrap();
+        let mut b = Vault::create(tb.path(), id(2), "v").unwrap();
+        a.authorize(&id(2).to_ssh_string()).unwrap();
+        b.authorize(&id(1).to_ssh_string()).unwrap();
+
+        // A creates a folder of files; B materializes them.
+        std::fs::create_dir_all(ta.path().join("src")).unwrap();
+        std::fs::write(ta.path().join("src/a.md"), "A").unwrap();
+        std::fs::write(ta.path().join("src/b.md"), "B").unwrap();
+        a.commit_local_changes().unwrap();
+        b.integrate(&a.export_all().unwrap()).unwrap();
+        assert!(tb.path().join("src/a.md").exists());
+        assert!(tb.path().join("src/b.md").exists());
+
+        // A renames the folder src/ → dst/ (per-file moves in the file model).
+        std::fs::create_dir_all(ta.path().join("dst")).unwrap();
+        std::fs::rename(ta.path().join("src/a.md"), ta.path().join("dst/a.md")).unwrap();
+        std::fs::rename(ta.path().join("src/b.md"), ta.path().join("dst/b.md")).unwrap();
+        let _ = std::fs::remove_dir(ta.path().join("src"));
+        a.commit_local_changes().unwrap();
+        b.integrate(&a.export_all().unwrap()).unwrap();
+
+        // Receiver moved the files AND reaped the now-empty source dir.
+        assert!(tb.path().join("dst/a.md").exists(), "renamed files arrive");
+        assert!(tb.path().join("dst/b.md").exists());
+        assert!(
+            !tb.path().join("src").exists(),
+            "empty source folder must not linger on the receiver"
         );
     }
 

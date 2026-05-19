@@ -154,7 +154,7 @@ describe('onVaultEvent branches', () => {
     await b.controller.stop();
   });
 
-  test("disconnected while idle does NOT flip to reconnecting", async () => {
+  test('disconnected while idle does NOT flip to reconnecting', async () => {
     const b = buildWithFakeSdk();
     await b.controller.prepare(); // connect:false → state stays idle
     expect(b.controller.state).toBe('idle');
@@ -189,9 +189,9 @@ describe('connectWithReconnect supervisor', () => {
     b.sdk.connectImpl = () => Promise.reject(new Error('supervisor died'));
     await b.controller.start({ connect: true });
     await tick(10);
-    expect(b.logs.some((l) => /reconnect supervisor exited with error.*supervisor died/.test(l))).toBe(
-      true,
-    );
+    expect(
+      b.logs.some((l) => /reconnect supervisor exited with error.*supervisor died/.test(l)),
+    ).toBe(true);
     await b.controller.stop();
   });
 
@@ -252,7 +252,9 @@ describe('peer-key pin decoding (sshPubkeyBytes)', () => {
     });
     await expect(controller.prepare()).rejects.toThrow(/invalid \[peer\] pubkey/);
     expect(controller.state).toBe('error');
-    expect(notices.some((n) => n.includes('Context: failed to start'))).toBe(true);
+    // start() rethrows and does NOT notice itself — the caller owns the
+    // single user-facing failure toast (no duplicate).
+    expect(notices.some((n) => n.includes('failed to start'))).toBe(false);
   });
 });
 
@@ -281,9 +283,7 @@ describe('not-running guards', () => {
     const b = buildWithFakeSdk();
     await b.controller.start({ connect: false });
     b.sdk.files.set('Notes/a.md', 'hello');
-    await b.controller
-      .getBridge()
-      ?.applyOneRemoteFile(b.sdk.listFiles()[0] as FileMeta);
+    await b.controller.getBridge()?.applyOneRemoteFile(b.sdk.listFiles()[0] as FileMeta);
     expect(b.vault.getAbstractFileByPath('Notes/a.md')).not.toBeNull();
     await b.controller.stop();
   });

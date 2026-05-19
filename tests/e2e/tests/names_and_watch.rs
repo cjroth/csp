@@ -35,8 +35,8 @@ async fn default_id_is_uuid_and_name_is_derived() {
 async fn init_path_arg_creates_folder_and_wins_over_ctx_cwd() {
     let mut s = Scenario::new("ignored");
     let a = s.add_uninit("A").unwrap();
-    // The harness always exports CTX_CWD = peer root. A positional path is
-    // the most explicit form, so it must WIN over CTX_CWD and be created
+    // The harness always exports CTX_DIR = peer root. A positional path is
+    // the most explicit form, so it must WIN over CTX_DIR and be created
     // if missing, nested parents and all (git `init <dir>` spirit).
     let target = s.peer(a).root().join("nested/created-by-arg");
     let tgt = target.to_str().unwrap();
@@ -48,7 +48,7 @@ async fn init_path_arg_creates_folder_and_wins_over_ctx_cwd() {
     );
     assert!(
         !s.peer(a).root().join(".context").exists(),
-        "positional path must win over CTX_CWD (root must stay uninited)"
+        "positional path must win over CTX_DIR (root must stay uninited)"
     );
     // Name derives from the new folder's basename (git-spirit).
     let js = s.peer(a).run(&["--dir", tgt, "status", "--json"]).await.unwrap();

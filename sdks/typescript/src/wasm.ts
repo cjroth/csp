@@ -59,6 +59,8 @@ interface CspWasmModule {
   verify_primitive_object(framed: Uint8Array): string;
   wire_encode(json: string): Uint8Array;
   wire_decode(bytes: Uint8Array): string;
+  config_parse(text: string): string;
+  config_to_toml(json: string): string;
 }
 
 const req = createRequire(import.meta.url);
@@ -118,4 +120,15 @@ export function wireEncode(json: string): Uint8Array {
 /** Decode a MessagePack wire frame back to JSON. */
 export function wireDecode(bytes: Uint8Array): string {
   return m.wire_decode(bytes);
+}
+
+/** Parse `.context/config` TOML into the typed `VaultConfig` as JSON — the
+ * one Rust codec `ctx` uses, never reimplemented. */
+export function configParse(text: string): string {
+  return m.config_parse(text);
+}
+
+/** Serialize a `VaultConfig` (JSON) back to `.context/config` TOML text. */
+export function configToToml(json: string): string {
+  return m.config_to_toml(json);
 }

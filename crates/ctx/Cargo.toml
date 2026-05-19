@@ -26,3 +26,7 @@ base64.workspace = true
 futures-util.workspace = true
 notify.workspace = true
 uuid.workspace = true
+ssh-key.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

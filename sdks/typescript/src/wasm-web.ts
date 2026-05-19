@@ -89,3 +89,11 @@ export function wireDecode(bytes: Uint8Array): string {
   assertReady();
   return wasm.wire_decode(bytes);
 }
+export function configParse(text: string): string {
+  assertReady();
+  return wasm.config_parse(text);
+}
+export function configToToml(json: string): string {
+  assertReady();
+  return wasm.config_to_toml(json);
+}

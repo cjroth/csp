@@ -1,12 +1,29 @@
 {
-  "vault_id": "v-tofu",
-  "counter": 0,
-  "observed": 1,
+  "vault_id": "v-gitflags",
+  "counter": 2,
+  "observed": 2,
   "known": [
-    "b99962d8460a0cceee26cd06ee2b6e239048d2f1"
+    "b99962d8460a0cceee26cd06ee2b6e239048d2f1",
+    "e6608904fd05117cac71342de00711be29d15175"
   ],
   "materialized": {
-    "seed.md": "4f2fced2e72d70cdaf695d9ba317a33120060e19"
+    "Cargo.toml": "4b49064b66ff6b29d60e0eee1ecbe5ad69867e2d",
+    "seed.md": "4f2fced2e72d70cdaf695d9ba317a33120060e19",
+    "src/lib.rs": "138edea30f2ed493defc56d5fb41150f3264ff31",
+    "tests/cli_surface.rs": "5fded6d474e072cecebd5977bdf9926049f2d493",
+    "tests/clone_sync.rs": "d1789aa441a36e23bcb36fbb37b4f7d10652a8c2",
+    "tests/concurrent_merge.rs": "a504ba32919c65f54bbd211e331a41be396ed2a1",
+    "tests/git_coherence.rs": "d77570a5dec03c832830c02a85340d04b1d78471",
+    "tests/names_and_watch.rs": "9606c4ae5a791fcf6aa49bb3023705fe12f9e249",
+    "tests/offline_reconnect.rs": "9c307d803de2cbf3ccb53b3446bfec6458447245",
+    "tests/relay_mesh.rs": "8f8fb37fc84a1f97794e4376c2ea949a4fe9fc80",
+    "tests/same_nodeid.rs": "a687eba3596ab9d9fe02ea6618b6afc8e4acdcf6",
+    "tests/scope_filtering.rs": "10b941a62f91aa9a0ef6540e2ecb64793c7622d2",
+    "tests/snapshot_restore.rs": "a2850f85a2cc70ad5eae6d27ff3efb7c5e2c002e",
+    "tests/tls_default.rs": "0cb0c395d749be4ab5c99fd82ee614f80d7b20cc",
+    "tests/tofu_bootstrap.rs": "670308d0f151fa0897fea4f25079a52aed984256",
+    "tests/two_peer_sync.rs": "95d0ef4be101a9be24a21cd9f3df686b1e4a3381",
+    "tests/unauthorized_relay.rs": "ff9e5fcabe8baedbab46af71dbd3a4f4a69f10e6"
   },
   "snapshots": {}
 }

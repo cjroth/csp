@@ -4,13 +4,13 @@
 // production handlers and assert what they call.
 
 import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import { DEFAULT_SETTINGS } from '../../src/settings.js';
 import { ContextSyncSettingTab } from '../../src/settings-tab.js';
+import { DEFAULT_SETTINGS } from '../../src/settings.js';
 import {
+  Notice,
   type RecordedComponent,
   __obsidian,
   __resetObsidian,
-  Notice,
 } from '../mocks/obsidian-shim.js';
 
 const clipboardWrites: string[] = [];
@@ -244,9 +244,7 @@ describe('configured view', () => {
     await auto?.onChangeToggle?.(true);
     expect(plugin.settings.autoConnectOnStart).toBe(true);
 
-    const ig = __obsidian
-      .setting('Ignore patterns')
-      ?.components.find((c) => c.kind === 'textarea');
+    const ig = __obsidian.setting('Ignore patterns')?.components.find((c) => c.kind === 'textarea');
     await ig?.onChangeText?.('Drafts/**\n# c\n\n*.tmp.md');
     expect(plugin.settings.ignoreGlobs).toEqual(['Drafts/**', '*.tmp.md']);
     expect(plugin.saved.length).toBeGreaterThanOrEqual(3);

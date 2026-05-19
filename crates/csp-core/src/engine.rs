@@ -15,7 +15,9 @@
 
 use crate::config::VaultConfig;
 use crate::error::{CspError, CspResult};
-use crate::fold::{compute_main, frontier, genesis, parse_primitive_meta, reachable};
+use crate::fold::{
+    compute_main, frontier, genesis, parse_primitive_meta, reachable, verify_fold_commit,
+};
 use crate::identity::{build_primitive, parse_ssh_pubkey, verify_primitive, Identity};
 use crate::object::{read_tree_to_files, write_tree_from_files, GitObject};
 use crate::oid::Oid;
@@ -87,8 +89,10 @@ impl MemEngine {
             name: name.to_string(),
             peers: Vec::new(),
             listen: None,
-            tier: "full".into(),
             no_tofu: false,
+            no_tls: false,
+            log: None,
+            debounce_ms: 1000,
             allow_binary: false,
             include: vec!["**".into()],
         };
@@ -239,6 +243,26 @@ impl MemEngine {
     pub fn integrate(&mut self, raws: &[Vec<u8>]) -> CspResult<usize> {
         for r in raws {
             self.store.put_raw(r)?;
+        }
+        // "Verified, not trusted": recompute-verify every received synthetic
+        // fold commit (recursively to primitives/M₀), once on receipt.
+        // Unreproducible fold commit → drop the whole batch (admit nothing,
+        // relay nothing). One engine everywhere: the wasm/SDK node runs this
+        // identical check.
+        for r in raws {
+            if let Ok(GitObject::Commit(c)) = GitObject::decompress_and_parse(r) {
+                if parse_primitive_meta(&c).is_none() {
+                    let oid = GitObject::Commit(c).oid();
+                    if verify_fold_commit(&mut self.store, oid).is_err() {
+                        tracing::warn!(
+                            oid = %oid,
+                            "rejected object batch: synthetic fold commit failed \
+                             recompute-verification"
+                        );
+                        return Ok(0);
+                    }
+                }
+            }
         }
         let authorized = self.authorized_node_ids();
         let mut admitted = 0;
@@ -530,6 +554,79 @@ mod tests {
         a.integrate(&bx).unwrap();
         b.integrate(&ax).unwrap();
         assert_eq!(a.main(), b.main(), "deterministic fold → identical main");
+    }
+
+    /// "Verified, not trusted": a received synthetic fold commit that does
+    /// NOT recompute byte-identically poisons the whole batch — nothing is
+    /// admitted and nothing would be relayed (integrate returns 0, `main`
+    /// unchanged). The untampered closure integrates normally.
+    #[test]
+    fn forged_fold_commit_rejects_whole_batch() {
+        use crate::object::{CommitObj, GitObject};
+
+        // Two peers author disjoint primitives, then b merges → b holds a
+        // real 2-parent synthetic fold commit.
+        let mut a = MemEngine::create(id(1), "v", "").unwrap();
+        let mut b = MemEngine::create(id(2), "v", "").unwrap();
+        a.authorize(&id(2).to_ssh_string());
+        b.authorize(&id(1).to_ssh_string());
+        a.commit_from_files(&files(&[("a.md", "AAA")])).unwrap();
+        b.commit_from_files(&files(&[("b.md", "BBB")])).unwrap();
+        let ax = a.export_closure(&a.known().unwrap()).unwrap();
+        b.integrate(&ax).unwrap();
+        // A third primitive authored on top of the merge makes the 2-parent
+        // fold commit reachable from the primitive set (primitives parent on
+        // the fold they were authored against).
+        b.commit_from_files(&files(&[("a.md", "AAA"), ("b.md", "BBB"), ("c.md", "CCC")]))
+            .unwrap();
+        let bx = b.export_closure(&b.known().unwrap()).unwrap();
+
+        // Find b's real fold commit (a non-primitive commit with parents)
+        // and a primitive's tree to use as a deliberately wrong fold tree.
+        let mut fold = None;
+        let mut wrong_tree = None;
+        for r in &bx {
+            if let Ok(GitObject::Commit(c)) = GitObject::decompress_and_parse(r) {
+                if parse_primitive_meta(&c).is_some() {
+                    wrong_tree = Some(c.tree);
+                } else if !c.parents.is_empty() {
+                    fold = Some(c);
+                }
+            }
+        }
+        let fold = fold.expect("b must hold a real fold commit");
+        let wrong_tree = wrong_tree.expect("a primitive tree");
+        assert_ne!(fold.tree, wrong_tree, "bogus tree must differ from real");
+
+        // Forge: same parents, wrong tree → cannot recompute to its own SHA.
+        let forged = GitObject::Commit(CommitObj {
+            tree: wrong_tree,
+            ..fold.clone()
+        });
+        let forged_raw = forged.compress();
+
+        // Control: the untampered closure integrates and moves `main`.
+        let mut ctrl = MemEngine::create(id(1), "v", "").unwrap();
+        ctrl.authorize(&id(2).to_ssh_string());
+        ctrl.commit_from_files(&files(&[("a.md", "AAA")])).unwrap();
+        let before = ctrl.main();
+        assert!(ctrl.integrate(&bx).unwrap() > 0);
+        assert_ne!(ctrl.main(), before, "clean batch must integrate");
+
+        // Tampered: same closure + the forged fold commit → whole batch
+        // rejected, nothing admitted, `main` frozen.
+        let mut victim = MemEngine::create(id(1), "v", "").unwrap();
+        victim.authorize(&id(2).to_ssh_string());
+        victim.commit_from_files(&files(&[("a.md", "AAA")])).unwrap();
+        let frozen = victim.main();
+        let mut batch = bx.clone();
+        batch.push(forged_raw);
+        assert_eq!(
+            victim.integrate(&batch).unwrap(),
+            0,
+            "a forged fold commit must reject the entire batch"
+        );
+        assert_eq!(victim.main(), frozen, "main must not move on a poisoned batch");
     }
 
     #[test]

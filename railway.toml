@@ -20,6 +20,9 @@
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
+# This hub is stateful: one instance bound to one volume (vault history +
+# node identity). Never scale it past a single replica — a second instance
+# can't share the volume, and a duplicated identity breaks peers' TOFU
+# trust. Railway's default is 1 replica, so we don't set numReplicas here.
 [deploy]
 restartPolicyType = "ALWAYS"
-numReplicas = 1

@@ -132,7 +132,7 @@ Every deployment knob also has a `CTX_*` env var and a config-file key
 (precedence: flag > env > config), so a headless listener needs no flags:
 
 ```sh
-CTX_CWD=/data/vault CTX_AUTHORIZED_KEYS="$KEYS" ctx watch --listen
+CTX_DIR=/data/vault CTX_AUTHORIZED_KEYS="$KEYS" ctx watch --listen
 ```
 
 The synced folder is plain files plus one `.context/` directory (engine state, never

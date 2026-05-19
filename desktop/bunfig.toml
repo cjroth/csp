@@ -1,0 +1,4 @@
+[install]
+# Don't install npm package versions newer than 7 days, to blunt
+# supply-chain attacks via freshly-published malicious releases.
+minimumReleaseAge = 604800

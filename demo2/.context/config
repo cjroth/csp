@@ -1,7 +1,0 @@
-vault_id = "0f9d2465-9d1c-4dd6-a97d-a796dfb5d1a4"
-name = "demo1"
-peers = ["wss://localhost:9000"]
-tier = "full"
-no_tofu = false
-allow_binary = false
-include = ["**"]

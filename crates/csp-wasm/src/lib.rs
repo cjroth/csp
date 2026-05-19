@@ -7,6 +7,7 @@
 //! low-level fns are retained for the cross-surface conformance vectors
 //! (§18 / `test-vectors.json`).
 
+use csp_core::config::VaultConfig;
 use csp_core::engine::MaterializeOp;
 use csp_core::identity::{build_primitive, ssh_pubkey_string, verify_primitive, Identity};
 use csp_core::object::GitObject;
@@ -108,6 +109,25 @@ pub fn wire_encode(json: &str) -> Result<Vec<u8>, JsError> {
 pub fn wire_decode(bytes: &[u8]) -> Result<String, JsError> {
     let msg = Msg::decode(bytes).map_err(|e| JsError::new(&e))?;
     serde_json::to_string(&msg).map_err(je)
+}
+
+/// Parse `.context/config` TOML text into the typed `VaultConfig` as JSON —
+/// the *same* hand-rolled codec `ctx` uses (one engine everywhere, never a
+/// reimplementation). Applies serde-equivalent defaults; throws on input the
+/// codec can't represent or a missing required `vault_id`.
+#[wasm_bindgen]
+pub fn config_parse(text: &str) -> Result<String, JsError> {
+    let cfg = VaultConfig::from_toml_str(text).map_err(je)?;
+    serde_json::to_string(&cfg).map_err(je)
+}
+
+/// Serialize a `VaultConfig` given as JSON back to `.context/config` TOML
+/// text via the same shared codec — valid TOML the real `toml` parser (and
+/// `ctx`) reads back identically.
+#[wasm_bindgen]
+pub fn config_to_toml(json: &str) -> Result<String, JsError> {
+    let cfg: VaultConfig = serde_json::from_str(json).map_err(je)?;
+    cfg.to_toml_string().map_err(je)
 }
 
 // ---- High-level: the real full engine (one core, §16) -------------------

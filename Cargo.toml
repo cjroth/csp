@@ -54,6 +54,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls-pki-types = "1"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
 tempfile = "3"
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519"] }
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,8 @@
+vault_id = "parity-v"
+name = "typescript"
+peers = []
+no_tofu = false
+no_tls = false
+debounce_ms = 1000
+allow_binary = false
+include = ["**"]

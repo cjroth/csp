@@ -36,18 +36,26 @@ pub struct VaultConfig {
     pub peers: Vec<String>,
     #[serde(default)]
     pub listen: Option<String>,
-    #[serde(default = "default_tier")]
-    pub tier: String, // "full" | "thin"
     #[serde(default)]
     pub no_tofu: bool,
+    /// Serve a plaintext ws:// listener instead of the default self-signed
+    /// wss://.
+    #[serde(default)]
+    pub no_tls: bool,
+    /// Log level / filter; the launcher's built-in default applies when None.
+    #[serde(default)]
+    pub log: Option<String>,
+    /// Auto-commit debounce, in milliseconds.
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
     #[serde(default)]
     pub allow_binary: bool,
     #[serde(default = "default_include")]
     pub include: Vec<String>,
 }
 
-fn default_tier() -> String {
-    "full".into()
+fn default_debounce_ms() -> u64 {
+    1000
 }
 fn default_include() -> Vec<String> {
     vec!["**".into()]
@@ -142,8 +150,12 @@ impl VaultConfig {
         if let Some(l) = &self.listen {
             s.push_str(&fmt_str("listen", l));
         }
-        s.push_str(&fmt_str("tier", &self.tier));
         s.push_str(&format!("no_tofu = {}\n", self.no_tofu));
+        s.push_str(&format!("no_tls = {}\n", self.no_tls));
+        if let Some(l) = &self.log {
+            s.push_str(&fmt_str("log", l));
+        }
+        s.push_str(&format!("debounce_ms = {}\n", self.debounce_ms));
         s.push_str(&format!("allow_binary = {}\n", self.allow_binary));
         s.push_str(&fmt_arr("include", &self.include));
         Ok(s)
@@ -159,8 +171,10 @@ impl VaultConfig {
         let mut name = String::new();
         let mut peers: Vec<String> = Vec::new();
         let mut listen: Option<String> = None;
-        let mut tier = default_tier();
         let mut no_tofu = false;
+        let mut no_tls = false;
+        let mut log: Option<String> = None;
+        let mut debounce_ms = default_debounce_ms();
         let mut allow_binary = false;
         let mut include: Option<Vec<String>> = None;
 
@@ -190,8 +204,13 @@ impl VaultConfig {
                 "name" => name = parse_str(&rhs).map_err(C)?,
                 "peers" => peers = parse_arr(&rhs).map_err(C)?,
                 "listen" => listen = Some(parse_str(&rhs).map_err(C)?),
-                "tier" => tier = parse_str(&rhs).map_err(C)?,
                 "no_tofu" => no_tofu = rhs == "true",
+                "no_tls" => no_tls = rhs == "true",
+                "log" => log = Some(parse_str(&rhs).map_err(C)?),
+                "debounce_ms" => {
+                    debounce_ms =
+                        rhs.parse().map_err(|_| C(format!("bad debounce_ms: {rhs}")))?
+                }
                 "allow_binary" => allow_binary = rhs == "true",
                 "include" => include = Some(parse_arr(&rhs).map_err(C)?),
                 _ => {} // unknown key tolerated (forward-compat)
@@ -202,8 +221,10 @@ impl VaultConfig {
             name,
             peers,
             listen,
-            tier,
             no_tofu,
+            no_tls,
+            log,
+            debounce_ms,
             allow_binary,
             include: include.unwrap_or_else(default_include),
         })
@@ -339,13 +360,16 @@ mod disk {
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn cfg(
         vault_id: &str,
         name: &str,
         peers: &[&str],
         listen: Option<&str>,
-        tier: &str,
         no_tofu: bool,
+        no_tls: bool,
+        log: Option<&str>,
+        debounce_ms: u64,
         allow_binary: bool,
         include: &[&str],
     ) -> VaultConfig {
@@ -354,15 +378,18 @@ mod tests {
             name: name.into(),
             peers: peers.iter().map(|s| s.to_string()).collect(),
             listen: listen.map(|s| s.to_string()),
-            tier: tier.into(),
             no_tofu,
+            no_tls,
+            log: log.map(|s| s.to_string()),
+            debounce_ms,
             allow_binary,
             include: include.iter().map(|s| s.to_string()).collect(),
         }
     }
 
     /// The corpus: every field varied incl. escape-relevant strings, empty
-    /// vs multi-element arrays, listen None/Some, non-default bools/tier.
+    /// vs multi-element arrays, listen/log None/Some, non-default bools and
+    /// debounce.
     fn corpus() -> Vec<VaultConfig> {
         let strs = [
             "v-1",
@@ -390,11 +417,13 @@ mod tests {
         let mut v = Vec::new();
         for s in strs {
             for a in arrs {
-                v.push(cfg(s, s, a, None, "full", false, false, a));
-                v.push(cfg(s, "", &["x"], Some(s), "thin", true, true, a));
+                v.push(cfg(s, s, a, None, false, false, None, 1000, false, a));
+                v.push(cfg(s, "", &["x"], Some(s), true, true, Some(s), 250, true, a));
             }
         }
-        v.push(cfg("id", "n", &["p1", "p2"], Some("ls"), "full", true, false, &["**"]));
+        v.push(cfg(
+            "id", "n", &["p1", "p2"], Some("ls"), true, true, Some("debug"), 500, false, &["**"],
+        ));
         v
     }
 
@@ -417,16 +446,17 @@ mod tests {
     fn defaults_and_missing_required() {
         // Minimal file → serde-equivalent defaults.
         let c = VaultConfig::from_toml_str("vault_id = \"x\"\n").unwrap();
-        assert_eq!(c.tier, "full");
+        assert_eq!(c.debounce_ms, 1000);
+        assert!(!c.no_tls && c.log.is_none());
         assert_eq!(c.include, vec!["**".to_string()]);
         assert!(c.name.is_empty() && c.peers.is_empty() && c.listen.is_none());
         // Missing required `vault_id` errors (like serde).
         assert!(VaultConfig::from_toml_str("name = \"x\"\n").is_err());
         // Comments / blanks / CRLF / ignored table header tolerated.
         let c2 = VaultConfig::from_toml_str(
-            "# hello\r\n\r\n[ignored]\r\nvault_id = \"y\" # trailing\r\ntier = \"thin\"\r\n",
+            "# hello\r\n\r\n[ignored]\r\nvault_id = \"y\" # trailing\r\nno_tls = true\r\n",
         )
         .unwrap();
-        assert_eq!((c2.vault_id.as_str(), c2.tier.as_str()), ("y", "thin"));
+        assert_eq!((c2.vault_id.as_str(), c2.no_tls), ("y", true));
     }
 }

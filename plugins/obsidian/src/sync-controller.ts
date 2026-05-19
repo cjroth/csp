@@ -148,7 +148,11 @@ export class SyncController {
       });
     } catch (err) {
       this.setState('error');
-      this.deps.notice?.(`Context: failed to start — ${err}`);
+      // Don't notice here: start() always rethrows, and every caller already
+      // surfaces the failure exactly once (the settings-tab "setup failed"
+      // toast + the wizard's inline `onboardingError`; onload's own catch).
+      // A notice here too produced a duplicate failure toast on every failed
+      // "Set up Context".
       throw err;
     }
   }

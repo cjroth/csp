@@ -118,10 +118,14 @@ pub fn frontier<S: Store>(store: &S, known: &[Oid]) -> CspResult<Vec<Oid>> {
     Ok(keyed.into_iter().map(|(_, o)| o).collect())
 }
 
-/// Deterministic merge-base over the real DAG: the maximal common ancestor,
-/// tie-broken by (committer-time desc, oid asc). Both operands are real
-/// commits whose ancestry bottoms out at fold commits / `M₀` (§5.3) — never
-/// per-node "last converged" state (§5.4 part 2). Merge-only → full profile.
+/// Deterministic merge-base over the real DAG: the maximal common ancestor.
+/// When a criss-cross yields more than one maximal common ancestor, the tie
+/// is broken by **commit-SHA bytewise (lowest wins)** — a content-only,
+/// wall-clock-free tiebreak consistent with the strict-total-order SHA
+/// tiebreaker. **Never** committer/author time: that would reintroduce a
+/// wall-clock-derived input the fold forbids. Both operands are real commits
+/// whose ancestry bottoms out at fold commits / `M₀` — never per-node "last
+/// converged" state. Merge-only → full profile.
 fn merge_base<S: Store>(store: &S, a: Oid, b: Oid) -> CspResult<Oid> {
     let mut anc_a = ancestors(store, a)?;
     anc_a.insert(a);
@@ -150,13 +154,10 @@ fn merge_base<S: Store>(store: &S, a: Oid, b: Oid) -> CspResult<Oid> {
             maximal.push(c);
         }
     }
-    let mut scored: Vec<(u64, Oid)> = Vec::new();
-    for m in maximal {
-        let c = load_commit(store, m)?;
-        scored.push((c.committer_time, m));
-    }
-    scored.sort_by(|x, y| y.0.cmp(&x.0).then(x.1 .0.cmp(&y.1 .0)));
-    Ok(scored[0].1)
+    // A multi-base criss-cross is tie-broken by commit-SHA bytewise (lowest
+    // wins) — content-only, wall-clock-free. Never by committer/author time.
+    maximal.sort_by(|x, y| x.0.cmp(&y.0));
+    Ok(maximal[0])
 }
 
 fn commit_tree<S: Store>(store: &S, oid: Oid) -> CspResult<Oid> {
@@ -269,8 +270,10 @@ pub fn compute_main<S: Store>(store: &mut S, known: &[Oid]) -> CspResult<Oid> {
 /// down to primitives / `M₀`. §5.4 determinism makes this exact. Returns
 /// `Ok(())` for primitives and `M₀` (verified by signature / fixed identity
 /// elsewhere); errors if any fold commit fails to reproduce byte-identically.
-/// Recompute-verification re-runs the merge → full profile (§4/§7); a thin
-/// node never recomputes folds (§7).
+/// Called **once on receipt** at integration — every node, browser/WebView
+/// included, runs the identical engine; a fold commit that fails here is
+/// dropped and not forwarded. Not re-run during steady-state `main`
+/// recomputation.
 pub fn verify_fold_commit<S: Store>(store: &mut S, oid: Oid) -> CspResult<()> {
     verify_inner(store, oid, &mut HashSet::new())
 }
@@ -701,6 +704,51 @@ mod tests {
             // after the superset's objects were added.
             verify_fold_commit(&mut sim.store, m_half).unwrap();
         }
+    }
+
+    /// A criss-cross with multiple maximal common ancestors is tie-broken by
+    /// **commit-SHA bytewise (lowest wins)**, NEVER by committer/author time.
+    /// We build a diamond where the two candidate bases carry committer-times
+    /// chosen so a time-based rule would pick the SHA-*max* base; the
+    /// wall-clock-free rule must still pick the SHA-min.
+    #[test]
+    fn merge_base_multibase_tiebreak_is_sha_not_time() {
+        let mut store = MemStore::new();
+        let raw = |store: &mut MemStore, tree: Oid, parents: Vec<Oid>, t: u64| -> Oid {
+            store
+                .put(&GitObject::Commit(CommitObj {
+                    tree,
+                    parents,
+                    author: FOLD_NAME.into(),
+                    author_email: FOLD_EMAIL.into(),
+                    author_time: t,
+                    committer: FOLD_NAME.into(),
+                    committer_email: FOLD_EMAIL.into(),
+                    committer_time: t,
+                    message: "raw".into(),
+                }))
+                .unwrap()
+        };
+        let t0 = put_tree(&mut store, &map(&[]));
+        let t1 = put_tree(&mut store, &map(&[("a", b"1")]));
+        let t2 = put_tree(&mut store, &map(&[("b", b"2")]));
+        let p = raw(&mut store, t0, vec![], 1);
+        // Two incomparable common ancestors (both maximal).
+        let b1 = raw(&mut store, t1, vec![p], 1000);
+        let b2 = raw(&mut store, t2, vec![p], 1);
+        let (lo, hi) = if b1.0 < b2.0 { (b1, b2) } else { (b2, b1) };
+        // Heads that both descend from BOTH b1 and b2 → criss-cross.
+        let h1 = raw(&mut store, t1, vec![b1, b2], 2000);
+        let h2 = raw(&mut store, t2, vec![b1, b2], 2000);
+        let got = merge_base(&store, h1, h2).unwrap();
+        assert_eq!(
+            got, lo,
+            "merge_base must pick the SHA-min maximal common ancestor \
+             (got {got}, sha-min {lo}, sha-max {hi}); a time-based tiebreak \
+             would have picked by committer_time — forbidden"
+        );
+        // Symmetric and deterministic regardless of operand order.
+        assert_eq!(merge_base(&store, h2, h1).unwrap(), lo);
     }
 
     /// §5.4 part 3 — explicitly "load-bearing, not an optimization": two

@@ -133,10 +133,22 @@ impl GitObject {
             .ok_or_else(|| CspError::Malformed("missing header NUL".into()))?;
         let header = std::str::from_utf8(&framed[..nul])
             .map_err(|_| CspError::Malformed("non-utf8 header".into()))?;
-        let (kind, _len) = header
+        let (kind, len) = header
             .split_once(' ')
             .ok_or_else(|| CspError::Malformed("bad header".into()))?;
         let payload = &framed[nul + 1..];
+        // The declared length must match the payload exactly — stock-git
+        // frames are `<type> <len>\0<payload>`. A mismatch means a truncated
+        // or padded object; reject rather than silently accepting it.
+        let declared: usize = len
+            .parse()
+            .map_err(|_| CspError::Malformed("bad header length".into()))?;
+        if declared != payload.len() {
+            return Err(CspError::Malformed(format!(
+                "framed length {declared} != payload {}",
+                payload.len()
+            )));
+        }
         match kind {
             "blob" => Ok(GitObject::Blob(payload.to_vec())),
             "tree" => Ok(GitObject::Tree(parse_tree(payload)?)),

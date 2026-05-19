@@ -125,41 +125,31 @@ export interface ReconnectOptions {
 
 // ---- `.context/config` typed schema (provisional — CSP spec §9.1/§17.1) ----
 
-/** A scalar or string-array TOML value — the only shapes the schema uses. */
-export type TomlValue = string | number | boolean | string[];
-
-/** An ordered TOML document: table → (key → value), insertion order kept.
- * Root (keys before any `[table]`) uses the `''` table key. */
-export type TomlDoc = Map<string, Map<string, TomlValue>>;
-
-// Optional fields are `?: T | undefined` so callers can clear them with an
-// explicit `= undefined` under `exactOptionalPropertyTypes`.
-
-/** `[peer]` — the full node this thin node syncs with (CSP §6.1). */
-export interface PeerSection {
-  /** Peer (full-node listener) WebSocket URL. */
-  url?: string | undefined;
-  /** Pinned peer identity pubkey, SSH wire format (`ssh-ed25519 AAAA…`). */
-  pubkey?: string | undefined;
-}
-
-/** `[identity]` — where the device key lives (CSP §9.1/§10). */
-export interface IdentitySection {
-  /** Vault-relative identity path (set on mobile; unset → CLI default
-   * `~/.context/id_ed25519`). */
-  path?: string | undefined;
-}
-
-/** `[scope]` — the explicit allowlist (CSP §11). */
-export interface ScopeSection {
-  /** Synced text extensions (no dot, lowercase). */
-  extensions: string[];
-  /** Extra include patterns under the allowlist. */
+// This mirrors `csp_core::config::VaultConfig` exactly (field names are the
+// serde JSON keys). The TOML codec is NOT reimplemented here — `config.ts`
+// bridges to the one Rust codec via wasm (one engine everywhere). `listen`
+// and `log` serialize as `null` when unset, matching serde's
+// `Option<String>`.
+export interface VaultConfig {
+  /** Opaque protocol identity (a UUID by default). The handshake's
+   * "same vault?" guard — not a display label. */
+  vault_id: string;
+  /** Optional human label (may be empty). */
+  name: string;
+  /** Peer (full-node listener) URLs this node syncs with (CSP §6.1). */
+  peers: string[];
+  /** Listen address for a full node; `null` for a thin/outbound-only node. */
+  listen: string | null;
+  /** Skip trust-on-first-use key pinning (CSP §10). */
+  no_tofu: boolean;
+  /** Serve a plaintext `ws://` listener instead of the default `wss://`. */
+  no_tls: boolean;
+  /** Log level / filter; `null` → the launcher's built-in default. */
+  log: string | null;
+  /** Auto-commit debounce, in milliseconds. */
+  debounce_ms: number;
+  /** Opt in to whole-file LWW binary sync (CSP §11). */
+  allow_binary: boolean;
+  /** The explicit include allowlist (CSP §11). */
   include: string[];
-}
-
-export interface CspConfig {
-  peer: PeerSection;
-  identity: IdentitySection;
-  scope: ScopeSection;
 }

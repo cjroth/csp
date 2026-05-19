@@ -1,4 +1,4 @@
 [core]
 	repositoryformatversion = 0
 	bare = false
-	worktree = .
+	worktree = /home/chris/csp/tests/e2e

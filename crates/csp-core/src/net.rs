@@ -6,9 +6,14 @@
 //! frontier-set anti-entropy catch-up (§6.4); immediate live push (§6.5);
 //! full nodes relay (§6.1).
 //!
-//! Transport is plaintext WebSocket — CSP ships no embedded CA; terminate
-//! TLS at a fronting proxy on untrusted networks (§10). Protocol-level
-//! mutual auth + content integrity hold regardless of transport TLS.
+//! Default transport is wss:// using a self-signed certificate the listener
+//! generates and persists; connectors accept any server cert at the TLS
+//! layer because trust is established by the ed25519 mutual-auth handshake
+//! (which binds the channel via the cert fingerprint). `--no-tls` opts a
+//! listener into plaintext ws:// for running behind a TLS-terminating proxy
+//! or on a trusted network. CSP ships no embedded CA: TLS adds
+//! confidentiality only — protocol-level mutual auth and content integrity
+//! hold regardless of transport TLS.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -58,15 +63,14 @@ impl Node {
         }
     }
 
-    /// Listen for inbound peers and relay between them (§6.1). **HARD
-    /// INVARIANT (§7):** only full nodes listen — enforced by the caller
-    /// (CLI refuses `--listen` on a thin tier). `tls = Some(cfg)` serves
-    /// `wss://` (the default, §17.1); `None` serves plaintext `ws://`
-    /// (`--no-tls`: behind a TLS-terminating proxy, or local/trusted).
-    /// `tls = Some((cfg, cert_fp))`: serve `wss://`; `cert_fp` (SHA-256 of
-    /// the server cert) is the channel binding mixed into the handshake
-    /// transcript (§10). `None`: plaintext `ws://`, empty binding (trusted
-    /// network — acceptable per §10).
+    /// Listen for inbound peers and relay between them. Listening is a
+    /// native-only capability (server sockets + on-disk odb); the wasm build
+    /// does not compile this module at all, so a browser/WebView node is
+    /// outbound-only by construction. `tls = Some((cfg, cert_fp))`: serve
+    /// `wss://` (the default); `cert_fp` (SHA-256 of the server cert) is the
+    /// channel binding mixed into the handshake transcript. `None`: plaintext
+    /// `ws://` (`--no-tls`: behind a TLS-terminating proxy or on a trusted
+    /// network), empty channel binding.
     pub async fn serve(
         &self,
         addr: SocketAddr,

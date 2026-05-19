@@ -63,18 +63,13 @@ export type {
 } from './vault.js';
 
 export type {
-  CspConfig,
   FileMeta,
-  IdentitySection,
-  PeerSection,
   ReconnectOptions,
-  ScopeSection,
   Snapshot,
   StorageAdapter,
-  TomlDoc,
-  TomlValue,
   TransportAdapter,
   TransportConn,
+  VaultConfig,
   VaultEvent,
   VaultOptions,
 } from './types.js';
@@ -82,16 +77,7 @@ export type {
 export { MemoryStorage, memoryStorage };
 export { defaultTransport, makeWebSocketTransport } from './transport-ws.js';
 
-export {
-  applyConfigToDoc,
-  configFromDoc,
-  defaultConfig,
-  defaultScopeSection,
-  parseConfig,
-  parseTomlDoc,
-  serializeConfig,
-  stringifyTomlDoc,
-} from './config.js';
+export { defaultConfig, parseConfig, serializeConfig } from './config.js';
 
 export { formatCspIdentity, formatPubkeySidecar, parseCspIdentity } from './identity-file.js';
 

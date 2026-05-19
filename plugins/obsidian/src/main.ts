@@ -8,10 +8,10 @@
 //                                  wizard stays up, pre-filled, with the
 //                                  error so the user can fix and retry.
 //
-// "Configured" is gated on `[obsidian] onboarded`, NOT merely on
-// `.context/config` existing. Setup writes config up front (it's the
-// CLI-shared file — a partial config is harmless), but the vault only
-// counts as configured once setup actually works end to end: create-mode
+// "Configured" is gated on the sidecar's `onboarded` flag, NOT merely on
+// the node-local sidecar existing. Setup writes the sidecar up front (peer
+// URL + plugin knobs), but the vault only counts as configured once setup
+// actually works end to end: create-mode
 // latches as soon as the local vault is built; connect-mode only after the
 // peer handshake + first catch-up succeeds (the exact step where an
 // unauthorized device key fails). Deleting `.context/` returns the plugin
@@ -145,8 +145,9 @@ export default class ContextSyncPlugin extends Plugin {
   }
 
   /** The one and only path that creates `<vault>/.context/`. Resolves (or
-   * generates) the device identity, writes `.context/config`, then brings
-   * the controller online. */
+   * generates) the device identity, writes the node-local plugin sidecar
+   * (and mirrors the peer into `.context/config` when the engine has
+   * created it), then brings the controller online. */
   async runSetup(opts: SetupOptions): Promise<void> {
     await this.initWasm();
     const io = this.resolveIdentityIO();
@@ -162,12 +163,12 @@ export default class ContextSyncPlugin extends Plugin {
     // it unset (CLI default `~/.context/id_ed25519`).
     if (!Platform.isDesktopApp) s.identityPath = VAULT_IDENTITY_PATH;
 
-    // Persist `.context/config` up front (CLI-shared; partial is harmless)
-    // but DON'T latch "configured" yet — `onboarded` flips only once setup
-    // actually works.
+    // Persist the plugin sidecar up front (peer URL + knobs) but DON'T
+    // latch "configured" yet — `onboarded` flips only once setup actually
+    // works.
     s.onboarded = false;
     this.settings = s;
-    await this.configStore?.save(s); // ← creates .context/config
+    await this.configStore?.save(s); // ← writes the node-local sidecar
     this.configured = false;
     this.onboardingError = null;
 
@@ -220,7 +221,7 @@ export default class ContextSyncPlugin extends Plugin {
     });
   }
 
-  /** Flip the master sync switch. Persists `[obsidian] sync_enabled`. */
+  /** Flip the master sync switch. Persists `syncEnabled` to the sidecar. */
   async setSyncEnabled(on: boolean): Promise<void> {
     if (!this.configured) return;
     this.settings.syncEnabled = on;

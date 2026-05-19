@@ -7,11 +7,8 @@
 // never touch the real `~/.context`.
 
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import ContextSyncPlugin, {
-  decodeInlinedWasm,
-  inlinedWasmB64,
-} from '../../src/main.js';
 import { type IdentityIO, loadOrCreateIdentity } from '../../src/identity-store.js';
+import ContextSyncPlugin, { decodeInlinedWasm, inlinedWasmB64 } from '../../src/main.js';
 import { ConfigStore, DEFAULT_SETTINGS } from '../../src/settings.js';
 import { App, Notice, Platform, __resetObsidian } from '../mocks/obsidian-shim.js';
 import { FakeDataAdapter, FakeVault } from '../mocks/obsidian.js';
@@ -50,13 +47,17 @@ class MemIO implements IdentityIO {
 const MANIFEST = { id: 'context-sync', name: 'Context', version: '0.1.0' };
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
-function makePlugin(adapter = new FakeDataAdapter()) {
+function makePluginWith(adapter: FakeDataAdapter, io: IdentityIO) {
   const vault = new FakeVault(adapter);
   const app = new App(vault);
   // biome-ignore lint/suspicious/noExplicitAny: shim App vs real obsidian type
   const plugin = new ContextSyncPlugin(app as any, MANIFEST as any);
-  plugin.identityIOOverride = new MemIO();
+  plugin.identityIOOverride = io;
   return { plugin, app, vault, adapter };
+}
+
+function makePlugin(adapter = new FakeDataAdapter()) {
+  return makePluginWith(adapter, new MemIO());
 }
 
 beforeEach(() => {
@@ -122,7 +123,7 @@ describe('onload — unconfigured', () => {
 });
 
 describe('runSetup — create mode', () => {
-  test('builds a local vault, latches onboarded, writes .context/config', async () => {
+  test('builds a local vault, latches onboarded, writes the sidecar', async () => {
     const { plugin, adapter } = makePlugin();
     await plugin.onload();
     await plugin.runSetup({ mode: 'create' });
@@ -131,9 +132,9 @@ describe('runSetup — create mode', () => {
     expect(plugin.settings.onboarded).toBe(true);
     expect(plugin.controller).not.toBeNull();
     expect(plugin.controller?.state).toBe('idle'); // create mode never connects
-    const cfg = await adapter.read('.context/config');
-    expect(cfg).toContain('sync_enabled = true');
-    expect(cfg).toContain('onboarded = true');
+    const side = JSON.parse(await adapter.read('.context/obsidian.json'));
+    expect(side.syncEnabled).toBe(true);
+    expect(side.onboarded).toBe(true);
     // Identity was generated through the injected IO, not ~/.context.
     expect((plugin.identityIOOverride as MemIO).body?.startsWith('csp-identity-v1 ')).toBe(true);
     await plugin.onunload();
@@ -151,8 +152,10 @@ describe('runSetup — connect mode failure', () => {
     expect(plugin.isConfigured()).toBe(false);
     expect(plugin.onboardingError).not.toBeNull();
     expect(plugin.controller).toBeNull();
-    // Config IS written up front (CLI-shared; a partial config is harmless).
-    expect(await adapter.exists('.context/config')).toBe(true);
+    // Plugin-owned state (the peer URL) is captured in the node-local
+    // sidecar up front even though the canonical .context/config is only
+    // created once the engine builds the vault.
+    expect(await adapter.exists('.context/obsidian.json')).toBe(true);
   });
 });
 
@@ -186,15 +189,68 @@ describe('configured onload + event wiring', () => {
     expect(plugin.controller).toBeNull();
   });
 
-  test('a vault create event is pushed into the engine', async () => {
+  test('create / modify / delete / rename events all reach the engine', async () => {
     const { plugin, vault } = await configuredPlugin();
-    await vault.create('note.md', '# hello\n');
+    const bridge = plugin.controller?.getBridge();
+
+    const f = await vault.create('note.md', '# hello\n');
     await tick(20);
-    expect(plugin.controller?.getBridge()?.pushed).toBeGreaterThanOrEqual(1);
+    expect(bridge?.pushed).toBeGreaterThanOrEqual(1);
+
+    await vault.modify(f, '# hello edited\n');
+    await tick(20);
+    const g = await vault.create('tmp.md', 'temp\n');
+    await tick(20);
+    await vault.rename(g, 'renamed.md');
+    await tick(20);
+    await vault.delete(f);
+    await tick(20);
+    // All four event handlers ran without an unhandled rejection.
+    expect(bridge?.pushed).toBeGreaterThanOrEqual(3);
+
+    // The configured `context-connect` command path.
+    // biome-ignore lint/suspicious/noExplicitAny: shim test helper
+    (plugin as any).__invoke('context-connect');
+    await tick(20);
+    expect(Notice.log.some((m) => /not set up yet/.test(m))).toBe(false);
+
     // The HARD INVARIANT: nothing under .context/ leaks into vault content.
-    expect(vault.getFiles().some((f) => f.path.startsWith('.context'))).toBe(false);
+    expect(vault.getFiles().some((x) => x.path.startsWith('.context'))).toBe(false);
     await plugin.onunload();
   });
+
+  test('saveSettings() writes plugin settings to the node-local sidecar', async () => {
+    const { plugin, adapter } = await configuredPlugin();
+    plugin.settings.ignoreGlobs = ['Drafts/**'];
+    await plugin.saveSettings();
+    const side = JSON.parse(await adapter.read('.context/obsidian.json'));
+    expect(side.ignoreGlobs).toContain('Drafts/**');
+    await plugin.onunload();
+  });
+});
+
+describe('runSetup — connect mode, peer unreachable', () => {
+  test('pre-seeded state opens locally then waitForConnect rejects on error', async () => {
+    const adapter = new FakeDataAdapter();
+    const io = new MemIO();
+    // Plugin 1, create mode: persists .context/state + the device key.
+    const p1 = makePluginWith(adapter, io);
+    await p1.plugin.onload();
+    await p1.plugin.runSetup({ mode: 'create' });
+    await p1.plugin.onunload();
+
+    // Plugin 2, same adapter + identity: openOrCreate takes Vault.open (no
+    // network throw); connect mode with an unreachable peer → the reconnect
+    // loop emits 'error' → waitForConnect rejects → runSetup rejects.
+    const p2 = makePluginWith(adapter, io);
+    await p2.plugin.onload();
+    await expect(
+      p2.plugin.runSetup({ mode: 'connect', peerUrl: 'ws://127.0.0.1:1' }),
+    ).rejects.toBeDefined();
+    expect(p2.plugin.isConfigured()).toBe(false);
+    expect(p2.plugin.onboardingError).not.toBeNull();
+    expect(p2.plugin.controller).toBeNull();
+  }, 20_000);
 });
 
 describe('setSyncEnabled + commands (configured)', () => {
@@ -205,14 +261,15 @@ describe('setSyncEnabled + commands (configured)', () => {
     return { plugin, vault, adapter };
   }
 
-  test('toggling sync off stops, back on restarts; persisted to config', async () => {
+  test('toggling sync off stops, back on restarts; persisted to the sidecar', async () => {
     const { plugin, adapter } = await ready();
     await plugin.setSyncEnabled(false);
     expect(plugin.settings.syncEnabled).toBe(false);
-    expect(await adapter.read('.context/config')).not.toContain('sync_enabled = true');
+    const off = JSON.parse(await adapter.read('.context/obsidian.json'));
+    expect(off.syncEnabled ?? false).toBe(false);
     await plugin.setSyncEnabled(true);
     expect(plugin.settings.syncEnabled).toBe(true);
-    expect(await adapter.read('.context/config')).toContain('sync_enabled = true');
+    expect(JSON.parse(await adapter.read('.context/obsidian.json')).syncEnabled).toBe(true);
     await plugin.onunload();
   });
 
@@ -245,13 +302,15 @@ describe('setSyncEnabled + commands (configured)', () => {
 });
 
 describe('mobile identity path', () => {
-  test('non-desktop runSetup records [identity] path in config', async () => {
+  test('non-desktop runSetup records the identity path in the sidecar', async () => {
     Platform.isDesktopApp = false;
     const { plugin, adapter } = makePlugin();
     await plugin.onload();
     await plugin.runSetup({ mode: 'create' });
     expect(plugin.settings.identityPath).toBe('.context/id_ed25519');
-    expect(await adapter.read('.context/config')).toContain('path = ".context/id_ed25519"');
+    expect(JSON.parse(await adapter.read('.context/obsidian.json')).identityPath).toBe(
+      '.context/id_ed25519',
+    );
     await plugin.onunload();
   });
 });

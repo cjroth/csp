@@ -60,6 +60,12 @@ function yieldToEventLoop(): Promise<void> {
   return new Promise((r) => setTimeout(r, 0));
 }
 
+/** Vault-relative parent directory of `path`, or '' at the root. */
+function parentDir(path: string): string {
+  const i = path.lastIndexOf('/');
+  return i <= 0 ? '' : path.slice(0, i);
+}
+
 export class ObsidianVaultBridge {
   /** Paths the bridge wrote — modify/create handlers eat one token each. */
   private suppressed = new Map<string, number>();
@@ -250,6 +256,7 @@ export class ObsidianVaultBridge {
       await this.deps.vault.delete(ex);
       this.pulled += 1;
       this.log(`pull-delete (tombstone): ${path}`);
+      await this.pruneEmptyFolders(path);
       if (++j % ObsidianVaultBridge.YIELD_EVERY === 0) await yieldToEventLoop();
     }
     this.knownSdkPaths = currentPaths;
@@ -268,6 +275,7 @@ export class ObsidianVaultBridge {
         await this.deps.vault.delete(existing);
         this.pulled += 1;
         this.log(`pull-delete: ${meta.path}`);
+        await this.pruneEmptyFolders(meta.path);
       }
       return;
     }
@@ -305,6 +313,34 @@ export class ObsidianVaultBridge {
     }
     this.pulled += 1;
     this.log(`pull-create: ${meta.path}`);
+  }
+
+  /**
+   * After removing a synced file, reap now-empty ancestor folders. The
+   * engine models files only — a folder rename is N file moves — so without
+   * this the emptied source folder (and its empty subfolders) lingers in
+   * the vault. Climbs parents, stopping at the first folder that still
+   * holds a file (or the vault root).
+   */
+  async pruneEmptyFolders(filePath: string): Promise<void> {
+    let dir = parentDir(filePath);
+    while (dir) {
+      const node = this.deps.vault.getAbstractFileByPath(dir);
+      if (!node || this.isFile(node)) break;
+      const prefix = `${dir}/`;
+      const stillUsed = this.deps.vault
+        .getFiles()
+        .some((f) => f.path === dir || f.path.startsWith(prefix));
+      if (stillUsed) break;
+      this.suppress(dir);
+      try {
+        await this.deps.vault.delete(node, true);
+      } catch {
+        break; // best-effort — a failed prune must not wedge the apply pass
+      }
+      this.log(`pull-rmdir (empty): ${dir}`);
+      dir = parentDir(dir);
+    }
   }
 
   /** Ensure all ancestor folders for `filePath` exist in the vault. */

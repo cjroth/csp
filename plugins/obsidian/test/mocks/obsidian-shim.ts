@@ -89,8 +89,7 @@ export const __obsidian = {
   /** True if any createEl text contains `needle`. */
   hasText: (needle: string): boolean => recordedEls.some((e) => e.text.includes(needle)),
   /** First createEl whose text contains `needle`. */
-  el: (needle: string): RecordedEl | undefined =>
-    recordedEls.find((e) => e.text.includes(needle)),
+  el: (needle: string): RecordedEl | undefined => recordedEls.find((e) => e.text.includes(needle)),
 };
 
 // ---------- Component stubs (bound to a RecordedComponent) ----------

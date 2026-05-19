@@ -2,10 +2,10 @@
 // and the desktop `~/.context/id_ed25519` Node-fs store. The pure
 // load/create logic is covered by identity-store.test.ts.
 
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   NodeHomeIdentityIO,
   VAULT_IDENTITY_PATH,

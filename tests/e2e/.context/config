@@ -1,6 +1,8 @@
-vault_id = "v-tofu"
+vault_id = "v-gitflags"
+name = "e2e"
 peers = []
-tier = "full"
 no_tofu = false
+no_tls = false
+debounce_ms = 1000
 allow_binary = false
 include = ["**"]

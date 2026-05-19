@@ -27,7 +27,7 @@ let port = 0;
 
 function run(args: string[], extraEnv: Record<string, string> = {}): string {
   const r = spawnSync(ctxBin, args, {
-    env: { ...process.env, HOME: home, CTX_CWD: vaultDir, CTX_LOG: 'error', ...extraEnv },
+    env: { ...process.env, HOME: home, CTX_DIR: vaultDir, CTX_LOG: 'error', ...extraEnv },
     encoding: 'utf8',
   });
   if (r.status !== 0) throw new Error(`ctx ${args.join(' ')} failed: ${r.stderr}`);
@@ -54,7 +54,7 @@ beforeAll(async () => {
   run(['init', '--vault-id', 'parity-v']);
 
   watch = spawn(ctxBin, ['watch', '--listen', '127.0.0.1:0', '--no-tls', '--debounce-ms', '250'], {
-    env: { ...process.env, HOME: home, CTX_CWD: vaultDir, CTX_LOG: 'ctx=info,csp_core=warn' },
+    env: { ...process.env, HOME: home, CTX_DIR: vaultDir, CTX_LOG: 'ctx=info,csp_core=warn' },
   });
   port = await waitFor<number>(
     () =>

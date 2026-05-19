@@ -1,61 +1,66 @@
-// The plugin's settings ARE `<vault>/.context/config` — the same file the
-// native `ctx` CLI reads/writes (CSP spec.md §9.1/§17.1: `ctx` is one
-// front-end, the plugin another). There is no separate `data.json`: a vault
-// directory works identically from the CLI or this plugin, which
-// structurally removes the "configured-vs-on-disk" divergence bug class.
+// The plugin is just another front-end over the same vault directory the
+// native `ctx` CLI reads/writes, so it does NOT keep a private `data.json`.
+// Persistence is split into two files, each owned by a clear party:
 //
-// Schema-defined tables (`[peer]`, `[identity]`, `[scope]`) are shared with
-// `ctx`. Plugin-only knobs live in an `[obsidian]` table `ctx` ignores; the
-// codec round-trips unknown tables losslessly so neither clobbers the
-// other.
+//   .context/config          The canonical, SHARED vault config. Exactly the
+//                             bytes `ctx` reads/writes, round-tripped through
+//                             the single Rust codec (wasm). The plugin only
+//                             projects `peerUrl` onto its `peers` list and
+//                             leaves every other field (vault_id, include,
+//                             debounce_ms, …) untouched: it parses the file
+//                             that is on disk, mutates `peers`, and
+//                             re-serializes, so anything `ctx` wrote survives.
+//                             If this file does not exist the plugin does NOT
+//                             invent one (it has no authority to mint a
+//                             vault_id); the peer URL still survives in the
+//                             node-local sidecar and is reconciled into the
+//                             canonical config once the vault exists.
 //
-// Pure module — no `obsidian` runtime import — so it is fully unit
-// testable. File IO is injected via `MinimalDataAdapter`.
+//   .context/obsidian.json   A node-local sidecar the PLUGIN fully owns. It
+//                             lives under `.context/`, which is never synced
+//                             and is excluded from the engine repo — the same
+//                             rationale that makes `authorized_keys`/`exclude`
+//                             node-local. It holds every plugin-only knob
+//                             (peerPubkey, syncEnabled, autoConnectOnStart,
+//                             onboarded, ignoreGlobs, identityPath) plus a
+//                             fallback copy of peerUrl for the pre-config
+//                             window. To keep the file minimal, a knob is only
+//                             written when it differs from its default.
 //
-// CSP recast of the agentsync settings: no `vaultId`/`vaultName` (no
-// server-minted id, CSP §5); `rendezvous_url`→`[peer] url`,
-// `hub_pubkey`→`[peer] pubkey` (no hub — a thin node connects to a full
-// node in listen mode, CSP §6.1).
+// The Rust config codec is strict and flat: it only round-trips the known
+// `VaultConfig` fields, so plugin-only knobs could never have lived safely in
+// `.context/config` anyway — they belong in the sidecar.
+//
+// Pure module — no `obsidian` runtime import — so it is fully unit testable.
+// File IO is injected via `MinimalDataAdapter`.
 
-import {
-  type CspConfig,
-  type TomlDoc,
-  type TomlValue,
-  applyConfigToDoc,
-  configFromDoc,
-  parseTomlDoc,
-  stringifyTomlDoc,
-} from '@csp/sdk/web-init';
+import { type VaultConfig, parseConfig, serializeConfig } from '@csp/sdk/web-init';
 import type { MinimalDataAdapter } from './storage-adapter.js';
 
-/** Plugin-only TOML table `ctx` ignores. */
-const OBSIDIAN_TABLE = 'obsidian';
-
 export interface CspSettings {
-  /** `[peer] url` — the full node (in listen mode, CSP §6.1) to sync with.
-   * Empty → offline-first local-only thin node (won't converge until it
-   * connects to a full node — CSP §7). */
+  /** The full node (running in listen mode) this thin node syncs with.
+   * Empty → offline-first local-only node (won't converge until it connects
+   * to a full node). Mapped onto `VaultConfig.peers` in `.context/config`. */
   peerUrl: string;
-  /** `[peer] pubkey` — pinned peer identity, SSH wire format
-   * (`ssh-ed25519 AAAA…`). Set on first successful connect (CSP §10 key
-   * pinning). */
+  /** Pinned peer identity, SSH wire format (`ssh-ed25519 AAAA…`). Set on the
+   * first successful connect. Plugin-owned (sidecar). */
   peerPubkey: string;
-  /** `[obsidian] sync_enabled` — master switch. While false the plugin
-   * opens no engine session and makes no connection. */
+  /** Master switch. While false the plugin opens no engine session and makes
+   * no connection. Plugin-owned (sidecar). */
   syncEnabled: boolean;
-  /** `[obsidian] auto_connect` — open the peer connection on launch (vs.
-   * staying prepared). Only meaningful while `syncEnabled`. */
+  /** Open the peer connection on launch (vs. staying prepared). Only
+   * meaningful while `syncEnabled`. Plugin-owned (sidecar). */
   autoConnectOnStart: boolean;
-  /** `[obsidian] onboarded` — true only once setup fully succeeded
-   * (create: local vault built; connect: peer handshake + first catch-up
-   * reached). `ctx` ignores this key. */
+  /** True only once setup fully succeeded (create: local vault built;
+   * connect: peer handshake + first catch-up reached). Plugin-owned
+   * (sidecar). */
   onboarded: boolean;
-  /** `[obsidian] ignore_globs` — extra globs to skip, on top of the
-   * always-on text-allowlist + `.context/` exclusion. */
+  /** Extra globs to skip, on top of the always-on text-allowlist +
+   * `.context/` exclusion. Plugin-owned (sidecar). */
   ignoreGlobs: string[];
-  /** `[identity] path` — vault-relative identity location. Set on mobile;
-   * unset on desktop so it defaults to the CLI-shared
-   * `~/.context/id_ed25519` (CSP §9.1/§10). */
+  /** Vault-relative identity location. Set on mobile; unset on desktop so it
+   * defaults to the CLI-shared `~/.context/id_ed25519`. Plugin-owned
+   * (sidecar). */
   identityPath: string;
 }
 
@@ -81,65 +86,79 @@ export function parseIgnoreGlobs(input: string): string[] {
 
 // ---- Pure config ⇄ settings mapping (unit-testable) ----
 
-function obsidianTable(doc: TomlDoc): Map<string, TomlValue> | undefined {
-  return doc.get(OBSIDIAN_TABLE);
+/** The plugin-owned sidecar shape. Every field is optional — a missing key
+ * means "use the default". `peerUrl` is mirrored here so it still persists
+ * before a canonical `.context/config` exists. */
+interface SidecarJson {
+  peerUrl?: string;
+  peerPubkey?: string;
+  syncEnabled?: boolean;
+  autoConnectOnStart?: boolean;
+  onboarded?: boolean;
+  ignoreGlobs?: string[];
+  identityPath?: string;
 }
 
-/** Project a parsed `.context/config` doc onto the plugin's settings view. */
-export function settingsFromTomlDoc(doc: TomlDoc): CspSettings {
-  const cfg = configFromDoc(doc);
-  const ob = obsidianTable(doc);
-  const auto = ob?.get('auto_connect');
-  const sync = ob?.get('sync_enabled');
-  const onboarded = ob?.get('onboarded');
-  const globs = ob?.get('ignore_globs');
-  return {
-    peerUrl: cfg.peer.url ?? '',
-    peerPubkey: cfg.peer.pubkey ?? '',
-    syncEnabled: sync === true,
-    autoConnectOnStart: auto === true,
-    onboarded: onboarded === true,
-    ignoreGlobs: Array.isArray(globs) ? globs.slice() : [],
-    identityPath: cfg.identity.path ?? '',
-  };
+/** Project a (possibly absent) canonical config + sidecar onto the merged
+ * settings view. `.context/config`'s `peers[0]` wins for `peerUrl` when the
+ * file exists; otherwise the sidecar's fallback copy is used. */
+export function settingsFromParts(cfg: VaultConfig | null, side: SidecarJson | null): CspSettings {
+  const s: CspSettings = { ...DEFAULT_SETTINGS };
+  if (side) {
+    if (typeof side.peerUrl === 'string') s.peerUrl = side.peerUrl;
+    if (typeof side.peerPubkey === 'string') s.peerPubkey = side.peerPubkey;
+    if (typeof side.syncEnabled === 'boolean') s.syncEnabled = side.syncEnabled;
+    if (typeof side.autoConnectOnStart === 'boolean') {
+      s.autoConnectOnStart = side.autoConnectOnStart;
+    }
+    if (typeof side.onboarded === 'boolean') s.onboarded = side.onboarded;
+    if (Array.isArray(side.ignoreGlobs)) {
+      s.ignoreGlobs = side.ignoreGlobs.filter((g): g is string => typeof g === 'string');
+    }
+    if (typeof side.identityPath === 'string') s.identityPath = side.identityPath;
+  }
+  // The shared canonical config is authoritative for the peer URL whenever it
+  // exists (it is what `ctx` and the engine actually read).
+  if (cfg) s.peerUrl = cfg.peers[0] ?? '';
+  return s;
 }
 
-/**
- * Layer settings back onto `base` (the doc parsed from disk, so unknown
- * `ctx`-written content survives). Empty/false plugin knobs are removed so
- * a default config is byte-identical to what `ctx` would write — no stray
- * empty `[obsidian]` table.
- */
-export function writeSettingsToTomlDoc(s: CspSettings, base?: TomlDoc): TomlDoc {
-  const prev: CspConfig = configFromDoc(base ?? new Map());
-  // Only the fields the plugin owns are overwritten; scope.* and any
-  // unknown `ctx` content are preserved. Empty string → drop the key (so
-  // we never persist `url = ""`).
-  prev.peer.url = s.peerUrl || undefined;
-  prev.peer.pubkey = s.peerPubkey || undefined;
-  prev.identity.path = s.identityPath || undefined;
-  const doc = applyConfigToDoc(prev, base);
+/** Build the sidecar JSON, persisting only knobs that differ from their
+ * default so the file stays minimal (mirrors the old "drop empty knobs"
+ * behavior). */
+export function sidecarFromSettings(s: CspSettings): SidecarJson {
+  const out: SidecarJson = {};
+  if (s.peerUrl !== DEFAULT_SETTINGS.peerUrl) out.peerUrl = s.peerUrl;
+  if (s.peerPubkey !== DEFAULT_SETTINGS.peerPubkey) out.peerPubkey = s.peerPubkey;
+  if (s.syncEnabled !== DEFAULT_SETTINGS.syncEnabled) out.syncEnabled = s.syncEnabled;
+  if (s.autoConnectOnStart !== DEFAULT_SETTINGS.autoConnectOnStart) {
+    out.autoConnectOnStart = s.autoConnectOnStart;
+  }
+  if (s.onboarded !== DEFAULT_SETTINGS.onboarded) out.onboarded = s.onboarded;
+  if (s.ignoreGlobs.length > 0) out.ignoreGlobs = s.ignoreGlobs.slice();
+  if (s.identityPath !== DEFAULT_SETTINGS.identityPath) out.identityPath = s.identityPath;
+  return out;
+}
 
-  const ob = new Map<string, TomlValue>();
-  if (s.syncEnabled) ob.set('sync_enabled', true);
-  if (s.autoConnectOnStart) ob.set('auto_connect', true);
-  if (s.onboarded) ob.set('onboarded', true);
-  if (s.ignoreGlobs.length > 0) ob.set('ignore_globs', s.ignoreGlobs.slice());
-  if (ob.size > 0) doc.set(OBSIDIAN_TABLE, ob);
-  else doc.delete(OBSIDIAN_TABLE);
-  return doc;
+/** Layer `peerUrl` onto an existing canonical config so everything `ctx`
+ * wrote (vault_id, include, debounce_ms, …) is preserved. */
+export function applyPeerUrl(cfg: VaultConfig, peerUrl: string): VaultConfig {
+  return { ...cfg, peers: peerUrl ? [peerUrl] : [] };
 }
 
 // ---- File-backed store ----
 
 /**
- * Reads/writes `<vault-root>/.context/config`. The last-parsed doc is
- * retained so saves are lossless w.r.t. anything `ctx` wrote that the
- * plugin doesn't model.
+ * Reads/writes the two-file split: the SHARED `.context/config` (only the
+ * peer URL is the plugin's to touch) and the node-local plugin sidecar
+ * `.context/obsidian.json`.
  */
 export class ConfigStore {
+  /** Kept for back-compat with callers that gate on the canonical config
+   * path. The sidecar path is derived from the same `.context` root. */
   static readonly PATH = '.context/config';
-  private doc: TomlDoc = new Map();
+  static readonly SIDECAR_PATH = '.context/obsidian.json';
+
   /** Serializes saves: connect-mode setup can fire two near-simultaneous
    * writes (the peer-key pin on `connected` and the onboarding latch), and
    * the tmp-write/rename dance is not concurrency-safe. */
@@ -147,20 +166,33 @@ export class ConfigStore {
 
   constructor(private readonly adapter: MinimalDataAdapter) {}
 
-  /** True once setup has written `.context/config`. The plugin treats this
-   * as the single "is this vault configured?" signal. */
-  exists(): Promise<boolean> {
-    return this.adapter.exists(ConfigStore.PATH);
+  /** True once the plugin or `ctx` has persisted anything for this vault —
+   * i.e. either the canonical config or the plugin sidecar exists. The
+   * plugin treats this as the "is there state to load?" signal. */
+  async exists(): Promise<boolean> {
+    return (
+      (await this.adapter.exists(ConfigStore.PATH)) ||
+      (await this.adapter.exists(ConfigStore.SIDECAR_PATH))
+    );
   }
 
   async load(): Promise<CspSettings> {
+    let cfg: VaultConfig | null = null;
     if (await this.adapter.exists(ConfigStore.PATH)) {
       const text = await this.adapter.read(ConfigStore.PATH);
-      this.doc = parseTomlDoc(text);
-    } else {
-      this.doc = new Map();
+      cfg = parseConfig(text);
     }
-    return settingsFromTomlDoc(this.doc);
+    let side: SidecarJson | null = null;
+    if (await this.adapter.exists(ConfigStore.SIDECAR_PATH)) {
+      const raw = await this.adapter.read(ConfigStore.SIDECAR_PATH);
+      try {
+        side = JSON.parse(raw) as SidecarJson;
+      } catch {
+        // A corrupt sidecar must not wedge load — fall back to defaults.
+        side = null;
+      }
+    }
+    return settingsFromParts(cfg, side);
   }
 
   save(s: CspSettings): Promise<void> {
@@ -176,16 +208,37 @@ export class ConfigStore {
   }
 
   private async doSave(s: CspSettings): Promise<void> {
-    this.doc = writeSettingsToTomlDoc(s, this.doc);
-    const text = stringifyTomlDoc(this.doc);
+    await this.ensureContextDir();
+
+    // 1. Sidecar — plugin-owned knobs + the peerUrl fallback.
+    const side = sidecarFromSettings(s);
+    await this.atomicWrite(ConfigStore.SIDECAR_PATH, JSON.stringify(side, null, 2));
+
+    // 2. Canonical config — ONLY the peer URL is ours to touch, and only if
+    // the file already exists (the plugin must not mint a vault_id). Parse
+    // what is on disk, mutate `peers`, re-serialize so `ctx`-written fields
+    // survive.
+    if (await this.adapter.exists(ConfigStore.PATH)) {
+      const text = await this.adapter.read(ConfigStore.PATH);
+      const cfg = applyPeerUrl(parseConfig(text), s.peerUrl);
+      await this.atomicWrite(ConfigStore.PATH, serializeConfig(cfg));
+    }
+  }
+
+  private async ensureContextDir(): Promise<void> {
     if (!(await this.adapter.exists('.context'))) {
       await this.adapter.mkdir('.context');
     }
-    const tmp = `${ConfigStore.PATH}.tmp`;
+  }
+
+  /** Write `<path>.tmp` then rename over `path` — the previous version stays
+   * intact until the rename succeeds. */
+  private async atomicWrite(path: string, text: string): Promise<void> {
+    const tmp = `${path}.tmp`;
     await this.adapter.write(tmp, text);
-    if (await this.adapter.exists(ConfigStore.PATH)) {
-      await this.adapter.remove(ConfigStore.PATH);
+    if (await this.adapter.exists(path)) {
+      await this.adapter.remove(path);
     }
-    await this.adapter.rename(tmp, ConfigStore.PATH);
+    await this.adapter.rename(tmp, path);
   }
 }

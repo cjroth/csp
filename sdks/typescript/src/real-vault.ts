@@ -44,6 +44,21 @@ export class RealVault implements Vault {
   private closed = false;
   private abort: AbortController | null = null;
 
+  // Commit coalescing (§5.2/§6.5). A bulk host operation — a folder rename,
+  // a multi-file paste, the initial reconcile — arrives as many separate
+  // writeTextFile/renameFile/deleteFile calls. Authoring + persisting the
+  // full engine state + live-pushing on EVERY one is O(n·stateSize) and
+  // produces n primitives + n frames (it never finishes on a big folder).
+  // Instead the working map is updated synchronously (reads stay correct)
+  // and a single commit is debounced so a burst collapses into ONE
+  // primitive + ONE persist + ONE live push. Durability/snapshot points
+  // flush explicitly.
+  private static readonly COMMIT_DEBOUNCE_MS = 120;
+  private commitTimer: ReturnType<typeof setTimeout> | null = null;
+  private commitPending = false;
+  private committing = false;
+  private commitWaiters: Array<() => void> = [];
+
   private constructor(
     private readonly engine: WasmEngine,
     private readonly seed: Uint8Array,
@@ -112,7 +127,7 @@ export class RealVault implements Vault {
 
   async writeTextFile(path: string, content: string): Promise<string> {
     this.files.set(path, content);
-    await this.commit();
+    this.scheduleCommit();
     return path;
   }
   async readTextFile(path: string): Promise<string> {
@@ -124,14 +139,14 @@ export class RealVault implements Vault {
     return this.files.has(path);
   }
   async deleteFile(path: string): Promise<void> {
-    if (this.files.delete(path)) await this.commit();
+    if (this.files.delete(path)) this.scheduleCommit();
   }
   async renameFile(from: string, to: string): Promise<void> {
     const c = this.files.get(from);
     if (c === undefined) return;
     this.files.set(to, c);
     this.files.delete(from);
-    await this.commit();
+    this.scheduleCommit();
   }
   listFiles(): FileMeta[] {
     const out: FileMeta[] = [];
@@ -152,6 +167,7 @@ export class RealVault implements Vault {
   // ---- Snapshots / recovery (CSP §8) ----
 
   async createSnapshot(name: string): Promise<void> {
+    await this.flushCommit(); // the snapshot frontier must include pending edits
     this.engine.snapshot(name);
     await this.persist();
   }
@@ -181,11 +197,12 @@ export class RealVault implements Vault {
   }
 
   private async applyRestoredTree(tree: Record<string, number[]>): Promise<void> {
+    await this.flushCommit(); // author any pending edits before re-authoring
     this.files.clear();
     for (const [p, bytes] of Object.entries(tree)) {
       this.files.set(p, dec.decode(Uint8Array.from(bytes)));
     }
-    await this.commit(); // restore-as-edit (§8)
+    await this.commitNow(); // restore-as-edit (§8)
     this.emit({ kind: 'tree-changed' });
   }
 
@@ -257,6 +274,7 @@ export class RealVault implements Vault {
 
   async close(): Promise<void> {
     if (this.closed) return;
+    await this.flushCommit(); // never lose a debounced edit on shutdown
     this.closed = true;
     await this.disconnect();
     await this.persist();
@@ -289,9 +307,54 @@ export class RealVault implements Vault {
     }
   }
 
+  /** Request a commit. Cheap + synchronous for the caller: a burst of host
+   * file ops collapses into one debounced `commitNow` (leading-edge, same
+   * shape as the bridge's apply debounce). */
+  private scheduleCommit(): void {
+    if (this.closed) return;
+    this.commitPending = true;
+    if (this.committing || this.commitTimer !== null) return;
+    this.commitTimer = setTimeout(() => {
+      this.commitTimer = null;
+      void this.runCommit();
+    }, RealVault.COMMIT_DEBOUNCE_MS);
+  }
+
+  /** Drain pending commits one at a time; ops that arrive mid-commit are
+   * folded into the next pass. Resolves any `flushCommit` waiters when idle. */
+  private async runCommit(): Promise<void> {
+    if (this.committing) return;
+    this.committing = true;
+    try {
+      while (this.commitPending && !this.closed) {
+        this.commitPending = false;
+        await this.commitNow();
+      }
+    } finally {
+      this.committing = false;
+      const waiters = this.commitWaiters;
+      this.commitWaiters = [];
+      for (const w of waiters) w();
+    }
+  }
+
+  /** Force any scheduled/in-flight commit to complete now. Used at the
+   * durability + snapshot points so a debounced edit is never lost. */
+  async flushCommit(): Promise<void> {
+    if (this.commitTimer !== null) {
+      clearTimeout(this.commitTimer);
+      this.commitTimer = null;
+    }
+    if (!this.commitPending && !this.committing) return;
+    await new Promise<void>((resolve) => {
+      this.commitWaiters.push(resolve);
+      void this.runCommit();
+    });
+  }
+
   /** Author a primitive from the working map (§5.6 reconcile-by-content is
    * inside the engine); on a new primitive, persist and live-push it (§6.5). */
-  private async commit(): Promise<void> {
+  private async commitNow(): Promise<void> {
     const prim = this.engine.commit_from_files(filesToJson(this.files));
     if (!prim) return;
     await this.persist();
@@ -304,6 +367,9 @@ export class RealVault implements Vault {
 
   /** Apply the §5.6 no-clobber materialize plan into the working map. */
   async materializeFromMain(): Promise<void> {
+    // Author pending host edits first so the §5.6 plan sees them as
+    // primitives (not just uncommitted working bytes) before a merge.
+    await this.flushCommit();
     const ops = JSON.parse(this.engine.materialize_plan(filesToJson(this.files))) as MatOp[];
     let changed = false;
     for (const o of ops) {
