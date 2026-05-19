@@ -12,6 +12,8 @@ pub enum CspError {
     Io(String),
     #[error("signature verification failed: {0}")]
     BadSignature(String),
+    #[error("channel binding mismatch: {0}")]
+    ChannelBinding(String),
     #[error("unauthorized author: {0}")]
     Unauthorized(String),
     #[error("fold verification failed: {0}")]

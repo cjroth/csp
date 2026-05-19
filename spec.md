@@ -426,7 +426,12 @@ re-runs catch-up — there is no separate resync path.
 `Hello`, `AuthProof`, `FrontierDigest`, `WantTips`, `Objects`,
 `Live(signed primitive)`, `Ping`, `Pong`. The handshake challenge is the
 channel-binding transcript carried by `Hello`/`AuthProof` (no separate
-`AuthChallenge`); object exchange is closure-based (`WantTips` → `Objects`,
+`AuthChallenge`). The listener's `Hello` **advertises its channel binding**
+— the SHA-256 of its TLS certificate, or an all-zero/empty "binding
+disabled" marker under `--no-tls` — and *both* sides sign the transcript
+over that single advertised value (§10), so a TLS-terminating front proxy
+no longer desynchronizes the two transcripts. Object exchange is
+closure-based (`WantTips` → `Objects`,
 no separate `Commits`/`WantObjects`); snapshots are local refs replicated as
 ordinary objects (no `Snapshot` message). `FrontierDigest`/`WantTips` is the
 sole, authoritative reconciliation (no scalar-VV fast-path).
@@ -651,6 +656,34 @@ thin-node retention horizon are explicitly deferred, not a v1 concern.
   underlying transport, so a captured handshake cannot be replayed or relayed
   onto another channel. Both directions authenticate: a connecting node also
   verifies the listener's key, enabling key pinning.
+- **Advertised channel binding (the listener owns it).** The transport
+  binding mixed into the signed transcript is **not** each side's local view
+  of the certificate (that desynchronizes the moment a benign TLS-terminating
+  proxy sits in front of the listener — the connector binds to the proxy's
+  cert, the listener to its own/none, and the two transcripts can never
+  agree, surfacing as an opaque signature failure). Instead, the **listener
+  advertises one channel-binding value in its `Hello`** — the SHA-256 of the
+  certificate it serves, or an all-zero/empty *binding-disabled* marker when
+  it runs `--no-tls` behind a TLS terminator — and **both sides sign the
+  transcript over that single advertised value**. Separately, and *only as an
+  explicit check with its own distinct error* (never as silent transcript
+  divergence), the connector enforces the binding:
+  - *Advertised binding disabled* (all-zero/empty): degraded mode. The
+    connector skips the certificate comparison; trust falls back to the
+    **TOFU-pinned listener identity** (the transcript also covers the
+    listener's NodeId, which a MITM cannot forge — and `ctx clone` already
+    pins the listener key, §6.1). Required configuration behind a
+    re-terminating reverse proxy.
+  - *Binding advertised but unobservable* (plaintext `ws://`, or a browser
+    `WebSocket` that cannot read the peer cert — §7): degraded as above; the
+    connector SHOULD warn.
+  - *Binding advertised and observable*: the connector MUST verify the
+    advertised fingerprint equals the certificate it actually saw and MUST
+    abort with a distinct channel-binding error (not a generic signature
+    failure) on mismatch — this is the live MITM / cert-substitution defense.
+  A handshake-transcript or framing change is a coordinated break: the wire
+  `proto` version is bumped so skew is reported as a clear version-mismatch
+  rather than an opaque signature error.
 - **Per-author authorization (not per-connection).** Transport auth alone is
   insufficient in a relay protocol. Every **primitive commit is signed by its
   author NodeId key** (§5.1/§5.2). A node accepts a primitive only if (a) the
@@ -680,7 +713,14 @@ thin-node retention horizon are explicitly deferred, not a v1 concern.
   **`--no-tls` / `CTX_NO_TLS`** opts a listener out into plaintext `ws://`,
   for running behind a fronting proxy that already terminates TLS (optionally
   with a CA-trusted cert) or on a trusted/local network. Connectors select
-  TLS by URL scheme (`wss://` vs `ws://`).
+  TLS by URL scheme (`wss://` vs `ws://`). A listener reached **through a
+  TLS-terminating reverse proxy (Fly.io, Railway, Render, Cloudflare Tunnel,
+  …) MUST run `--no-tls`**: the proxy re-terminates TLS, so the certificate a
+  connector observes is the proxy's, never the listener's — only the
+  advertised binding-disabled marker keeps the handshake coherent (above).
+  Connectors then still dial `wss://` so the proxy hop stays encrypted; the
+  TLS layer authenticates the proxy and the pinned listener identity
+  authenticates the peer.
 - **Integrity.** Objects are **content-addressed and self-verifying**: a
   received object is stored under the SHA recomputed from its own bytes, so a
   corrupted or substituted object cannot masquerade as another and is never

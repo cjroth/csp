@@ -1,8 +1,0 @@
-vault_id = "5325cf30-dd3f-43d8-be8c-b6753d9a5bff"
-name = "demo1"
-peers = []
-no_tofu = false
-no_tls = false
-debounce_ms = 1000
-allow_binary = false
-include = ["**"]

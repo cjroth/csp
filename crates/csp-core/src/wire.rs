@@ -9,8 +9,11 @@ use serde::{Deserialize, Serialize};
 /// Wire/handshake protocol version. Bump on any change to the handshake
 /// transcript or message framing so version skew is reported clearly
 /// instead of surfacing as an opaque signature error. v2 added §10
-/// channel binding (TLS cert fingerprint in the transcript).
-pub const PROTO_VERSION: u32 = 2;
+/// channel binding (TLS cert fingerprint in the transcript); v3 made the
+/// binding **listener-advertised** (`Hello.cb`) and signed over that single
+/// agreed value, so a TLS-terminating front proxy no longer desynchronizes
+/// the two transcripts (§10).
+pub const PROTO_VERSION: u32 = 3;
 
 fn proto_default() -> u32 {
     // An old peer's `Hello` has no `proto` field → 0 → reported as skew.
@@ -29,6 +32,14 @@ pub enum Msg {
         name: String,
         node_ssh: String,
         nonce: Vec<u8>,
+        /// The **listener's advertised channel binding** (§10): the SHA-256
+        /// of the TLS certificate it serves, or all-zero/empty when it runs
+        /// `--no-tls` behind a TLS terminator ("binding disabled"). Both
+        /// sides sign the transcript over this single advertised value; the
+        /// connector additionally checks it against the cert it observed.
+        /// A connector's `Hello` leaves this empty (it advertises nothing).
+        #[serde(default)]
+        cb: Vec<u8>,
         #[serde(default = "proto_default")]
         proto: u32,
     },

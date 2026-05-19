@@ -25,11 +25,25 @@ fn transcript(client_nonce: &[u8], server_nonce: &[u8], channel_binding: &[u8]) 
     let mut t = AUTH_CTX.to_vec();
     t.extend_from_slice(client_nonce);
     t.extend_from_slice(server_nonce);
-    // §10 channel binding: the TLS cert fingerprint both sides observed. A
-    // relayed MITM that re-terminates TLS presents a different cert, so the
-    // signed transcripts no longer match. Empty for plaintext `ws://`.
+    // §10 channel binding: the **listener-advertised** TLS cert fingerprint
+    // (`Hello.cb`). Both sides sign over this one agreed value — *not* each
+    // side's local view — so a benign TLS-terminating front proxy (which
+    // makes the connector see the proxy's cert and the listener its own /
+    // none) no longer desynchronizes the two transcripts. The connector
+    // separately enforces this value against the cert it observed, as an
+    // explicit check with a distinct error (see `on_hello`). Empty/all-zero
+    // = "binding disabled" (`--no-tls`).
     t.extend_from_slice(channel_binding);
     t
+}
+
+/// A channel binding is "disabled" — the listener opted out via `--no-tls`
+/// behind a TLS terminator (§10) — when it is empty or all-zero. In that
+/// mode the connector skips the certificate comparison and trust falls back
+/// to the TOFU-pinned listener identity carried in the transcript, which a
+/// MITM cannot forge.
+fn is_binding_disabled(cb: &[u8]) -> bool {
+    cb.is_empty() || cb.iter().all(|b| *b == 0)
 }
 
 /// Everything the protocol needs from the engine. Implemented by the native
@@ -71,7 +85,7 @@ enum Phase {
 /// frames to send, raw closures to relay to other peers (§6.1 — native
 /// full-node concern; empty for a thin node), and how many primitives were
 /// integrated (for logging / host materialize triggers).
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Step {
     pub out: Vec<Msg>,
     pub relay: Vec<Vec<u8>>,
@@ -113,6 +127,13 @@ impl Session {
             name: v.name(),
             node_ssh: v.identity_ssh(),
             nonce: self.my_nonce.clone(),
+            // Only the listener advertises a binding (the cert it serves, or
+            // empty under `--no-tls`); the connector advertises nothing —
+            // it *verifies* the listener's value against what it observed.
+            cb: match self.role {
+                Role::Listener => self.channel_binding.clone(),
+                Role::Connector => Vec::new(),
+            },
             proto: PROTO_VERSION,
         }
     }
@@ -134,9 +155,9 @@ impl Session {
     }
 
     fn on_hello<V: SessionVault>(&mut self, v: &mut V, msg: Msg) -> CspResult<Step> {
-        let (peer_vault, peer_ssh, peer_nonce, peer_proto) = match msg {
-            Msg::Hello { vault_id, node_ssh, nonce, proto, .. } => {
-                (vault_id, node_ssh, nonce, proto)
+        let (peer_vault, peer_ssh, peer_nonce, peer_cb, peer_proto) = match msg {
+            Msg::Hello { vault_id, node_ssh, nonce, cb, proto, .. } => {
+                (vault_id, node_ssh, nonce, cb, proto)
             }
             _ => return Err(CspError::Protocol("expected Hello".into())),
         };
@@ -155,7 +176,49 @@ impl Session {
             Role::Connector => (self.my_nonce.clone(), peer_nonce),
             Role::Listener => (peer_nonce, self.my_nonce.clone()),
         };
-        let script = transcript(&client_nonce, &server_nonce, &self.channel_binding);
+        // The binding mixed into the signed transcript is the listener's
+        // single advertised value (§10), so both sides sign identical bytes
+        // even with a TLS-terminating proxy in front of the listener.
+        let agreed_binding = match self.role {
+            // The listener signs over exactly what it advertised in its own
+            // `Hello` (== self.channel_binding).
+            Role::Listener => self.channel_binding.clone(),
+            Role::Connector => {
+                let advertised = peer_cb;
+                let observed = &self.channel_binding;
+                if is_binding_disabled(&advertised) {
+                    // Listener opted out (`--no-tls` behind a TLS
+                    // terminator, e.g. Fly/Railway). Degraded: trust falls
+                    // back to the pinned listener identity (the transcript
+                    // also covers peer_ssh, which a MITM cannot forge).
+                    advertised
+                } else if observed.is_empty() {
+                    // Cert unobservable here (plaintext `ws://`, or a
+                    // browser WebSocket — §7). Bind to the advertised value
+                    // and rely on the pinned listener identity; the cert
+                    // itself cannot be checked at this layer.
+                    advertised
+                } else if observed.as_slice() != advertised.as_slice() {
+                    // Binding advertised AND observable AND different: a
+                    // re-terminating proxy or live MITM. Fail with a
+                    // *distinct* error, never an opaque signature failure.
+                    return Err(CspError::ChannelBinding(format!(
+                        "listener advertised a TLS cert fingerprint ({} bytes) \
+                         that does not match the certificate this connection \
+                         observed ({} bytes) — a re-terminating proxy or MITM \
+                         is in the path. If the listener is behind a trusted \
+                         TLS-terminating proxy, run it with --no-tls / \
+                         CTX_NO_TLS so it advertises a disabled binding",
+                        advertised.len(),
+                        observed.len()
+                    )));
+                } else {
+                    // Observed == advertised: channel binding fully verified.
+                    advertised
+                }
+            }
+        };
+        let script = transcript(&client_nonce, &server_nonce, &agreed_binding);
         let sig = v.sign(&script);
         self.phase = Phase::AwaitAuth { script, peer_ssh };
         Ok(Step {
@@ -238,5 +301,137 @@ impl Session {
             }
         }
         Ok(step)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+
+    /// Minimal `SessionVault` that signs with a real ed25519 key, so the
+    /// transcript signatures genuinely verify when (and only when) both
+    /// sides built identical transcripts.
+    struct MockVault {
+        id: Identity,
+    }
+    impl MockVault {
+        fn new(seed: u8) -> MockVault {
+            MockVault { id: Identity::from_seed(&[seed; 32]) }
+        }
+    }
+    impl SessionVault for MockVault {
+        fn vault_id(&self) -> String {
+            "VID".into()
+        }
+        fn name(&self) -> String {
+            String::new()
+        }
+        fn identity_ssh(&self) -> String {
+            self.id.to_ssh_string()
+        }
+        fn sign(&self, msg: &[u8]) -> Vec<u8> {
+            self.id.sign(msg)
+        }
+        fn frontier_tips(&self) -> CspResult<Vec<Oid>> {
+            Ok(vec![])
+        }
+        fn known(&self) -> CspResult<Vec<Oid>> {
+            Ok(vec![])
+        }
+        fn has(&self, _o: Oid) -> bool {
+            false
+        }
+        fn export_closure(&self, _t: &[Oid]) -> CspResult<Vec<Vec<u8>>> {
+            Ok(vec![])
+        }
+        fn integrate(&mut self, _r: &[Vec<u8>]) -> CspResult<usize> {
+            Ok(0)
+        }
+        fn admit_peer(&mut self, _p: &str) -> CspResult<bool> {
+            Ok(true)
+        }
+    }
+
+    /// Drive the two-message handshake between a connector that *observed*
+    /// `conn_observed_cb` at its TLS layer and a listener that *advertises*
+    /// `listener_cb` in its `Hello`. `Ok(())` iff both sides reach
+    /// Established (i.e. both transcripts matched and verified).
+    fn handshake(conn_observed_cb: Vec<u8>, listener_cb: Vec<u8>) -> CspResult<()> {
+        let mut cv = MockVault::new(1);
+        let mut lv = MockVault::new(2);
+        let mut c = Session::new(Role::Connector, conn_observed_cb, vec![7u8; 32]);
+        let mut l = Session::new(Role::Listener, listener_cb, vec![9u8; 32]);
+        let hello_c = c.start(&cv);
+        let hello_l = l.start(&lv);
+        let step_c = c.on_msg(&mut cv, hello_l)?;
+        let step_l = l.on_msg(&mut lv, hello_c)?;
+        let auth_c = step_c.out.into_iter().next().expect("connector AuthProof");
+        let auth_l = step_l.out.into_iter().next().expect("listener AuthProof");
+        let sc = c.on_msg(&mut cv, auth_l)?;
+        let sl = l.on_msg(&mut lv, auth_c)?;
+        assert!(matches!(sc.out.first(), Some(Msg::FrontierDigest { .. })));
+        assert!(matches!(sl.out.first(), Some(Msg::FrontierDigest { .. })));
+        assert!(c.established() && l.established());
+        Ok(())
+    }
+
+    #[test]
+    fn no_tls_listener_behind_terminating_proxy_converges() {
+        // The exact Railway failure: the listener runs `--no-tls` (empty /
+        // disabled advertised binding) behind a TLS-terminating edge; the
+        // connector dialed `wss://` and observed the *proxy's* cert.
+        // Pre-fix this desynchronized the transcripts and surfaced as an
+        // opaque "Verification equation was not satisfied".
+        handshake(vec![0xAB; 32], Vec::new()).expect("no-tls degraded must converge");
+        // An all-zero advertised binding is equivalent to empty.
+        handshake(vec![0xAB; 32], vec![0u8; 32]).expect("all-zero == disabled");
+    }
+
+    #[test]
+    fn end_to_end_tls_matching_cert_converges() {
+        handshake(vec![7u8; 32], vec![7u8; 32]).expect("verified binding must converge");
+    }
+
+    #[test]
+    fn unobservable_transport_degrades_to_identity_pin() {
+        // Connector cannot read the peer cert (plaintext `ws://` or a
+        // browser WebSocket, §7) but the listener advertises one: bind to
+        // the advertised value, converge, rely on the pinned identity.
+        handshake(Vec::new(), vec![5u8; 32]).expect("unobservable must degrade, not fail");
+    }
+
+    #[test]
+    fn cert_substitution_fails_with_distinct_channel_binding_error() {
+        // Observable AND advertised AND different = re-terminating proxy or
+        // live MITM. MUST be a distinct ChannelBinding error — never an
+        // opaque BadSignature.
+        let err = handshake(vec![2u8; 32], vec![1u8; 32]).unwrap_err();
+        assert!(
+            matches!(err, CspError::ChannelBinding(_)),
+            "expected ChannelBinding, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn proto_skew_reports_clearly_not_as_signature_error() {
+        // A stale peer (older proto) must surface as a clear
+        // version-mismatch Protocol error, not an opaque signature failure.
+        let mut lv = MockVault::new(2);
+        let mut l = Session::new(Role::Listener, Vec::new(), vec![9u8; 32]);
+        let stale = Msg::Hello {
+            vault_id: "VID".into(),
+            name: String::new(),
+            node_ssh: Identity::from_seed(&[1u8; 32]).to_ssh_string(),
+            nonce: vec![7u8; 32],
+            cb: Vec::new(),
+            proto: PROTO_VERSION - 1,
+        };
+        match l.on_msg(&mut lv, stale).unwrap_err() {
+            CspError::Protocol(m) => {
+                assert!(m.contains("protocol version mismatch"), "{m}")
+            }
+            other => panic!("expected Protocol version mismatch, got {other:?}"),
+        }
     }
 }

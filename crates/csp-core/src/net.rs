@@ -166,6 +166,9 @@ pub async fn probe(
         name: String::new(),
         node_ssh: identity.to_ssh_string(),
         nonce: rand_nonce(),
+        // Probe is a connector and never authenticates — it advertises no
+        // binding and only reads the listener's `Hello` back (§17).
+        cb: Vec::new(),
         proto: crate::wire::PROTO_VERSION,
     })
     .await?;
@@ -561,10 +564,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_tls_listener_behind_terminating_proxy_syncs_over_duplex() {
+        // End-to-end repro of the Railway failure: the listener runs
+        // `--no-tls` (empty advertised binding) behind a TLS-terminating
+        // edge; the connector dialed `wss://` and observed the *proxy's*
+        // cert (a non-empty fingerprint it never shares a value with).
+        // Pre-fix the two transcripts desynchronized and the handshake
+        // died with an opaque signature error → zero sync. It must now
+        // converge (degraded binding, trust via the pinned listener id).
+        let ta = tempdir().unwrap();
+        let tb = tempdir().unwrap();
+        let va = Vault::create(ta.path(), id(1), "v").unwrap();
+        let mut vb = Vault::create(tb.path(), id(2), "v").unwrap();
+        va.authorize(&id(2).to_ssh_string()).unwrap();
+        vb.authorize(&id(1).to_ssh_string()).unwrap();
+        std::fs::write(tb.path().join("hub.md"), "HUB").unwrap();
+        vb.commit_local_changes().unwrap();
+
+        let na = Node::new(va);
+        let nb = Node::new(vb);
+        let (t1, t2) = Transport::pair();
+        let na2 = na.clone();
+        let nb2 = nb.clone();
+        // Connector "saw" the proxy's TLS cert; listener is `--no-tls`
+        // (empty advertised binding).
+        tokio::spawn(async move {
+            let _ = run_session(na2, t1, Role::Connector, vec![0xAB; 32]).await;
+        });
+        tokio::spawn(async move {
+            let _ = run_session(nb2, t2, Role::Listener, Vec::new()).await;
+        });
+
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if na.vault.lock().await.main() == nb.vault.lock().await.main()
+                && na.vault.lock().await.main().is_some()
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(ta.path().join("hub.md")).unwrap(),
+            "HUB",
+            "no-tls listener behind a TLS terminator must still sync to the connector"
+        );
+    }
+
+    #[tokio::test]
     async fn mismatched_channel_binding_fails_handshake() {
-        // A relayed MITM that re-terminates TLS presents a different cert →
-        // the two sides compute different channel bindings → the signed
-        // transcripts don't match → handshake fails → NO sync (§10).
+        // A relayed MITM that re-terminates TLS presents a cert whose
+        // fingerprint differs from the one the listener advertises in
+        // `Hello`. The connector observes the binding, sees it is advertised
+        // *and* mismatched, and aborts with a distinct `ChannelBinding`
+        // error (never an opaque signature failure) → NO sync (§10).
         let ta = tempdir().unwrap();
         let tb = tempdir().unwrap();
         let mut va = Vault::create(ta.path(), id(1), "v").unwrap();

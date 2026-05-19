@@ -1,7 +1,5 @@
----
-title: "Context Sync Protocol — Design specification"
-description: "The complete CSP design: object model, deterministic fold/merge, identity, replication protocol, storage, security, and cross-surface conformance."
----
+# Context Sync Protocol (CSP) — Design Specification
+
 > Status: draft / greenfield design. Nothing here is implemented yet.
 > This document supersedes any earlier draft.
 > The reference implementation ships as a single CLI, `ctx`.
@@ -89,12 +87,16 @@ remains in history).
   `refs/heads/node/*`, `refs/tags/snap/*` are engine-managed; CSP force-
   recomputes `main`, owns the refs, and GCs. **Out-of-band writes via raw
   `GIT_DIR=… git …` are unsupported and will be clobbered without warning.**
-- **Hash: SHA-1 (sha1dc).** Chosen for maximum compatibility with stock git,
-  hosts, and tooling. Git’s hashing is *not* CSP’s security boundary (that is
-  node-key auth + transport content verification, §10), so SHA-1’s weakness is
-  not load-bearing here. **v1 is SHA-1, period;** SHA-256 is explicitly out of
-  scope for v1 (a different hash = a different repository — no in-place
-  migration) and revisited post-v1 only if ecosystem support warrants.
+- **Hash: SHA-1.** Plain SHA-1, byte-identical to `sha1dc` on every non-
+  colliding input (so determinism and stock-git coherence are unaffected).
+  Collision-detection (`sha1dc`) is **intentionally not bundled**: git’s
+  hashing is *not* CSP’s security boundary (that is node-key auth + transport
+  content verification, §10), so SHA-1’s collision weakness is not load-bearing
+  here, and the always-on engine is lean by construction for the wasm payload
+  (§16) — adding the UBC tables would cost size for a non-load-bearing
+  property. **v1 is SHA-1, period;** SHA-256 is explicitly out of scope for v1
+  (a different hash = a different repository — no in-place migration) and
+  revisited post-v1 only if ecosystem support warrants.
 - **One engine everywhere — the merge engine compiles to wasm too.**
   *(Revised, pre-release: supersedes the earlier "merge is native/full-node
   only" design.)* The deterministic 3-way merge/fold is in the always-on
@@ -103,12 +105,14 @@ remains in history).
   `main`** (§5.4 holds by construction; the cross-surface conformance suite is
   the headline guarantee). Only genuinely platform-bound pieces stay
   native-only (`cfg`-gated): the on-disk odb/packfiles, the tokio socket
-  driver, and TLS provisioning. Tiering is therefore **listen/relay
-  capability + retention horizon, never merge capability** (§7). A wasm node
-  still cannot *bind a listener* (no server sockets in a browser/WebView) —
-  that, not merge, is the only thing it delegates. This is proven, not
-  assumed: the SDK (wasm engine) converges with the real `ctx` in the §18
-  parity suite.
+  driver, and TLS provisioning. The only node distinction is therefore
+  **whether it can listen/relay — a platform fact, not a configured tier**
+  (§7; there is no `tier` knob in v1, and a bounded retention horizon is
+  post-v1). A wasm node still cannot *bind a listener* (no server sockets in a
+  browser/WebView) — that, not merge, is the only thing it delegates, and it
+  is enforced structurally (the listener does not compile to wasm). This is
+  proven, not assumed: the SDK (wasm engine) converges with the real `ctx` in
+  the §18 parity suite.
 
 ---
 
@@ -178,8 +182,13 @@ and **synthetic fold commits** (derived, *unsigned*, deterministic — §5.3).
   fold commit → its parents → … → `M₀`. Any received fold commit is checked by
   recomputing the fold over *its own* parent list and asserting the SHA
   matches (recursively to primitives/`M₀`; §5.4 determinism makes this exact).
-  A node recomputes only the **current** `main`; received historical fold
-  commits are objects it may verify but need not recompute.
+  A received synthetic fold commit is recompute-verified **exactly once, on
+  receipt** — at integration, recursively to primitives/`M₀` — and then
+  **never re-verified during steady-state `main` recomputation**. A node
+  recomputes only the **current** `main` for *materialization*; "need not
+  recompute [historical fold commits]" therefore means *not re-derived every
+  fold*, **not** "accepted untrusted": a fold commit that fails recompute-
+  verification on receipt is dropped and not forwarded (§6.3, §13.2).
 - `git log main` is identical on every node holding the same primitive set.
 
 ### 5.3 The deterministic fold (the central algorithm)
@@ -205,7 +214,12 @@ deterministic commits, **not** a flat octopus:
    - `base = git-merge-base(accₖ₋₁, Tₖ)` over the real DAG — well-defined
      because `accₖ₋₁` is a real commit whose ancestry bottoms out at fold
      commits / `M₀` (no synthetic-acc hand-waving: every step's base is the
-     graph merge-base of two real objects).
+     graph merge-base of two real objects). When the real graph yields **more
+     than one maximal common ancestor** (a criss-cross), select the one
+     **lowest by commit-SHA bytewise** — a content-only, wall-clock-free
+     tiebreak consistent with the §5.1 strict-total-order SHA tiebreaker.
+     **Never** tiebreak a merge base by committer/author time: that would
+     reintroduce a wall-clock-derived input forbidden by §5.1 and §5.4(2).
    - `tree = 3way-merge(base.tree, accₖ₋₁.tree, Tₖ.tree)`: disjoint regions
      both survive; an overlapping hunk resolves to the operand later in the
      strict order; **no conflict markers ever**; binary / non-mergeable files
@@ -260,7 +274,10 @@ The invariant has **four co-equal, hard parts** — all must hold, and the
 1. **Complete DAG** — every parent fold commit is a real replicated object
    (§5.2/§6.3); no dangling parent, ever.
 2. **Deterministic per-step base** — `git-merge-base(accₖ₋₁, Tₖ)` over the
-   real graph; never per-node "last converged" state.
+   real graph; never per-node "last converged" state. A criss-cross with
+   multiple maximal common ancestors is tie-broken by **commit-SHA bytewise
+   (lowest wins)** — content-only, never committer/author time, so the base
+   is wall-clock-free and byte-identical on every node.
 3. **Strict total order** — `(counter, NodeId, SHA)` fixes fold order *and*
    conflict tiebreak with no ties (incl. same-NodeId concurrency, §5.1).
    3-way merge is non-associative, so this is load-bearing, not an
@@ -368,10 +385,11 @@ parent is an invalid DAG). They are **verified, not trusted** — each
 recompute-verifies from its own parent list (§5.2). Primitive commits are
 **accepted only if the author signature verifies and the author key is in the
 receiver's local authorized set** (§6.1/§10), independent of the relaying
-peer; unauthorized or unverifiable objects are dropped and not forwarded. A
-node recomputes only the **current** `main`; a **thin** node recomputes none —
-after catch-up it receives the current merged tree from a full node (§7).
-Snapshots (§8) replicate as small records.
+peer; unauthorized or unverifiable objects are dropped and not forwarded.
+**Every node — browser/WebView included — recomputes its own current `main`**
+(one engine everywhere, §4/§7); no node recomputes *historical* fold commits
+(those are recompute-verified once on receipt, §5.2, then trusted). Snapshots
+(§8) replicate as small records.
 
 ### 6.4 Catch-up
 
@@ -396,73 +414,86 @@ fast path, but it is never the thing correctness depends on.
 ### 6.5 Live
 
 After catch-up, each new local primitive commit is pushed immediately to all
-connected peers (commit + missing objects). **Full** receivers integrate and
-recompute `main`; **thin** receivers integrate the primitive commit and apply
-the merged tree served by a full peer; both materialize. Relay (full) nodes
-forward onward. On disconnect, a node simply reconnects and re-runs catch-up —
-there is no separate resync path.
+connected peers (commit + missing objects). **Every** receiver integrates the
+primitive commit and **recomputes its own `main`** (identical engine
+everywhere — there is no "thin receiver applies a tree served by a full peer"
+path; that pre-revision design is gone, §4/§7), then materializes. Listenable
+(relay) nodes forward onward. On disconnect, a node simply reconnects and
+re-runs catch-up — there is no separate resync path.
 
 ### 6.6 Message kinds (sketch)
 
 `Hello`, `AuthProof`, `FrontierDigest`, `WantTips`, `Objects`,
 `Live(signed primitive)`, `Ping`, `Pong`. The handshake challenge is the
 channel-binding transcript carried by `Hello`/`AuthProof` (no separate
-`AuthChallenge`); object exchange is closure-based (`WantTips` → `Objects`,
+`AuthChallenge`). The listener's `Hello` **advertises its channel binding**
+— the SHA-256 of its TLS certificate, or an all-zero/empty "binding
+disabled" marker under `--no-tls` — and *both* sides sign the transcript
+over that single advertised value (§10), so a TLS-terminating front proxy
+no longer desynchronizes the two transcripts. Object exchange is
+closure-based (`WantTips` → `Objects`,
 no separate `Commits`/`WantObjects`); snapshots are local refs replicated as
 ordinary objects (no `Snapshot` message). `FrontierDigest`/`WantTips` is the
 sole, authoritative reconciliation (no scalar-VV fast-path).
 
 ---
 
-## 7. Node tiers
+## 7. Node roles (platform-derived, not a configured tier)
 
-> **Revised (pre-release): one engine everywhere.** The earlier design split
-> tiers by *merge capability* (thin nodes couldn't merge). That is no longer
-> true: the deterministic 3-way merge/fold compiles to `wasm32`, so **every
+> **Revised (pre-release): one engine everywhere; no `tier` knob in v1.** The
+> original design split *tiers* by *merge capability* (thin nodes couldn't
+> merge). The deterministic 3-way merge/fold compiles to `wasm32`, so **every
 > node — including a wasm plugin — runs the identical Rust engine and computes
-> its own byte-identical `main`**. Tiering now distinguishes only
-> **listen/relay capability** and **retention horizon**, never merge. Proven
-> by the §18 SDK⇄`ctx` parity suite.
+> its own byte-identical `main`**. With merge no longer a tier axis, the only
+> remaining distinction is **whether a node can listen/relay**, and that is a
+> **platform fact, not a configured tier**: there is therefore **no `tier`
+> config field, flag, or env var in v1**. A bounded **retention horizon** is
+> *post-v1* (§9.2); v1 keeps complete local history everywhere. The role
+> terms "full" / "thin" survive only as **descriptive shorthand** for the
+> platform-derived capability below, never as a stored setting. Proven by the
+> §18 SDK⇄`ctx` parity suite.
 
-Every node runs the same engine and protocol and is **offline-first regardless
-of tier**: it always has a complete local working copy, reads and writes
-entirely offline, records its own edits locally, computes the deterministic
-`main` itself (§5.3), and reconciles on reconnect. Tier governs only how much
-*history* a node retains and whether it can *listen/relay* — never whether it
-works offline and never whether it merges.
+Every node runs the same engine and protocol and is **offline-first**: it
+always has a complete local working copy, reads and writes entirely offline,
+records its own edits locally, computes the deterministic `main` itself
+(§5.3), and reconciles on reconnect. Nothing a node does — merge included —
+depends on a role; role governs only *whether it can accept inbound
+connections*.
 
-- **Full node.** Retains the entire primitive-commit DAG and all objects in a
-  real on-disk `.git` (native odb). Offers deep point-in-time recovery,
-  bootstraps others, and is the **only tier that may listen/relay** (it needs
-  inbound server sockets — a native-only capability). Default retention:
-  complete history. Desktop / server / always-on.
-- **Thin node.** Same engine, same `compute_main` — it **does compute its own
-  merge** — but does **not** retain deep history (bounded by a retention
-  horizon, §9) and **cannot listen** (no server sockets in a browser/WebView).
-  It holds a full local working copy, appends its own **signed primitive
-  commits**, folds the frontier exactly like a full node, and converges over
-  an outbound connection to a peer. Deep PITR delegated to full nodes (it may
-  lack the deep DAG). Suitable for storage-constrained / wasm clients
-  (mobile, browser/WebView, editor plugins). The §5.3 `|F|=1` self-wrapper is
-  still the degenerate case of the *same* fold (not a special thin path).
+- **Full (listenable) node.** A **native** node (real on-disk odb + the
+  ability to bind inbound server sockets). It *may* enter listen/relay mode,
+  retains the entire primitive-commit DAG, offers deep point-in-time
+  recovery, and bootstraps others. Desktop / server / always-on. This is a
+  *capability of the platform it runs on*, established by it being a native
+  build with the on-disk odb — not selected by config.
+- **Thin (outbound-only) node.** A **wasm/WebView/browser** node. Same
+  engine, same `compute_main` — it **computes its own merge**, holds a full
+  local working copy, appends its own **signed primitive commits**, folds the
+  frontier exactly like any node — but **cannot listen** because a browser/
+  WebView has no server sockets (a compile-time platform fact: the listener
+  module is native-only, §16). It converges over an *outbound* connection to
+  a listenable peer. The §5.3 `|F|=1` self-wrapper is still the degenerate
+  case of the *same* fold (not a special thin path).
 
-**HARD INVARIANT — listen/relay ⇒ full node.** A node in listen/relay mode MUST
-be a full node — not because of merge (every node merges) but because
-listening requires inbound server sockets + the on-disk odb, which are
-native-only. A browser/WebView node is therefore outbound-only.
+**HARD INVARIANT — listen/relay ⇒ native/listenable node.** A node in
+listen/relay mode MUST be a native node — not because of merge (every node
+merges identically) but because listening requires inbound server sockets +
+the on-disk odb, which are native-only. This is **enforced structurally**:
+the wasm build does not compile the listener at all (§16), so a browser/
+WebView node is outbound-only by construction, with no `tier` string to set
+or check.
 
 **Deployment requirement.** Every deployment MUST contain at least one
-listenable node (a full node) as the rendezvous/relay point — two
-browser/WebView thin nodes cannot connect *to each other* directly (neither
-can accept a connection), even though each merges on its own. This is a
-transport/platform constraint, not a merge one.
+listenable (native) node as the rendezvous/relay point — two browser/WebView
+nodes cannot connect *to each other* directly (neither can accept a
+connection), even though each merges on its own. This is a transport/platform
+constraint, not a merge one.
 
-**Still fully offline-first.** No node of any tier can merge changes it has not
-received — convergence inherently requires connectivity for *everyone*. A thin
+**Still fully offline-first.** No node can merge changes it has not received —
+convergence inherently requires connectivity for *everyone*. A browser/WebView
 node authors and reads entirely offline, **computes its own merge**, and
-converges on reconnect; the only things it delegates are *listening/relaying*
-and *retaining deep history*, never computing the merge and never its ability
-to work disconnected.
+converges on reconnect; the only thing it cannot do is *listen/relay*, never
+computing the merge and never its ability to work disconnected.
 
 ---
 
@@ -502,10 +533,13 @@ exact, skew-free recovery points.
 <scope-root>/                 # materialized working files (real, what tools read)
 <scope-root>/.context/            # CSP's ENTIRE footprint — one dir; gitignore this
 <scope-root>/.context/git/        #   the real stock-git-compatible repo (GIT_DIR)
-<scope-root>/.context/config          #   scope, peers, listen settings, tier
+<scope-root>/.context/config          #   scope, peers, listen/transport, knob settings
 <scope-root>/.context/authorized_keys #   admitted peer keys — LOCAL, NOT synced (§10)
-<scope-root>/.context/snapshots       #   named snapshot records
-<scope-root>/.context/state           #   sync/peer state, last-materialized hashes
+<scope-root>/.context/state           #   sync/peer state, last-materialized hashes,
+                                  #   AND named snapshot records (small, §8)
+<scope-root>/.context/state.lock      #   state write lock (internal)
+<scope-root>/.context/tls.crt         #   persisted self-signed listener cert (§10)
+<scope-root>/.context/tls.key         #   persisted self-signed listener key (§10)
 <scope-root>/.contextignore           # user exclude file (synced); see §11
 ~/.context/id_ed25519             # device identity (default; see §10) — NOT per-vault
 ```
@@ -527,7 +561,7 @@ directory (plus the synced `.contextignore`).
 - **CLI / launcher surface → tool-anchored.** CLI flags, environment
   variables (`CTX_*`), and the config file are read by the **`ctx` CLI /
   native launcher only** — the engine (csp-core) does not read process env,
-  the SDK does not, and host plugins use host settings, not `CTX_CWD`. They
+  the SDK does not, and host plugins use host settings, not `CTX_DIR`. They
   are configuration of one front-end, exactly parallel to CLI flags (a flag is
   not "part of the spec"; neither is an env var). Hence the tool-anchored
   `CTX_` prefix, not `CSP_`. (`PORT` is kept as the platform convention.)
@@ -556,23 +590,26 @@ only the objects backing current `main`.
   correct reachability GC already retains them — an implementer must **not**
   special-case "prune synthetic fold commits": they are load-bearing history
   (parent edges of later primitives/folds), not garbage.
-- **Full nodes keep complete history by default** — this *is* the PITR
-  guarantee and the durable archive. An optional configurable retention
-  horizon lets an operator bound disk (collapse pre-horizon primitive history).
-- **Thin nodes are bounded by a retention horizon by default** — recent
-  history + working state kept; deeper history pruned locally and fetched from
-  a full node on demand. This horizon is exactly what lets a phone/plugin be a
-  real offline-first node without unbounded growth.
+- **All nodes keep complete local history in v1** — this *is* the PITR
+  guarantee and the durable archive, and it holds on every node regardless of
+  platform (v1 has no `tier` knob, §7).
+- **Retention horizon is post-v1.** A bounded retention horizon (recent
+  history + working state kept; deeper history pruned locally and back-filled
+  from a listenable peer on demand) — the thing that would let a storage-
+  constrained browser/WebView node bound unbounded growth — is **explicitly
+  deferred to post-v1**. No pruning-by-horizon, no on-demand deep-history
+  back-fill protocol, and no per-node retention policy ships in v1; every
+  node retains everything. (This resolves the prior §7-vs-§9.2 tension: §7
+  no longer promises a "by default" horizon.)
 - **Snapshots are never pruned by truncation.** Snapshot-reachable states
-  survive any horizon, so named recovery points stay exact and durable even on
-  thin nodes.
+  survive any future horizon, so named recovery points stay exact and durable
+  — relevant once a horizon exists post-v1.
 
 Compaction is local and uncoordinated; nodes may run different policies.
 **Deliberately low priority:** at the markdown/text scale CSP targets,
 content-addressed history packs so tightly that growth is a non-issue for a
-long time — the simple defaults above suffice and the thin-node horizon is a
-safety valve, not an aggressive policy. Aggressive compaction is explicitly
-deferred, not a v1 concern.
+long time — the simple defaults above suffice. Aggressive compaction *and* the
+thin-node retention horizon are explicitly deferred, not a v1 concern.
 
 ---
 
@@ -619,6 +656,34 @@ deferred, not a v1 concern.
   underlying transport, so a captured handshake cannot be replayed or relayed
   onto another channel. Both directions authenticate: a connecting node also
   verifies the listener's key, enabling key pinning.
+- **Advertised channel binding (the listener owns it).** The transport
+  binding mixed into the signed transcript is **not** each side's local view
+  of the certificate (that desynchronizes the moment a benign TLS-terminating
+  proxy sits in front of the listener — the connector binds to the proxy's
+  cert, the listener to its own/none, and the two transcripts can never
+  agree, surfacing as an opaque signature failure). Instead, the **listener
+  advertises one channel-binding value in its `Hello`** — the SHA-256 of the
+  certificate it serves, or an all-zero/empty *binding-disabled* marker when
+  it runs `--no-tls` behind a TLS terminator — and **both sides sign the
+  transcript over that single advertised value**. Separately, and *only as an
+  explicit check with its own distinct error* (never as silent transcript
+  divergence), the connector enforces the binding:
+  - *Advertised binding disabled* (all-zero/empty): degraded mode. The
+    connector skips the certificate comparison; trust falls back to the
+    **TOFU-pinned listener identity** (the transcript also covers the
+    listener's NodeId, which a MITM cannot forge — and `ctx clone` already
+    pins the listener key, §6.1). Required configuration behind a
+    re-terminating reverse proxy.
+  - *Binding advertised but unobservable* (plaintext `ws://`, or a browser
+    `WebSocket` that cannot read the peer cert — §7): degraded as above; the
+    connector SHOULD warn.
+  - *Binding advertised and observable*: the connector MUST verify the
+    advertised fingerprint equals the certificate it actually saw and MUST
+    abort with a distinct channel-binding error (not a generic signature
+    failure) on mismatch — this is the live MITM / cert-substitution defense.
+  A handshake-transcript or framing change is a coordinated break: the wire
+  `proto` version is bumped so skew is reported as a clear version-mismatch
+  rather than an opaque signature error.
 - **Per-author authorization (not per-connection).** Transport auth alone is
   insufficient in a relay protocol. Every **primitive commit is signed by its
   author NodeId key** (§5.1/§5.2). A node accepts a primitive only if (a) the
@@ -648,9 +713,21 @@ deferred, not a v1 concern.
   **`--no-tls` / `CTX_NO_TLS`** opts a listener out into plaintext `ws://`,
   for running behind a fronting proxy that already terminates TLS (optionally
   with a CA-trusted cert) or on a trusted/local network. Connectors select
-  TLS by URL scheme (`wss://` vs `ws://`).
-- **Integrity.** Every object is verified against its SHA on receipt;
-  unverifiable or unauthorized data is dropped.
+  TLS by URL scheme (`wss://` vs `ws://`). A listener reached **through a
+  TLS-terminating reverse proxy (Fly.io, Railway, Render, Cloudflare Tunnel,
+  …) MUST run `--no-tls`**: the proxy re-terminates TLS, so the certificate a
+  connector observes is the proxy's, never the listener's — only the
+  advertised binding-disabled marker keeps the handshake coherent (above).
+  Connectors then still dial `wss://` so the proxy hop stays encrypted; the
+  TLS layer authenticates the proxy and the pinned listener identity
+  authenticates the peer.
+- **Integrity.** Objects are **content-addressed and self-verifying**: a
+  received object is stored under the SHA recomputed from its own bytes, so a
+  corrupted or substituted object cannot masquerade as another and is never
+  referenced by a valid DAG. Trust does **not** come from the bytes hashing —
+  it comes from per-author **primitive signatures** (§5.1/§10) and **fold-
+  commit recompute-verification on receipt** (§5.2/§6.3). Unsigned,
+  unauthorized, or recompute-failing data is dropped and not forwarded.
 
 ---
 
@@ -660,13 +737,24 @@ deferred, not a v1 concern.
   and/or include patterns, plus exclusions. CSP must never read or write
   outside scope. An allowlist (not “everything minus a denylist”) makes the
   default failure mode *syncing too little*, never exfiltrating secrets or
-  build output.
+  build output. The **default include is `**`** (everything under the scope
+  root). This is deliberately usable out of the box, bounded by three
+  always-on guards that keep the blast radius small even at the permissive
+  default: (i) `.context/` is unconditionally excluded (the HARD INVARIANT
+  below); (ii) non-text/binary files are excluded unless explicitly opted in;
+  (iii) the synced `.contextignore` removes patterns. The allowlist mechanism
+  exists for *narrowing* to a dedicated subtree; `**` is the safe default
+  because the guarded classes (CSP state, secrets-as-binaries, ignored paths)
+  are never in scope regardless.
 - **Text-only by default; binaries are opt-in and never merged.** v1 syncs
   only text/mergeable files. Binary / non-text files are excluded by the
-  allowlist unless explicitly opted into the scope; when opted in they
-  replicate as **whole-file, last-writer-wins by total order** (no 3-way
-  merge — binary merge is undefined), with no chunking. Content-defined
-  chunking/dedup for large binaries is explicitly out of scope for v1.
+  allowlist unless explicitly opted into the scope; when opted in they are
+  **whole-file, last-writer-wins by total order** — **not a separate code
+  path** but the §5.3 fold's existing non-mergeable fallback: a binary /
+  non-UTF-8 file is never diff3'd; the whole file resolves to the operand
+  later in the strict total order. No chunking anywhere (objects are whole
+  blobs). Content-defined chunking/dedup for large binaries is explicitly out
+  of scope for v1.
 - **`.contextignore` — the user exclude file.** A gitignore-syntax file at
   `<scope-root>/.contextignore`, scope-relative, applied as exclusions *under* the
   allowlist scope (allowlist decides what's eligible; `.contextignore` removes
@@ -736,28 +824,39 @@ deferred, not a v1 concern.
   to remove the malicious-key-propagation vector.)*
 - **Clock skew:** snapshots are the exact, skew-free recovery mechanism;
   `ctx restore <time>` is best-effort and warns on detected skew. (§8)
-- **Auto-commit debounce:** default ~1 s, configurable. (§14)
-- **Hash:** SHA-1 (sha1dc) for v1. SHA-256 explicitly out of scope (no in-place
-  migration — a different hash is a different repo); revisit post-v1 only if
-  ecosystem support warrants. (§4)
+- **Auto-commit debounce:** default ~1 s (1000 ms), configurable with full
+  three-way parity — `--debounce <ms>` / `CTX_DEBOUNCE` / config `debounce_ms`
+  (flag > env > config). (§14, §17.1)
+- **Hash:** plain SHA-1 for v1 (byte-compatible with `sha1dc` on non-colliding
+  inputs; collision-detection intentionally not bundled — not the security
+  boundary, §10, and the wasm engine is lean by construction, §16). SHA-256
+  explicitly out of scope (no in-place migration — a different hash is a
+  different repo); revisit post-v1 only if ecosystem support warrants. (§4)
 - **git coexistence:** CSP never plants a `.git` at the scope root; the repo is
   `<scope>/.context/git/` with a decoupled worktree, accessed via `ctx git`.
   Default model: a dedicated subtree the enclosing project repo gitignores.
   (§4, §9, §11)
 - **User excludes:** a synced, gitignore-syntax `.contextignore` (plus optional
   node-local `.context/exclude`) layered under the allowlist scope. (§11)
-- **Node tiers / wasm (revised, pre-release):** **one engine everywhere** —
+- **Node roles / wasm (revised, pre-release):** **one engine everywhere** —
   the deterministic fold/merge compiles to `wasm32`, so *every* node
   (including a wasm plugin) runs the identical `compute_main` and computes
-  its own byte-identical `main`. Tiering distinguishes only **listen/relay
-  capability** (native server sockets) and **retention horizon**, never
-  merge. ≥1 listenable (full) node is still required as the rendezvous/relay
-  point — two browser/WebView nodes cannot accept each other's connection;
-  that is a transport/platform constraint, not a merge one. All-thin meshes
-  remain unsupported for *connectivity*, not for merge. Proven by the §18
-  SDK⇄`ctx` parity suite. (§7, §4, §16)
-- **CTX_\* env surface:** full deployment knobs (`CTX_CWD`, `CTX_NO_TLS`,
-  `CTX_AUTHORIZED_KEYS`, `CTX_LOG`, `PORT`, generic `CTX_*` overrides). (§17.1)
+  its own byte-identical `main`. With merge no longer a tier axis, **there is
+  no `tier` config field/flag/env in v1**; the only node distinction —
+  whether it can listen/relay — is a **platform fact** (native server sockets
+  + on-disk odb), enforced structurally (the listener is not compiled to
+  wasm). A bounded **retention horizon is post-v1** (§9.2); v1 keeps complete
+  local history on every node. ≥1 listenable (native) node is still required
+  as the rendezvous/relay point — two browser/WebView nodes cannot accept
+  each other's connection; that is a transport/platform constraint, not a
+  merge one. All-browser meshes remain unsupported for *connectivity*, not
+  for merge. Proven by the §18 SDK⇄`ctx` parity suite. (§7, §4, §16)
+- **CTX_\* env surface:** full deployment knobs (`CTX_DIR` [renamed from
+  `CTX_CWD`], `CTX_NO_TLS`, `CTX_NO_TOFU`, `CTX_AUTHORIZED_KEYS`, `CTX_LOG`,
+  `CTX_DEBOUNCE`, `PORT`, generic `CTX_*` overrides). Three-way parity
+  (flag/env/config, flag > env > config) for every knob **except the vault
+  locator** (`--dir`/`CTX_DIR`), which by nature has no config-file key (it
+  locates the config itself — circular). (§17.1)
 - **Conflict representation:** jj-style commutative conflicts evaluated and
   declined for v1; deterministic 3-way merge + total-order tiebreak retained;
   suppressed sides surfaced as a derived view over the DAG, not a stored
@@ -778,7 +877,8 @@ deferred, not a v1 concern.
   1. **Complete DAG** — synthetic fold commits are transmitted as reachable
      objects; no node ever has a dangling parent (§5.2/§6.3).
   2. **Deterministic per-step base** — `git-merge-base(accₖ₋₁, Tₖ)` over the
-     real graph; never per-node "last converged" state (§5.3).
+     real graph; never per-node "last converged" state; criss-cross
+     multi-base tie-broken by commit-SHA bytewise, never by time (§5.3/§5.4).
   3. **Strict total order** `(counter, NodeId, SHA)` — fixes fold order *and*
      conflict tiebreak with no ties, including same-NodeId concurrency (§5.1).
   4. **Byte-pinned, unsigned fold commit object** (§5.4).
@@ -834,7 +934,7 @@ End-to-end (file saved on A → visible on B), with the dominant terms:
 
 | Stage | Cost |
 |---|---|
-| Auto-commit **debounce** on A | **default ~1 s; configurable (≈200 ms–1 s)** |
+| Auto-commit **debounce** on A | **default ~1 s; configurable `--debounce`/`CTX_DEBOUNCE`/`debounce_ms` (≈200 ms–1 s; §17.1)** |
 | Hash + commit locally on A | ~1–5 ms |
 | Serialize + WebSocket send | sub-ms |
 | Network A→(relay)→B | LAN ~5–30 ms; cross-region ~30–150 ms; far geo 200 ms+ |
@@ -882,9 +982,12 @@ End-to-end (file saved on A → visible on B), with the dominant terms:
   this sound under gossip topology and untrusted relays.
 - **Realtime transport, not git’s.** Persistent push + delta catch-up gives
   near-real-time sync with zero polling and no commit-then-wait latency.
-- **One Rust/wasm engine; tiered nodes.** The same core runs everywhere;
-  storage-constrained clients participate as thin working nodes while desktop/
-  server full nodes carry git-compatible history and PITR.
+- **One Rust/wasm engine; one behavior.** The same core runs everywhere and
+  every node computes its own merge identically; storage-constrained
+  browser/WebView clients are full working nodes that merge offline, while
+  desktop/server nodes additionally listen/relay and carry git-compatible
+  history and PITR. The only distinction is the platform-derived ability to
+  listen — not a tier, not merge (§7).
 
 ---
 
@@ -950,7 +1053,7 @@ the protocol can do may be CLI-inaccessible. Command sketch (final names TBD):
 - `ctx init [path]` — create a new, empty scoped vault and this node's SSH
   key identity. An explicit `[path]` is created if missing (`git init
   <dir>` spirit), `.` = current dir; as the most explicit form it wins
-  over the global `--dir`/`CTX_CWD`, which it falls back to (then the
+  over the global `--dir`/`CTX_DIR`, which it falls back to (then the
   current dir) when omitted.
   **Identity model:** `vault_id` is an **opaque protocol id**
   — a fresh **UUID** by default (it must not leak the node key and is only
@@ -1028,33 +1131,56 @@ Ergonomic requirements (treated as acceptance criteria, not nice-to-haves):
 For headless / container / managed-platform deployment the CLI honors these
 environment variables (CLI flags override env; env overrides the config file):
 
-Each is settable as a CLI flag **or** the equivalent env var (flag > env >
-config file):
+Every deployment knob is a **global option** (accepted on any subcommand, not
+just `watch`) with **three-way parity** — a CLI flag, a `CTX_*` env var, **and**
+a config-file key — resolved strictly **flag > env > config**. Precedence is
+*non-destructive*: supplying a flag/env value does **not** rewrite the
+persisted config file, and a flag/env value can override a config value in
+*both* directions (a flag-supplied `false` overrides a config `true`, not only
+the reverse). The **one documented exception** is the vault locator
+(`--dir`/`CTX_DIR`) — it cannot have a config-file key because it *locates the
+config file itself* (a config key for "where is the config" is circular), so it
+is flag+env only, by nature.
 
-- `--dir <path>` / `CTX_CWD` — the vault/scope root, **decoupled from the
-  process working directory**. Set when the platform mounts persistent storage
-  somewhere other than where the process starts — the classic cause of "state
-  silently re-initialized on every deploy." Must always resolve to the
-  persistent volume, never an ephemeral path.
-- `--no-tls` / `CTX_NO_TLS` — serve a plaintext `ws://` listener instead of
-  the default self-signed `wss://` (§10), for running behind a reverse proxy
-  / edge that already terminates TLS, or on a trusted/local network.
-- `--listen [addr]` / `--port <n>` / `PORT` — listen address/port for a full
-  node (`ctx watch --listen`). Bare `--listen` defaults to `0.0.0.0:9000`
-  (unprivileged; deliberately not 443); `--port` / `PORT` (managed platforms
-  inject `PORT`) or an explicit `addr` override it.
-- `--log <level>` / `CTX_LOG` — log level / filter. Default surfaces
-  operator-visible `INFO` (connections, handshake outcomes, catch-up,
+- `--dir <path>` / `CTX_DIR` — the vault/scope root, **decoupled from the
+  process working directory** *(env renamed from the misleading `CTX_CWD`: this
+  is NOT the process cwd; `DIR` mirrors git's `GIT_DIR`)*. Set when the
+  platform mounts persistent storage somewhere other than where the process
+  starts — the classic cause of "state silently re-initialized on every
+  deploy." Must always resolve to the persistent volume, never an ephemeral
+  path. **Flag+env only** (the parity exception above): no config-file key.
+- `--no-tls` / `CTX_NO_TLS` / config `no_tls` — serve a plaintext `ws://`
+  listener instead of the default self-signed `wss://` (§10), for running
+  behind a reverse proxy / edge that already terminates TLS, or on a
+  trusted/local network.
+- `--listen [addr]` / `--port <n>` / `PORT` / config `listen` — listen
+  address/port for a listenable (native) node (`ctx watch --listen`). Bare
+  `--listen` defaults to `0.0.0.0:9000` (unprivileged; deliberately not 443);
+  `--port` / `PORT` (managed platforms inject `PORT`) or an explicit `addr`
+  override it. A config-file `listen` value **actually starts a listener**
+  (it is read, not merely stored), subject to flag > env > config.
+- `--log <level>` / `CTX_LOG` / config `log` — log level / filter. Default
+  surfaces operator-visible `INFO` (connections, handshake outcomes, catch-up,
   integrate, commits); `csp_core=debug` for protocol detail.
+- `--debounce <ms>` / `CTX_DEBOUNCE` / config `debounce_ms` — auto-commit
+  debounce in milliseconds (default 1000; §13.1/§14). `--debounce-ms` is kept
+  as a hidden backward-compatible alias of `--debounce`.
 - `--authorized-keys <keys|file>` / `CTX_AUTHORIZED_KEYS` — public keys
   (newline- or comma-separated, or a file path) merged into this node's
   **local** `authorized_keys` (`.context/authorized_keys`, never synced — §10)
-  on startup, idempotently. The supported way to pre-seed trust on a fresh
-  hosted listener so the TOFU window never opens (§10).
-- `--no-tofu` / `CTX_NO_TOFU` — disable trust-on-first-use entirely (§10).
-- **General rule:** every config-file key has *both* a `--flag` and a `CTX_*`
-  env var. This three-way parity is a requirement, not a coincidence — no
-  deployment knob is env-only or flag-only.
+  on startup, idempotently. (Not a persisted config key: it is merged into the
+  side `authorized_keys` file, not the vault config — that *is* its parity
+  form.) The supported way to pre-seed trust on a fresh hosted listener so the
+  TOFU window never opens (§10).
+- `--no-tofu` / `CTX_NO_TOFU` / config `no_tofu` — disable trust-on-first-use
+  entirely (§10). Resolved flag > env > config **without** rewriting the
+  persisted config (the prior "sticky" behavior — flag silently persisting
+  `no_tofu=true` so it could never be turned back off — is disallowed).
+- **General rule:** every deployment knob has *all three* of a `--flag`, a
+  `CTX_*` env var, and a config-file key — **except** the vault locator
+  (`--dir`/`CTX_DIR`, flag+env only, structurally) and `--authorized-keys`
+  (whose persisted form is the `authorized_keys` side file, not vault config).
+  No knob is env-only or flag-only. This is a requirement, not a coincidence.
 
 A hosted listener is thus fully configurable by flags *or* env, with no file
 editing or container-command override — e.g.
