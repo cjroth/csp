@@ -1,98 +1,55 @@
 // Explicit-init entry — the surface a thin-node host (the Obsidian plugin)
-// imports as `@csp/sdk/web-init`, mirroring how the agentsync plugin
-// imported `@agentsync/sdk/web-init`. The host inlines the wasm bytes and
-// passes them to `initCsp()` once at startup.
-//
-// TODAY this is backed by the in-memory mock in `./mock/` (CSP spec.md
-// §13.2 / obsidian-plugin-spec §14 — `csp-wasm` is a residual gate). When
-// the real reduced wasm surface (CSP §4/§7) exists, swap the bindings here;
-// the host, its tests, and its module boundaries do not change ("one core,
-// thin bindings", CSP §16).
+// imports as `@csp/sdk/web-init`. Backed by the **real one Rust engine** via
+// wasm (`csp_core::MemEngine` + the shared sans-IO `Session`, §16): the
+// plugin computes its own byte-identical `main` exactly like `ctx`. The
+// in-memory mock remains exported for the SDK's own unit tests only.
 
-import { MockIdentity, MockPubkey } from './mock/identity.js';
-import { MockVault } from './mock/vault.js';
-import type {
-  CloneOptions,
-  CreateOptions,
-  Identity as IdentityContract,
-  OpenOptions,
-  Pubkey as PubkeyContract,
-} from './vault.js';
+import { initEngine } from '#engine';
+import { Identity as RealIdentityNS, Pubkey as RealPubkeyNS } from './identity-real.js';
+import { MemoryStorage, memoryStorage } from './mock/memory-storage.js';
+import { RealVault } from './real-vault.js';
+import type { CloneOptions, CreateOptions, OpenOptions } from './vault.js';
 
-// Accepts anything the real wasm-bindgen `web` target would accept; the
-// mock ignores the bytes but the host's inline-wasm path stays real so no
-// host code changes when csp-wasm lands.
-type WasmInput =
-  | Uint8Array
-  | ArrayBuffer
-  | Response
-  | URL
-  | WebAssembly.Module
-  | string
-  | null
-  | undefined;
+// The wasm module is loaded synchronously by `./wasm.js` (wasm-pack `nodejs`
+// glue via `createRequire`) at import time, so the engine is ready as soon
+// as this module is imported. `initCsp` is kept for API parity with the
+// browser `web` target (where wasm instantiation is async) and is a no-op
+// here. Accepts anything the wasm-bindgen `web` target would accept.
+type WasmInput = Uint8Array | ArrayBuffer | Response | URL | WebAssembly.Module | string;
 
 let ready = false;
 
-function assertReady(): void {
-  if (!ready) {
-    throw new Error('csp: not initialized — call `await initCsp(wasmBytes)` first');
-  }
-}
-
-/** Load and initialize the engine. Idempotent. (Mock: marks ready; the
- * real impl instantiates the wasm module from `input`.) */
-export async function initCsp(_input?: WasmInput): Promise<void> {
+/** Initialize the engine. Idempotent. Node/Bun: a no-op (the nodejs glue is
+ * loaded synchronously by `require` at import). Browser/WebView: instantiate
+ * the wasm module from the host-inlined `input` bytes (the `#engine` imports
+ * map selects the right glue per runtime). */
+export async function initCsp(input?: WasmInput): Promise<void> {
+  await initEngine(input);
   ready = true;
 }
-
-/** True once the engine is initialized. */
 export function isInitialized(): boolean {
   return ready;
 }
 
-/** High-level CSP thin-node vault factory. */
+/** High-level CSP thin-node vault factory — the real engine. */
 export const Vault = {
   create(opts: CreateOptions) {
-    assertReady();
-    return MockVault.create(opts);
+    return RealVault.create(opts);
   },
   open(opts: OpenOptions) {
-    assertReady();
-    return MockVault.open(opts);
+    return RealVault.open(opts);
   },
-  /** Bootstrap from a peer (a full node in listen mode) — CSP §17
-   * `ctx clone <url>`. Per CSP §5.1 the caller MUST fork a fresh NodeId or
-   * warn rather than resume a possibly-live key. */
+  /** `ctx clone <url>` (§17): probe the peer for its vault id + key, build
+   * the engine for that vault, trust the peer's key. Per CSP §5.1 the host
+   * MUST fork a fresh NodeId or warn rather than resume a possibly-live key. */
   clone(opts: CloneOptions) {
-    assertReady();
-    return MockVault.clone(opts);
+    return RealVault.clone(opts);
   },
 };
 
-// ---- Lazy primitive accessors (parity with the future wasm surface) ----
-
-export const Identity = {
-  generate(): IdentityContract {
-    assertReady();
-    return MockIdentity.generate();
-  },
-  fromSeed(seed: Uint8Array): IdentityContract {
-    assertReady();
-    return MockIdentity.fromSeed(seed);
-  },
-};
-
-export const Pubkey = {
-  fromBytes(bytes: Uint8Array): PubkeyContract {
-    assertReady();
-    return MockPubkey.fromBytes(bytes);
-  },
-  fromSshString(s: string): PubkeyContract {
-    assertReady();
-    return MockPubkey.fromSshString(s);
-  },
-};
+// Real device identity over the engine (CSP §10).
+export const Identity = RealIdentityNS;
+export const Pubkey = RealPubkeyNS;
 
 // ---- Re-exports ----
 
@@ -122,8 +79,8 @@ export type {
   VaultOptions,
 } from './types.js';
 
-export { MemoryStorage, memoryStorage } from './mock/memory-storage.js';
-export { _resetBroker, memoryTransportPair } from './mock/broker.js';
+export { MemoryStorage, memoryStorage };
+export { defaultTransport, makeWebSocketTransport } from './transport-ws.js';
 
 export {
   applyConfigToDoc,
@@ -138,7 +95,14 @@ export {
 
 export { formatCspIdentity, formatPubkeySidecar, parseCspIdentity } from './identity-file.js';
 
-/** @internal — exposed only for tests. Resets module-level init state. */
+// ---- Test-only: the in-memory mock (used by the SDK's own unit tests and
+// available to host plugins for offline UI tests). NOT the production path. ----
+export { MockVault } from './mock/vault.js';
+export { _resetBroker, memoryTransportPair } from './mock/broker.js';
+export { MockIdentity, MockPubkey } from './mock/identity.js';
+
+/** @internal — test reset hook (no-op for the real engine; kept for the
+ * mock tests). */
 export function _resetForTests(): void {
-  ready = false;
+  ready = true;
 }

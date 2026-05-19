@@ -17,12 +17,12 @@ const READ_ONLY: &[&str] = &[
 
 fn pointer(verb: &str) -> &'static str {
     match verb {
-        "commit" => "edit files and let `ctx watch` auto-commit (§5.6)",
-        "checkout" | "switch" | "restore" | "reset" => "use `ctx restore <name|time>` (§8)",
-        "tag" | "branch" => "use `ctx snapshot <name>` to mark a point (§8)",
-        "gc" | "prune" => "GC is engine-internal (§9.2)",
-        "fetch" | "pull" | "push" => "replication is the realtime transport, not git (§6)",
-        _ => "the engine owns this repo; there is no write workflow through git (§4)",
+        "commit" => "edit files and let `ctx watch` auto-commit",
+        "checkout" | "switch" | "restore" | "reset" => "use `ctx restore <name|time>`",
+        "tag" | "branch" => "use `ctx snapshot <name>` to mark a point",
+        "gc" | "prune" => "GC is engine-internal",
+        "fetch" | "pull" | "push" => "replication is the realtime transport, not git",
+        _ => "the engine owns this repo; there is no write workflow through git",
     }
 }
 

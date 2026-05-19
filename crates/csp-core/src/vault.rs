@@ -15,52 +15,15 @@ use crate::order::NodeId;
 use crate::repo::Repo;
 use crate::scope::{Scope, CONTEXTIGNORE, CONTEXT_DIR};
 use crate::state::{EngineState, Snapshot};
+use crate::config::VaultConfig;
 use crate::store::Store;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// `<scope>/.context/config` — tool/launcher-anchored vault config (§9.1).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VaultConfig {
-    pub vault_id: String,
-    #[serde(default)]
-    pub peers: Vec<String>,
-    #[serde(default)]
-    pub listen: Option<String>,
-    #[serde(default = "default_tier")]
-    pub tier: String, // "full" | "thin"
-    #[serde(default)]
-    pub no_tofu: bool,
-    #[serde(default)]
-    pub allow_binary: bool,
-    #[serde(default = "default_include")]
-    pub include: Vec<String>,
-}
-
-fn default_tier() -> String {
-    "full".into()
-}
-fn default_include() -> Vec<String> {
-    vec!["**".into()]
-}
-
-impl VaultConfig {
-    fn path(context: &Path) -> PathBuf {
-        context.join("config")
-    }
-    fn load(context: &Path) -> CspResult<VaultConfig> {
-        let s = std::fs::read_to_string(Self::path(context))
-            .map_err(|e| CspError::Config(format!("read config: {e}")))?;
-        toml::from_str(&s).map_err(|e| CspError::Config(format!("parse config: {e}")))
-    }
-    fn save(&self, context: &Path) -> CspResult<()> {
-        let s = toml::to_string_pretty(self).map_err(|e| CspError::Config(e.to_string()))?;
-        std::fs::write(Self::path(context), s)?;
-        Ok(())
-    }
-}
+// `VaultConfig` now lives in `crate::config` (always-on / wasm-safe model +
+// TOML; on-disk file I/O `cfg`-gated there). `ctx` and the wasm SDK share
+// the exact same `.context/config` bytes (§9.1).
 
 pub struct Vault {
     root: PathBuf,
@@ -96,11 +59,28 @@ impl Vault {
     pub fn identity_clone(&self) -> Identity {
         self.identity.clone()
     }
+    /// Detached ed25519 sign (the §10 handshake transcript). Used by the
+    /// sans-IO [`crate::session::Session`] via `SessionVault`.
+    pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
+        self.identity.sign(msg)
+    }
     pub fn repo(&self) -> &Repo {
         &self.repo
     }
     pub fn vault_id(&self) -> &str {
         &self.config.vault_id
+    }
+    /// Human label (may be empty). Not a uniqueness guarantee — see
+    /// [`VaultConfig::name`].
+    pub fn name(&self) -> &str {
+        &self.config.name
+    }
+    pub fn set_name(&mut self, name: &str) -> CspResult<()> {
+        if self.config.name != name {
+            self.config.name = name.to_string();
+            self.save_config()?;
+        }
+        Ok(())
     }
     pub fn main(&self) -> Option<Oid> {
         self.repo.main()
@@ -116,6 +96,7 @@ impl Vault {
         repo.set_main(m0)?;
         let config = VaultConfig {
             vault_id: vault_id.to_string(),
+            name: String::new(),
             peers: Vec::new(),
             listen: None,
             tier: "full".into(),

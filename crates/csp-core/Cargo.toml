@@ -29,9 +29,13 @@ thiserror.workspace = true
 hex.workspace = true
 base64.workspace = true
 similar.workspace = true
-regex.workspace = true
-toml.workspace = true
 tracing.workspace = true
+# NB: `regex` and `toml` are intentionally NOT runtime dependencies. `scope`
+# uses a hand-rolled gitignore matcher and `config` a hand-rolled flat-TOML
+# codec (regex ~1 MB, toml/toml_edit/winnow ~460 KB in wasm — §16 one engine
+# everywhere). Both are dev-dependencies only — the differential-test
+# oracles: `scope` is proven byte-for-byte vs the old regex; `config` is
+# proven to round-trip and to emit valid TOML the real parser accepts.
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rand_core.workspace = true
@@ -51,9 +55,15 @@ rcgen.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
+# Advisory wall-clock only in wasm (§5.1: the logical counter is
+# authoritative for order). Native uses std::time.
+js-sys = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile.workspace = true
 rand.workspace = true
 rand_core.workspace = true
+# Test-only oracles for the differential tests (scope.rs / config.rs).
+regex.workspace = true
+toml.workspace = true

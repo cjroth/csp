@@ -191,6 +191,23 @@ impl Peer {
         Ok(())
     }
 
+    /// Spawn an arbitrary long-running `ctx` command as a daemon (e.g.
+    /// `clone … --watch`). Captures stderr; killed on drop / `stop`.
+    pub async fn spawn_daemon(&mut self, args: &[&str]) -> Result<()> {
+        let mut child = self
+            .base_cmd()
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawn ctx daemon")?;
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        drain(&mut child, &self.name, stderr.clone());
+        self.stderr = stderr;
+        self.proc = Some(child);
+        Ok(())
+    }
+
     pub async fn stop(&mut self) {
         if let Some(mut c) = self.proc.take() {
             let _ = c.kill().await;

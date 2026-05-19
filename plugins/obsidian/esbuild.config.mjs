@@ -1,16 +1,12 @@
-// Build the Obsidian plugin to a single CJS bundle (`main.js`) consumable
-// by Obsidian on desktop AND mobile.
+// Build the Obsidian plugin to a single CJS bundle (`main.js`) for desktop
+// AND mobile.
 //
-// The CSP wasm is read from the SDK's freshly-built `dist/web-pkg/` and
-// inlined as a base64 constant under the global `__CSP_WASM_B64__`, so the
-// plugin can call `initCsp()` synchronously without fetching at runtime
-// (mobile WebViews can't fetch arbitrary local URLs).
-//
-// `csp-wasm` is a residual gate (CSP spec.md §13.2 / obsidian-plugin-spec
-// §14): until it is built the .wasm is absent — we inline an EMPTY constant
-// and continue, because the @csp/sdk seam runs on an in-memory mock. The
-// plugin still builds, unit-tests, and e2e-tests; real cross-device sync
-// requires csp-wasm. This is the ONLY place that changes when it lands.
+// One engine everywhere (CSP spec.md §16): the plugin runs the *real* Rust
+// engine via `@csp/sdk`, whose `#engine` imports map resolves to the
+// wasm-pack **web** glue under esbuild's `browser` condition. The wasm bytes
+// are read from the SDK's `pkg-web/` and inlined as base64
+// (`__CSP_WASM_B64__`); `main.ts` passes them to `initCsp()` so the WebView
+// never has to fetch (mobile can't fetch arbitrary local URLs).
 
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -26,21 +22,18 @@ const wasmPath = resolve(
   '..',
   'sdks',
   'typescript',
-  'dist',
-  'web-pkg',
+  'pkg-web',
   'csp_wasm_bg.wasm',
 );
-let wasmB64 = '';
-if (existsSync(wasmPath)) {
-  wasmB64 = readFileSync(wasmPath).toString('base64');
-} else {
-  console.warn(
-    `[esbuild] csp-wasm not found at ${wasmPath}\n` +
-      '[esbuild] Inlining an empty constant — the @csp/sdk seam runs on the\n' +
-      '[esbuild] in-memory mock (CSP §13.2; repo task #6). The plugin builds\n' +
-      '[esbuild] and tests; real cross-device sync requires csp-wasm.',
+if (!existsSync(wasmPath)) {
+  console.error(
+    `[esbuild] csp wasm not found at ${wasmPath}\n` +
+      '[esbuild] Run `bun run build:wasm` in sdks/typescript first ' +
+      '(builds the nodejs + web wasm targets).',
   );
+  process.exit(1);
 }
+const wasmB64 = readFileSync(wasmPath).toString('base64');
 
 const banner = `/*
   Context for Obsidian — bundled by esbuild.
@@ -54,6 +47,8 @@ const buildOpts = {
   format: 'cjs',
   target: 'ES2020',
   platform: 'browser',
+  // Resolve `@csp/sdk`'s `#engine` imports map to the web wasm glue.
+  conditions: ['browser'],
   external: [
     'obsidian',
     'electron',
@@ -63,6 +58,7 @@ const buildOpts = {
     'node:fs',
     'node:os',
     'node:path',
+    'node:module',
     '@codemirror/autocomplete',
     '@codemirror/collab',
     '@codemirror/commands',
@@ -75,12 +71,13 @@ const buildOpts = {
     '@lezer/highlight',
     '@lezer/lr',
   ],
+  loader: { '.wasm': 'binary' },
   define: {
     __CSP_WASM_B64__: JSON.stringify(wasmB64),
     'process.env.NODE_ENV': JSON.stringify(prod ? 'production' : 'development'),
-    // wasm-pack `web` glue (future) has a dead-code default-input branch
-    // that touches `import.meta.url`; we always pass bytes explicitly, but
-    // esbuild still warns under format=cjs. Replace with a literal.
+    // The wasm-pack `web` glue's no-arg init branch touches
+    // `import.meta.url`; we always pass bytes explicitly, so neutralize it
+    // (esbuild warns on `import.meta` under format=cjs otherwise).
     'import.meta.url': JSON.stringify('context-plugin://main'),
   },
   outfile: 'main.js',

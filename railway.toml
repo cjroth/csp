@@ -1,0 +1,25 @@
+# Railway config-as-code. Build from the repo Dockerfile; the image CMD
+# runs `ctx watch --listen` and honors the $PORT Railway injects.
+#
+# Railway terminates TLS at its edge and proxies plain HTTP/WS to the
+# container, so set these as service Variables in the Railway dashboard
+# (they're read directly by `ctx watch` / the image CMD — no start-command
+# override needed):
+#
+#   CTX_NO_TLS = 1                      # bind plain ws; edge handles TLS
+#   CTX_CWD    = /mnt/workspace         # match the attached volume's mount
+#   CTX_AUTHORIZED_KEYS = ssh-ed25519…  # secret; merged on every start
+#   CTX_VAULT_NAME = vault              # optional; default clone dir name
+#
+# Attach a Railway Volume and set its mount path to the same value as
+# CTX_CWD (e.g. /mnt/workspace) so the vault history + node identity
+# (.context/) survive restarts and redeploys. Clients connect via the
+# public TLS endpoint: `ctx clone wss://<your-app>.up.railway.app`.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType = "ALWAYS"
+numReplicas = 1

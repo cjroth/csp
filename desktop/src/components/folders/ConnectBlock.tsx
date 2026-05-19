@@ -76,22 +76,20 @@ export function ConnectBlock({ vaultId }: { vaultId: string }) {
           {addr.firewallGuidance}
         </div>
 
-        {addr.exposureCaveat ? (
+        {addr.noAuthorizedKeys && addr.note ? (
           <Alert variant="destructive">
             <ShieldAlert className="h-4 w-4" />
-            <AlertTitle>Exposure caveat</AlertTitle>
-            <AlertDescription>{addr.exposureCaveat}</AlertDescription>
+            <AlertTitle>No authorized keys</AlertTitle>
+            <AlertDescription>{addr.note}</AlertDescription>
           </Alert>
         ) : (
-          addr.isNonLoopback && (
-            <div className="flex items-start gap-2 rounded-lg border border-border bg-background/40 p-3 text-xs text-muted-foreground">
-              <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-400" />
-              <span>
-                Reachable beyond loopback. New peers are gated by your authorized keys /
-                trust-on-first-use — keep it on LAN or a private overlay for public exposure.
-              </span>
-            </div>
-          )
+          <div className="flex items-start gap-2 rounded-lg border border-border bg-background/40 p-3 text-xs text-muted-foreground">
+            <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-400" />
+            <span>
+              Trust-on-first-use is disabled: only the keys you authorize below can connect. Keep
+              this on LAN or a private overlay for any public exposure.
+            </span>
+          </div>
         )}
       </div>
     </Panel>

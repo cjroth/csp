@@ -1,8 +1,7 @@
-import { Boxes, FolderGit2, Settings, Sparkles, Wand2 } from "lucide-react";
+import { Boxes, FolderGit2, Settings, Sparkles } from "lucide-react";
 import { NavLink } from "react-router";
 import { StatusBadge } from "@/components/layout/StatusDot";
 import { useEngine } from "@/hooks/useEngine";
-import { api } from "@/lib/api";
 import { shortFp } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -60,29 +59,7 @@ export function Sidebar() {
             </>
           )}
         </NavLink>
-
-        <div className="mt-auto mb-3 rounded-xl border border-sidebar-border bg-card/40 p-3">
-          <div className="mb-2 flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-            <Wand2 className="h-3 w-3" />
-            Simulate
-          </div>
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={() => void api.devTriggerTofu()}
-              className="flex-1 rounded-md border border-border bg-background/40 px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
-            >
-              TOFU
-            </button>
-            <button
-              type="button"
-              onClick={() => void api.devTriggerSuperseded()}
-              className="flex-1 rounded-md border border-border bg-background/40 px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
-            >
-              Edit
-            </button>
-          </div>
-        </div>
+        <div className="mt-auto" />
       </nav>
 
       <div className="border-t border-sidebar-border p-4">

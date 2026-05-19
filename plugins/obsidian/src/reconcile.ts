@@ -2,12 +2,12 @@
 // CSP-side thin-node working tree. Pure planning function — minimal
 // interfaces, no Obsidian/SDK runtime deps, fully unit-testable.
 //
-// With the real CSP SDK this is largely subsumed by the engine: first
-// attach and every reconnect run frontier-set anti-entropy catch-up (CSP
-// spec.md §6.4) and §5.6 materialization. The host only adapts Obsidian's
-// vault to the SDK's file surface and renders progress. This planner is
-// retained because the in-memory mock has no frontier anti-entropy, and it
-// keeps the first-attach pass deterministic and testable either way.
+// The real engine owns convergence: first attach and every reconnect run
+// frontier-set anti-entropy catch-up (CSP spec.md §6.4) and §5.6
+// materialization inside the same Rust core as `ctx`. The host only adapts
+// Obsidian's vault to the SDK's file surface and renders progress. This
+// pure planner is retained as the deterministic first-attach pass (and
+// because it is trivially unit-testable with no SDK/Obsidian runtime).
 
 export interface ObsidianFileSummary {
   path: string;

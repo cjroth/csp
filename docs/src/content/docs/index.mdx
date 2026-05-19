@@ -1,0 +1,59 @@
+---
+title: Context Sync Protocol
+description: CSP syncs agent context across tools, devices, and apps — plain files on disk, real-time sync, stock-git-compatible history, deterministic merge.
+template: splash
+hero:
+  tagline: Sync agent context across tools, devices, and apps. Your context stays as ordinary files on disk; CSP keeps them byte-identical everywhere, in real time, with full local history.
+  actions:
+    - text: Quick start
+      link: /quick-start/
+      icon: right-arrow
+    - text: Read the protocol
+      link: /protocol/overview/
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+CSP is built for the folders where agents and humans share working memory:
+notes, plans, prompts, task state, and project context that needs to follow
+you between a CLI, a desktop app, an editor plugin, or a remote machine.
+
+Context stays as normal files on disk, so any app or agent reads and edits it
+directly. CSP watches for changes, syncs them in real time, keeps a
+stock-git-compatible history, and lets you recover the folder from an earlier
+point in time — without ever writing conflict markers into your files.
+
+## One core, thin bindings
+
+Protocol behavior lives in Rust once. Every surface — CLI, SDK, plugin,
+desktop — calls into the same engine, so behavior parity is structural, not
+hand-maintained.
+
+<CardGrid>
+	<Card title="Protocol" icon="open-book">
+		The design: object model, deterministic fold/merge, identity, and the
+		replication protocol. [Overview](/protocol/overview/) ·
+		[Specification](/protocol/spec/)
+	</Card>
+	<Card title="Rust Core · csp-core" icon="setting">
+		The single engine: storage, signing, the deterministic merge, and sync
+		state. [Overview](/rust-core/overview/)
+	</Card>
+	<Card title="CLI · ctx" icon="laptop">
+		Set up context folders, run realtime sync, inspect history, restore.
+		[Overview](/cli/overview/)
+	</Card>
+	<Card title="SDK · wasm + TypeScript" icon="seti:typescript">
+		The same engine compiled to wasm, with thin TypeScript bindings.
+		[Overview](/sdk/overview/)
+	</Card>
+	<Card title="Obsidian Plugin" icon="seti:notebook">
+		Sync an Obsidian vault as agent-readable context, on desktop and mobile.
+		[Overview](/obsidian/overview/) · [Spec](/obsidian/spec/)
+	</Card>
+	<Card title="Desktop App" icon="seti:default">
+		A background app for managing and syncing context folders.
+		[Overview](/desktop/overview/) · [Spec](/desktop/spec/)
+	</Card>
+</CardGrid>

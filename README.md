@@ -64,21 +64,24 @@ manual key exchange.
 
 ```sh
 # --- device A: create a vault and start serving it ---
-ctx --dir ~/notesA init --vault-id team-notes
-ctx --dir ~/notesA watch --listen --no-tls          # binds 0.0.0.0:9000
+ctx --dir ~/team-notes init --name team-notes        # name → folder/display
+ctx --dir ~/team-notes watch --listen --no-tls        # binds 0.0.0.0:9000
 
-# --- device B: clone it, then keep it synced ---
-ctx clone ws://A-HOST:9000                           # creates ./team-notes/
-ctx --dir ./team-notes watch --peer ws://A-HOST:9000
+# --- device B: clone it and keep it synced, in one command ---
+ctx clone ws://A-HOST:9000 --watch                    # creates ./team-notes/
 ```
+
+`ctx clone` records the origin (like git), so even without `--watch` you can
+just `cd team-notes && ctx watch` later. `init`/`clone` also take `--watch`
+to stay running as the daemon immediately.
 
 `ctx watch` logs what it's doing — peer connect, handshake outcome (and *why*
 it was rejected, e.g. unauthorized key or vault-id mismatch), catch-up, and
 each commit. If a peer is refused, the listener prints the exact
 `ctx authorize "ssh-ed25519 …"` line to run.
 
-Now edit any text file under `~/notesA` and it appears under `./team-notes`
-(and vice versa) in well under a second. Concurrent edits to different regions
+Now edit any text file under `~/team-notes` and it appears under the cloned
+`./team-notes` (and vice versa) in well under a second. Concurrent edits to different regions
 of a file both survive; same-region conflicts resolve deterministically with
 the losing version kept in history — never with conflict markers.
 
@@ -91,13 +94,24 @@ the losing version kept in history — never with conflict markers.
   drop it (and dial `wss://`) for the encrypted default.
 - **Bare `--listen` binds `0.0.0.0:9000`** (unprivileged; not 443). Override
   with an explicit `addr`, `--port`, or the `PORT` env var.
-- **`ctx clone <url>`** creates `./<vault-id>/`. Use `ctx clone <url> .` to
-  clone into the current folder, or `ctx clone <url> <path>` for a specific
-  one. It refuses to clobber an existing vault.
+- **Vault id vs name.** `vault_id` is an opaque **UUID** by default (the
+  protocol's "same vault?" guard — it never leaks the node key);
+  `--vault-id` overrides it to share a memorable id. The **name** is a
+  separate human label (`--name`, else the init directory's basename) used
+  for display and clone-folder naming — not a uniqueness guarantee.
+- **`ctx clone <url>`** creates `./<name>/` (falling back to a short id
+  slug, never the raw id). `ctx clone <url> .` clones into the current
+  folder; `ctx clone <url> <path>` a specific one. It refuses to clobber an
+  existing vault. Add `--watch` to bootstrap and stay synced in one step.
 
 ### Without clone (explicit mutual authorization)
 
+Since each `ctx init` mints its own UUID `vault_id`, two independently
+`init`-ed vaults must be given the **same explicit id** to be the same vault
+(clone handles this for you):
+
 ```sh
+ctx --dir ~/notesA init --vault-id team-notes        # shared, explicit id
 ctx --dir ~/notesB init --vault-id team-notes
 ctx --dir ~/notesA authorize "$(ctx --dir ~/notesB key)"
 ctx --dir ~/notesB authorize "$(ctx --dir ~/notesA key)"

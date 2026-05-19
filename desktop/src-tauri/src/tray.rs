@@ -18,11 +18,10 @@ pub const TRAY_ID: &str = "main-tray";
 
 fn glyph(s: SyncState) -> &'static str {
     match s {
+        SyncState::Disabled => "◦",
         SyncState::Idle => "•",
-        SyncState::Syncing => "↻",
-        SyncState::Synced => "✓",
-        SyncState::Offline => "⚠",
-        SyncState::Attention => "!",
+        SyncState::Active => "✓",
+        SyncState::Error => "!",
     }
 }
 
@@ -88,10 +87,9 @@ pub fn refresh(app: &AppHandle) {
     }
 
     let tooltip = match agg.as_ref().map(|a| a.state) {
-        Some(SyncState::Syncing) => "Context Desktop — syncing",
-        Some(SyncState::Offline) => "Context Desktop — offline",
-        Some(SyncState::Attention) => "Context Desktop — needs attention",
-        Some(SyncState::Synced) => "Context Desktop — synced",
+        Some(SyncState::Active) => "Context Desktop — active",
+        Some(SyncState::Error) => "Context Desktop — needs attention",
+        Some(SyncState::Idle) => "Context Desktop — idle",
         _ => "Context Desktop",
     };
 

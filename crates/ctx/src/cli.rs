@@ -34,20 +34,38 @@ pub struct Cli {
 pub enum Cmd {
     /// Create a new, empty scoped vault and this node's key identity here.
     Init {
+        /// Where to init. An explicit path is created if missing (like
+        /// `git init <dir>`); `.` = current dir. Most explicit, so it wins
+        /// over the global `--dir`/`CTX_CWD`; omitted falls back to those,
+        /// then the current dir. (Named `path` not `dir` to avoid colliding
+        /// with the global `--dir` arg id, exactly like `clone`'s `into`.)
+        path: Option<PathBuf>,
+        /// Opaque protocol id shared by all replicas. Default: a fresh
+        /// UUID (override only to deliberately share a memorable id).
         #[arg(long)]
         vault_id: Option<String>,
+        /// Human label. Default: the scope directory's name.
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long, env = "CTX_AUTHORIZED_KEYS")]
         authorized_keys: Option<String>,
+        /// After init, stay running as the sync daemon (= `ctx watch`).
+        #[arg(long)]
+        watch: bool,
     },
     /// Bootstrap a new node from an existing vault served by a listener.
     Clone {
         url: String,
-        /// Where to clone. Default: `./<vault-id>/`. `.` = current dir; an
-        /// explicit path = that path. (Named `into` to avoid colliding with
-        /// the global `--dir`/`CTX_CWD`.)
+        /// Where to clone. Default: `./<name-or-short-id>/`. `.` = current
+        /// dir; an explicit path = that path. (Named `into` to avoid
+        /// colliding with the global `--dir`/`CTX_CWD`.)
         into: Option<PathBuf>,
         #[arg(long, env = "CTX_AUTHORIZED_KEYS")]
         authorized_keys: Option<String>,
+        /// After cloning, stay running as the sync daemon (= `ctx watch`),
+        /// reconnecting to the cloned origin.
+        #[arg(long)]
+        watch: bool,
     },
     /// The primary long-running command: watch the scoped tree, sync.
     Watch {

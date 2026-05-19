@@ -4,7 +4,6 @@
 //! command/event bridge. Every sync/merge/identity/auth/history behavior is
 //! a call into the engine (spec §2 HARD INVARIANT — no protocol logic here).
 
-mod app_config;
 mod commands;
 mod state;
 mod tray;
@@ -22,17 +21,23 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .manage(AppState::new())
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Build the REAL engine over native csp-core. App config lives
+            // in the OS app-config dir (spec §7), never in any .context/.
+            let cfg_dir = app
+                .path()
+                .app_config_dir()
+                .expect("resolve app config dir");
+            let state = tauri::async_runtime::block_on(AppState::new(cfg_dir))
+                .expect("initialise csp engine");
+            app.manage(state);
             let engine = app.state::<AppState>().engine.clone();
 
             // Build the native tray menu and wire click handling (spec §6.1).
             tray::refresh(&handle);
             tray::install_handlers(&handle);
-
-            // Drive the simulated "alive" engine (spec: stub fidelity).
-            tauri::async_runtime::spawn(engine.clone().run_simulation());
 
             // Forward the engine event stream to the webview. The app is a
             // pure projection of these events (spec §13).
@@ -72,9 +77,7 @@ pub fn run() {
             commands::list_authorized,
             commands::authorize,
             commands::revoke,
-            commands::respond_tofu,
             commands::get_identity,
-            commands::set_identity_source,
             commands::get_settings,
             commands::set_settings,
             commands::create_snapshot,
@@ -82,8 +85,6 @@ pub fn run() {
             commands::restore,
             commands::get_status,
             commands::get_aggregate_status,
-            commands::dev_trigger_tofu,
-            commands::dev_trigger_superseded,
             commands::refresh_tray,
         ])
         .build(tauri::generate_context!())

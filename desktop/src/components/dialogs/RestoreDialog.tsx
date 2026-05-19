@@ -59,7 +59,6 @@ export function RestoreDialog({
     await restore(vaultId, {
       kind: "time",
       rfc3339: new Date(when).toISOString(),
-      skewWarning: SKEW_WARNING,
     });
     onOpenChange(false);
   }

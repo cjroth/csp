@@ -68,9 +68,14 @@ remains in history).
 
 ## 4. Engine
 
-- **`gitoxide` (`gix`)**, pure Rust, is the only git engine. Native nodes and
-  the wasm module share one codebase. No `git` binary dependency. Not
-  isomorphic-git (JS), not libgit2 (C; will not wasm).
+- **A pure-Rust, hand-rolled, stock-git-compatible object/ref layer** is the
+  only git engine (`sha1` + `flate2` for stock object encoding; minimal
+  loose-object/pack/ref handling). Native nodes and the wasm module share
+  this one codebase. No `git` binary dependency. Deliberately *not* a
+  general git library — not isomorphic-git (JS), not libgit2 (C; will not
+  wasm), and not `gitoxide` (kept out so the one engine stays a small wasm
+  payload, §16). Stock git only ever *reads* the result (§4 read-only
+  passthrough, proven git-coherent by the §18 e2e).
 - **On-disk format is real, stock-git-compatible — but not at `.git`.** Object
   encoding, repository layout (`objects/`, `refs/`, `HEAD`, `config`, packs),
   and refs are exactly what unmodified git expects, but the git directory is
@@ -88,13 +93,20 @@ remains in history).
   not load-bearing here. **v1 is SHA-1, period;** SHA-256 is explicitly out of
   scope for v1 (a different hash = a different repository — no in-place
   migration) and revisited post-v1 only if ecosystem support warrants.
-- **The merge engine is native/full-node only.** Per §7, thin/wasm nodes do
-  not compute the merge — so the wasm build needs only object encode/decode,
-  the sync state machine, auth, and framing; **not** diff / 3-way merge, and
-  not the on-disk odb/packfiles (native, full-node only). This makes the
-  gitoxide-in-wasm question low-stakes: the wasm surface is small and the merge
-  (the part most at risk) never runs there. Validating that reduced wasm
-  surface is still an explicit pre-build spike (§13), not an assumption.
+- **One engine everywhere — the merge engine compiles to wasm too.**
+  *(Revised, pre-release: supersedes the earlier "merge is native/full-node
+  only" design.)* The deterministic 3-way merge/fold is in the always-on
+  surface and compiles to `wasm32`, so **every node — including a plugin —
+  runs the identical Rust `compute_main` and computes its own byte-identical
+  `main`** (§5.4 holds by construction; the cross-surface conformance suite is
+  the headline guarantee). Only genuinely platform-bound pieces stay
+  native-only (`cfg`-gated): the on-disk odb/packfiles, the tokio socket
+  driver, and TLS provisioning. Tiering is therefore **listen/relay
+  capability + retention horizon, never merge capability** (§7). A wasm node
+  still cannot *bind a listener* (no server sockets in a browser/WebView) —
+  that, not merge, is the only thing it delegates. This is proven, not
+  assumed: the SDK (wasm engine) converges with the real `ctx` in the §18
+  parity suite.
 
 ---
 
@@ -390,57 +402,65 @@ there is no separate resync path.
 
 ### 6.6 Message kinds (sketch)
 
-`Hello`, `AuthChallenge`, `AuthProof`, `FrontierDigest`, `WantTips`,
-`Commits`, `WantObjects`, `Objects`, `Live(signed primitive)`, `Snapshot`,
-`Ping`, `Pong`. (`HaveVV` MAY be sent as an optional fast-path hint — §6.4 —
-but `FrontierDigest`/`WantTips` is the authoritative reconciliation.)
+`Hello`, `AuthProof`, `FrontierDigest`, `WantTips`, `Objects`,
+`Live(signed primitive)`, `Ping`, `Pong`. The handshake challenge is the
+channel-binding transcript carried by `Hello`/`AuthProof` (no separate
+`AuthChallenge`); object exchange is closure-based (`WantTips` → `Objects`,
+no separate `Commits`/`WantObjects`); snapshots are local refs replicated as
+ordinary objects (no `Snapshot` message). `FrontierDigest`/`WantTips` is the
+sole, authoritative reconciliation (no scalar-VV fast-path).
 
 ---
 
 ## 7. Node tiers
 
+> **Revised (pre-release): one engine everywhere.** The earlier design split
+> tiers by *merge capability* (thin nodes couldn't merge). That is no longer
+> true: the deterministic 3-way merge/fold compiles to `wasm32`, so **every
+> node — including a wasm plugin — runs the identical Rust engine and computes
+> its own byte-identical `main`**. Tiering now distinguishes only
+> **listen/relay capability** and **retention horizon**, never merge. Proven
+> by the §18 SDK⇄`ctx` parity suite.
+
 Every node runs the same engine and protocol and is **offline-first regardless
 of tier**: it always has a complete local working copy, reads and writes
-entirely offline, records its own edits locally, and reconciles on reconnect.
-Tier governs only how much *history* a node retains and whether it *computes*
-the merge — never whether it works offline.
+entirely offline, records its own edits locally, computes the deterministic
+`main` itself (§5.3), and reconciles on reconnect. Tier governs only how much
+*history* a node retains and whether it can *listen/relay* — never whether it
+works offline and never whether it merges.
 
 - **Full node.** Retains the entire primitive-commit DAG and all objects in a
-  real on-disk `.git`. Runs the gitoxide 3-way merge and computes the
-  deterministic `main` (§5.3). Offers point-in-time recovery, bootstraps
-  others, and is the **only tier that may listen/relay**. Default retention:
+  real on-disk `.git` (native odb). Offers deep point-in-time recovery,
+  bootstraps others, and is the **only tier that may listen/relay** (it needs
+  inbound server sockets — a native-only capability). Default retention:
   complete history. Desktop / server / always-on.
-- **Thin node.** Offline-first, but does **not** retain deep history and does
-  **not** run the 3-way merge engine. It holds a full local working copy and
-  appends its own **primitive commits**. **Self-collapse rule:** between
-  reconnects a thin node advances its *own* spine by computing the trivial
-  `|F|=1` **synthetic fold commit** over its own single latest tip (tree = that
-  tip's tree, parent = [tip], deterministic — §5.3). This is **not a 3-way
-  merge** (no merge-base, no diff3, no merge engine, wasm-safe) — it is just a
-  deterministic wrapper — so each subsequent offline edit is parented on the
-  thin node's *own previous fold commit*, keeping its offline run **linear
-  (O(1) frontier contribution)** instead of N concurrent siblings. It still
-  never computes a real (`|F|≥2`) merge. On reconnect it catches up and
-  receives the merged tree from a connected full node; it never computes the
-  multi-tip `main`. Local history bounded by a retention horizon (§9); deep
-  PITR delegated to full nodes. Suitable for storage-constrained / wasm
-  clients (mobile, browser/WebView, editor plugins).
+- **Thin node.** Same engine, same `compute_main` — it **does compute its own
+  merge** — but does **not** retain deep history (bounded by a retention
+  horizon, §9) and **cannot listen** (no server sockets in a browser/WebView).
+  It holds a full local working copy, appends its own **signed primitive
+  commits**, folds the frontier exactly like a full node, and converges over
+  an outbound connection to a peer. Deep PITR delegated to full nodes (it may
+  lack the deep DAG). Suitable for storage-constrained / wasm clients
+  (mobile, browser/WebView, editor plugins). The §5.3 `|F|=1` self-wrapper is
+  still the degenerate case of the *same* fold (not a special thin path).
 
 **HARD INVARIANT — listen/relay ⇒ full node.** A node in listen/relay mode MUST
-be a full node: a listener serves the deterministic merged state to thin peers,
-which requires the merge engine and full history. Thin nodes never listen.
+be a full node — not because of merge (every node merges) but because
+listening requires inbound server sockets + the on-disk odb, which are
+native-only. A browser/WebView node is therefore outbound-only.
 
-**Deployment requirement.** Every deployment MUST contain at least one full
-node (it is where listeners and deep PITR live). A mesh of *only* thin nodes is
-explicitly unsupported and will not converge concurrent edits — by design:
-supporting it would require a second merge implementation that would endanger
-§5.4.
+**Deployment requirement.** Every deployment MUST contain at least one
+listenable node (a full node) as the rendezvous/relay point — two
+browser/WebView thin nodes cannot connect *to each other* directly (neither
+can accept a connection), even though each merges on its own. This is a
+transport/platform constraint, not a merge one.
 
 **Still fully offline-first.** No node of any tier can merge changes it has not
 received — convergence inherently requires connectivity for *everyone*. A thin
-node authors and reads entirely offline and converges on reconnect; the only
-things it delegates are *computing* the merge and *retaining* deep history,
-never its ability to work disconnected.
+node authors and reads entirely offline, **computes its own merge**, and
+converges on reconnect; the only things it delegates are *listening/relaying*
+and *retaining deep history*, never computing the merge and never its ability
+to work disconnected.
 
 ---
 
@@ -526,7 +546,7 @@ only the objects backing current `main`.
 ### 9.2 Packing, GC & retention
 
 - **Packing/GC (automatic hygiene, non-negotiable).** Debounced auto-commits
-  create many small loose objects; full nodes auto-pack (gitoxide
+  create many small loose objects; full nodes auto-pack (the engine's own
   pack-objects) on a size/count threshold or on idle, and GC unreachable
   objects. Required maintenance, not a policy choice. **GC-safety:**
   historical synthetic fold commits and primitives are reachable through the
@@ -724,11 +744,16 @@ deferred, not a v1 concern.
   (§4, §9, §11)
 - **User excludes:** a synced, gitignore-syntax `.contextignore` (plus optional
   node-local `.context/exclude`) layered under the allowlist scope. (§11)
-- **Node tiers / wasm:** thin nodes are offline-first but never run the merge
-  engine and never listen; only full nodes merge and listen; ≥1 full node
-  required; all-thin meshes unsupported. The wasm build therefore needs only
-  object encode/decode + sync + auth + framing — **not** the merge engine — so
-  gitoxide-in-wasm is low-stakes. (§7, §4)
+- **Node tiers / wasm (revised, pre-release):** **one engine everywhere** —
+  the deterministic fold/merge compiles to `wasm32`, so *every* node
+  (including a wasm plugin) runs the identical `compute_main` and computes
+  its own byte-identical `main`. Tiering distinguishes only **listen/relay
+  capability** (native server sockets) and **retention horizon**, never
+  merge. ≥1 listenable (full) node is still required as the rendezvous/relay
+  point — two browser/WebView nodes cannot accept each other's connection;
+  that is a transport/platform constraint, not a merge one. All-thin meshes
+  remain unsupported for *connectivity*, not for merge. Proven by the §18
+  SDK⇄`ctx` parity suite. (§7, §4, §16)
 - **CTX_\* env surface:** full deployment knobs (`CTX_CWD`, `CTX_NO_TLS`,
   `CTX_AUTHORIZED_KEYS`, `CTX_LOG`, `PORT`, generic `CTX_*` overrides). (§17.1)
 - **Conflict representation:** jj-style commutative conflicts evaluated and
@@ -774,11 +799,17 @@ deferred, not a v1 concern.
   (order-only associativity, recursive verification) **before anything else is
   built** — if it cannot be made deterministic in practice, the architecture
   does not work. Non-negotiable.
-- **gitoxide-wasm spike — low-stakes but still required.** Validate that the
-  *reduced* wasm surface (object encode/decode, sync state machine, auth,
-  framing — no merge, no on-disk odb/packfiles) compiles and runs under
-  `wasm32` in a browser/WebView before committing the SDK build. De-risked
-  because the merge engine never runs in wasm (§4, §7), not eliminated.
+- **Full-engine-in-wasm — DISCHARGED (was a residual gate; pre-release
+  decision moved it here).** The original gate validated only a *reduced*
+  wasm surface (no merge). Superseded by "one engine everywhere": the
+  **full** engine — fold/merge (`compute_main`), the sans-IO `Session`,
+  auth, framing, scope, config — compiles and runs under `wasm32` (browser/
+  WebView), with only the native odb/sockets/TLS `cfg`-gated out. Proven,
+  not assumed: the §18 cross-surface interop (byte-identity vs the shared
+  vectors) and the SDK⇄real-`ctx` parity suite show the wasm node converges
+  bit-for-bit with native. Wasm footprint is held down by the hand-rolled
+  scope/config codecs (no `regex`/`toml`) and a size build profile; this is
+  a maintenance concern, no longer a correctness gate. (§4, §7, §16, §18)
 - **TOFU exposure — operational caveat, not a code gate.** An internet-
   reachable listener with an empty authorized set and TOFU enabled trusts the
   first connector. Deployments exposing a fresh listener publicly MUST
@@ -861,17 +892,38 @@ The protocol is implemented **exactly once**, in Rust. Everything else is thin
 bindings or host glue. This is a hard structural rule, not a preference.
 
 - **`csp-core` (Rust crate).** The entire engine: object store, commit DAG,
-  deterministic fold/merge, sync protocol state machine, identity & auth,
-  scope/ignore. *All* protocol, merge, and convergence logic lives here and
-  nowhere else — **one codebase, conditionally compiled**: the merge/fold
-  engine and on-disk odb/packfiles are behind a build feature enabled for the
-  native/full-node profile and **compiled out of the wasm/thin profile** (thin
-  nodes never call them — §7, §4). It is not "merge logic also lives
-  elsewhere"; it is the same source feature-gated by node profile. Pure Rust;
-  I/O injected via traits (storage, transport, clock).
-- **`ctx` (native CLI).** A thin wrapper over `csp-core`: argument parsing,
-  process lifecycle, the filesystem watcher, the listen socket, native git
-  on-disk odb/packing. **No protocol logic.**
+  deterministic fold/**merge**, sync protocol state machine, identity & auth,
+  scope/ignore, config codec. *All* protocol, merge, and convergence logic
+  lives here and nowhere else. **One engine everywhere — the always-on
+  surface (object/oid, fold+merge incl. `compute_main`, the sans-IO
+  `Session`, identity/auth, wire framing, scope, the flat-TOML config codec,
+  the engine-state model, the in-memory store) compiles to `wasm32`
+  unchanged.** Only genuinely platform-bound pieces are behind the native
+  `full` feature (`cfg(not(wasm32) + full)`): the on-disk odb/packfiles
+  (`repo`), the disk-backed vault, the tokio socket driver (`net`), and TLS.
+  It is emphatically **not** "merge compiled out of wasm" — every node,
+  including a wasm plugin, runs the identical `compute_main` (§4/§7). Pure
+  Rust; I/O injected via traits (storage, transport, clock, rng).
+- **Sans-IO protocol core.** The replication state machine is a **sans-IO
+  `Session`** (`session.rs`: handshake/transcript, frontier anti-entropy,
+  integrate+verify, the `|F|=1` self-wrapper): it consumes inbound frame
+  bytes and emits outbound frame bytes + effects, with **no sockets, fs, or
+  clock of its own**. `ctx`'s `net.rs` (tokio) and the wasm/SDK node are
+  both thin drivers over the *same* `Session` — the protocol is executed by
+  one codebase on every surface, not reimplemented per host.
+- **Lean by construction.** Because the one engine must also be the wasm
+  payload, `csp-core` carries **no heavy general-purpose deps**: scope uses
+  a hand-rolled gitignore matcher (no `regex`) and config a hand-rolled
+  flat-TOML codec (no `toml`/`toml_edit`). Each replaced crate is kept as a
+  **dev-only differential-test oracle** — the hand-rolled scope matcher is
+  proven byte-for-byte against the old `regex` over tens of thousands of
+  generated cases, and the config codec proven to round-trip and to emit
+  TOML the real parser reads back identically (§18). Equivalence is proven,
+  not assumed.
+- **`ctx` (native CLI).** A thin driver over `csp-core`: argument parsing,
+  process lifecycle, the filesystem watcher, the listen socket, the native
+  on-disk odb/packing — feeding the shared sans-IO `Session`. **No protocol
+  logic.**
 - **TypeScript SDK.** `csp-core` compiled to a single **wasm** module plus
   thin TS bindings and injected host adapters (filesystem, WebSocket). It is
   **not a reimplementation** — there is exactly one protocol implementation
@@ -893,15 +945,33 @@ bindings or host glue. This is a hard structural rule, not a preference.
 A single binary, `ctx`, exposes the **full** engine capability set — nothing
 the protocol can do may be CLI-inaccessible. Command sketch (final names TBD):
 
-- `ctx init` — create a new, empty scoped vault and this node's SSH key
-  identity here.
+- `ctx init [path]` — create a new, empty scoped vault and this node's SSH
+  key identity. An explicit `[path]` is created if missing (`git init
+  <dir>` spirit), `.` = current dir; as the most explicit form it wins
+  over the global `--dir`/`CTX_CWD`, which it falls back to (then the
+  current dir) when omitted.
+  **Identity model:** `vault_id` is an **opaque protocol id**
+  — a fresh **UUID** by default (it must not leak the node key and is only
+  the handshake's "same vault?" equality guard, since all vaults share the
+  global genesis `M₀`); `--vault-id` overrides it to deliberately share a
+  memorable id. A separate optional **human name** (`--name`, else the
+  scope directory's basename, git-spirit "the folder is the name", else
+  empty) is *not* a uniqueness guarantee — it travels in config + `Hello`
+  purely for display and clone-folder naming. `--watch` stays running as
+  the sync daemon afterward.
 - `ctx clone <url> [into]` — bootstrap a new node from an existing vault
   served by a listening node: authenticate, full catch-up (download the
   primitive DAG + objects), materialize the working tree, write local
-  identity + config. **Target directory:** with no `[into]` it creates
-  `./<vault-id>/` (so cloning never silently litters the current folder);
-  `.` clones into the current folder; an explicit path uses that path. It
-  refuses to clobber an existing vault.
+  identity + config, and **record the source URL as a peer** (like git's
+  `origin`, so a bare `ctx watch` here reconnects automatically).
+  **Target directory:** with no `[into]` it creates `./<name>/` (the human
+  name, falling back to a short id slug — never the raw opaque id, and
+  never silently littering the current folder); `.` clones into the current
+  folder; an explicit path uses that path. It refuses to clobber an
+  existing vault. `--watch` transitions straight into the sync daemon after
+  bootstrap (one command to clone-and-stay-synced); without it `clone`
+  catches up and exits (git-clone semantics) and prints the exact `cd … &&
+  ctx watch` next step.
 - `ctx watch [--listen [addr]]` — **the primary long-running command.** Open
   the configured vault, watch the scoped tree (debounced auto-commit, with
   self-write suppression per §5.6), connect to its configured peer(s), and run
@@ -1012,8 +1082,17 @@ below green before any release.
 - **Cross-surface interop.** A wasm/TS node must interoperate with a native
   node — handshake, replication, identical convergence and SHAs. This is the
   guarantee that the wasm path is bindings over the same core, not a divergent
-  reimplementation. Host-plugin behavior is validated through the TS SDK e2e
-  harness.
+  reimplementation. Includes a **byte-identity vector check** (wasm output ==
+  shared test vectors == live `ctx`) and a **SDK⇄real-`ctx` parity** e2e
+  (spawn the real binary; assert bidirectional convergence). Host-plugin
+  behavior is validated through the TS SDK e2e harness.
+- **Differential-equivalence oracles (build gate).** Every hand-rolled
+  substitute for a dropped general-purpose dep must prove equivalence to the
+  original, kept dev-only: the scope matcher byte-for-byte vs the former
+  `regex` implementation over tens of thousands of generated path/pattern
+  cases; the config codec round-trips every config and emits TOML the real
+  `toml` parser reads back identically. "We didn't change behavior by
+  shrinking the engine" is a passing test, not an assertion.
 - **No-regression / parity requirement.** The CLI + SDK must be at least as
   capable and ergonomic as a mature reference sync tool: full command coverage,
   scriptable (`--json`), shell completions, robust SSH-key auth, snapshot/

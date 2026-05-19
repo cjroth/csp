@@ -1,7 +1,7 @@
 {
   "name": "@csp/sdk",
   "version": "0.1.0",
-  "description": "TypeScript SDK seam for the Context Sync Protocol. Types + helpers + an in-memory mock; the real csp-wasm bindings land here later behind the same API (CSP spec.md §16).",
+  "description": "TypeScript SDK for the Context Sync Protocol — a thin shim over the one Rust engine via wasm (csp-core/csp-wasm). One engine everywhere (CSP spec.md §16).",
   "license": "MIT OR Apache-2.0",
   "type": "module",
   "main": "./src/index.ts",
@@ -15,6 +15,12 @@
     "./web-init": {
       "types": "./src/web-init.ts",
       "default": "./src/web-init.ts"
+    }
+  },
+  "imports": {
+    "#engine": {
+      "browser": "./src/wasm-web.ts",
+      "default": "./src/wasm.ts"
     }
   },
   "files": ["src", "README.md"],

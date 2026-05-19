@@ -1,60 +1,46 @@
-// The single engine boundary. Auto-detects Tauri vs plain browser:
-//   - under Tauri  → `invoke()` the Rust command bridge + `listen()` events
-//   - in a browser → the in-TS mock (identical shapes & event cadence)
-// Nothing else in the app talks to the engine directly.
+// The single engine boundary: every call is a Tauri command into the real
+// native csp-core backend. No mocks, no dual mode.
 
 import type {
   AggregateStatus,
   AppSettings,
   AuthorizedKey,
-  CloneOutcome,
   ConnectAddress,
   EngineApi,
   EngineEvent,
   Identity,
-  IdentitySource,
   ListenerInfo,
-  RestoreTarget,
   Snapshot,
   Vault,
-  VaultId,
   VaultStatus,
 } from "@/lib/api.types";
-import { mockEngine } from "@/lib/mock/stub-engine";
-import { isTauri, tauriInvoke, tauriListen } from "@/lib/tauri";
+import { tauriInvoke, tauriListen } from "@/lib/tauri";
+
+/** The app only ships inside the Tauri shell now (real csp-core). */
+export const runningUnderTauri = true;
 
 const ENGINE_EVENT = "engine://event";
 
-class TauriEngine implements EngineApi {
-  listVaults = () => tauriInvoke<Vault[]>("list_vaults");
-  addLocalFolder = (path: string) => tauriInvoke<Vault>("add_local_folder", { path });
-  cloneRemote = (dest: string, url: string) =>
-    tauriInvoke<CloneOutcome>("clone_remote", { dest, url });
-  removeVault = (id: VaultId) => tauriInvoke<void>("remove_vault", { id });
-  setEnabled = (id: VaultId, on: boolean) => tauriInvoke<void>("set_enabled", { id, on });
-  setAllowConnections = (id: VaultId, on: boolean) =>
-    tauriInvoke<ListenerInfo>("set_allow_connections", { id, on });
-  getConnectAddress = (id: VaultId) => tauriInvoke<ConnectAddress>("get_connect_address", { id });
-  listAuthorized = (id: VaultId) => tauriInvoke<AuthorizedKey[]>("list_authorized", { id });
-  authorize = (id: VaultId, pubkey: string) => tauriInvoke<void>("authorize", { id, pubkey });
-  revoke = (id: VaultId, fingerprint: string) => tauriInvoke<void>("revoke", { id, fingerprint });
-  respondTofu = (requestId: string, allow: boolean) =>
-    tauriInvoke<void>("respond_tofu", { request_id: requestId, allow });
-  getIdentity = () => tauriInvoke<Identity>("get_identity");
-  setIdentitySource = (src: IdentitySource) =>
-    tauriInvoke<Identity>("set_identity_source", { src });
-  getSettings = () => tauriInvoke<AppSettings>("get_settings");
-  setSettings = (settings: AppSettings) => tauriInvoke<AppSettings>("set_settings", { settings });
-  createSnapshot = (id: VaultId, name: string) =>
-    tauriInvoke<Snapshot>("create_snapshot", { id, name });
-  listSnapshots = (id: VaultId) => tauriInvoke<Snapshot[]>("list_snapshots", { id });
-  restore = (id: VaultId, target: RestoreTarget) => tauriInvoke<void>("restore", { id, target });
-  getStatus = (id: VaultId) => tauriInvoke<VaultStatus>("get_status", { id });
-  getAggregateStatus = () => tauriInvoke<AggregateStatus>("get_aggregate_status");
-  devTriggerTofu = () => tauriInvoke<void>("dev_trigger_tofu");
-  devTriggerSuperseded = () => tauriInvoke<void>("dev_trigger_superseded");
-  refreshTray = () => tauriInvoke<void>("refresh_tray");
-
+export const api: EngineApi = {
+  listVaults: () => tauriInvoke<Vault[]>("list_vaults"),
+  addLocalFolder: (path) => tauriInvoke<Vault>("add_local_folder", { path }),
+  cloneRemote: (dest, url) => tauriInvoke<Vault>("clone_remote", { dest, url }),
+  removeVault: (id) => tauriInvoke<void>("remove_vault", { id }),
+  setEnabled: (id, on) => tauriInvoke<void>("set_enabled", { id, on }),
+  setAllowConnections: (id, on) => tauriInvoke<ListenerInfo>("set_allow_connections", { id, on }),
+  getConnectAddress: (id) => tauriInvoke<ConnectAddress>("get_connect_address", { id }),
+  listAuthorized: (id) => tauriInvoke<AuthorizedKey[]>("list_authorized", { id }),
+  authorize: (id, pubkey) => tauriInvoke<void>("authorize", { id, pubkey }),
+  revoke: (id, fingerprint) => tauriInvoke<void>("revoke", { id, fingerprint }),
+  getIdentity: () => tauriInvoke<Identity>("get_identity"),
+  getSettings: () => tauriInvoke<AppSettings>("get_settings"),
+  setSettings: (settings) => tauriInvoke<AppSettings>("set_settings", { settings }),
+  createSnapshot: (id, name) => tauriInvoke<Snapshot>("create_snapshot", { id, name }),
+  listSnapshots: (id) => tauriInvoke<Snapshot[]>("list_snapshots", { id }),
+  restore: (id, target) => tauriInvoke<void>("restore", { id, target }),
+  getStatus: (id) => tauriInvoke<VaultStatus>("get_status", { id }),
+  getAggregateStatus: () => tauriInvoke<AggregateStatus>("get_aggregate_status"),
+  refreshTray: () => tauriInvoke<void>("refresh_tray"),
   subscribe(cb: (e: EngineEvent) => void) {
     let unlisten: (() => void) | null = null;
     let stopped = false;
@@ -66,9 +52,5 @@ class TauriEngine implements EngineApi {
       stopped = true;
       unlisten?.();
     };
-  }
-}
-
-export const api: EngineApi = isTauri() ? new TauriEngine() : mockEngine();
-
-export const runningUnderTauri = isTauri();
+  },
+};

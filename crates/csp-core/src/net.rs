@@ -24,13 +24,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Listener,
-    Connector,
-}
-
-const AUTH_CTX: &[u8] = b"csp-auth-v1";
+pub use crate::session::Role;
+use crate::session::{Session, SessionVault};
 
 /// A running engine node: the shared vault plus an intra-process relay bus
 /// that fans new object closures out to every live session (§6.1 relay).
@@ -153,20 +148,27 @@ impl Node {
 }
 
 /// Bootstrap probe for `ctx clone` (§17): connect, read the listener's
-/// `Hello` to learn the vault id + its public key (so the fresh node can be
-/// created with the right vault id and seed the source's key into its local
-/// authorized set — §10), then drop the connection.
-pub async fn probe(url: &str, identity: &Identity) -> CspResult<(String, String)> {
+/// `Hello` to learn the vault id, its human name (for clone-folder naming),
+/// and its public key (to seed the source's key into the new node's local
+/// authorized set — §10), then drop the connection. Returns
+/// `(vault_id, name, server_ssh)`.
+pub async fn probe(
+    url: &str,
+    identity: &Identity,
+) -> CspResult<(String, String, String)> {
     let (mut t, _cb) = dial(url).await?;
     t.send(&Msg::Hello {
         vault_id: String::new(),
+        name: String::new(),
         node_ssh: identity.to_ssh_string(),
         nonce: rand_nonce(),
         proto: crate::wire::PROTO_VERSION,
     })
     .await?;
     match t.recv().await {
-        Some(Msg::Hello { vault_id, node_ssh, .. }) => Ok((vault_id, node_ssh)),
+        Some(Msg::Hello { vault_id, name, node_ssh, .. }) => {
+            Ok((vault_id, name, node_ssh))
+        }
         _ => Err(CspError::Protocol("probe: expected Hello".into())),
     }
 }
@@ -303,137 +305,82 @@ fn rand_nonce() -> Vec<u8> {
     n.to_vec()
 }
 
-fn transcript(client_nonce: &[u8], server_nonce: &[u8], channel_binding: &[u8]) -> Vec<u8> {
-    let mut t = AUTH_CTX.to_vec();
-    t.extend_from_slice(client_nonce);
-    t.extend_from_slice(server_nonce);
-    // §10 channel binding: the TLS cert fingerprint both sides observed. A
-    // relayed MITM that re-terminates TLS presents a different cert, so the
-    // signed transcripts no longer match. Empty for plaintext `ws://`.
-    t.extend_from_slice(channel_binding);
-    t
+/// Everything the protocol needs from the engine, supplied by the native
+/// full `Vault`. The *one* sans-IO [`Session`] (shared with the wasm/thin
+/// SDK) drives this — there is exactly one protocol implementation (§16).
+impl SessionVault for Vault {
+    fn vault_id(&self) -> String {
+        Vault::vault_id(self).to_string()
+    }
+    fn name(&self) -> String {
+        Vault::name(self).to_string()
+    }
+    fn identity_ssh(&self) -> String {
+        Vault::identity_ssh(self)
+    }
+    fn sign(&self, msg: &[u8]) -> Vec<u8> {
+        Vault::sign(self, msg)
+    }
+    fn frontier_tips(&self) -> CspResult<Vec<crate::oid::Oid>> {
+        Vault::frontier_tips(self)
+    }
+    fn known(&self) -> CspResult<Vec<crate::oid::Oid>> {
+        Vault::known(self)
+    }
+    fn has(&self, o: crate::oid::Oid) -> bool {
+        self.repo().store.has(o)
+    }
+    fn export_closure(&self, tips: &[crate::oid::Oid]) -> CspResult<Vec<Vec<u8>>> {
+        Vault::export_closure(self, tips)
+    }
+    fn integrate(&mut self, raws: &[Vec<u8>]) -> CspResult<usize> {
+        Vault::integrate(self, raws)
+    }
+    fn admit_peer(&mut self, peer_ssh: &str) -> CspResult<bool> {
+        Vault::admit_peer_tofu(self, peer_ssh)
+    }
 }
 
-/// Mutual authentication (§10): each side signs a transcript covering both
-/// nonces; both directions verify. The listener then admits the connector
-/// per its **local** authorized set (TOFU only while empty — §10),
-/// independent of any relay (per-author trust is separately enforced in
-/// `integrate`).
-async fn handshake(
-    node: &Node,
-    t: &mut Transport,
-    role: Role,
-    channel_binding: &[u8],
-) -> CspResult<()> {
-    let (vault_id, my_ssh, identity): (String, String, Identity) = {
-        let v = node.vault.lock().await;
-        (
-            v.vault_id().to_string(),
-            v.identity_ssh(),
-            v.identity_clone(),
-        )
-    };
-    let my_nonce = rand_nonce();
-    t.send(&Msg::Hello {
-        vault_id: vault_id.clone(),
-        node_ssh: my_ssh.clone(),
-        nonce: my_nonce.clone(),
-        proto: crate::wire::PROTO_VERSION,
-    })
-    .await?;
-    let (peer_vault, peer_ssh, peer_nonce, peer_proto) = match t.recv().await {
-        Some(Msg::Hello { vault_id, node_ssh, nonce, proto }) => {
-            (vault_id, node_ssh, nonce, proto)
-        }
-        _ => return Err(CspError::Protocol("expected Hello".into())),
-    };
-    if peer_proto != crate::wire::PROTO_VERSION {
-        tracing::warn!(
-            "rejecting peer: protocol version mismatch (peer speaks v{peer_proto}, \
-             we speak v{}) — both nodes must run the same `ctx` build; restart the \
-             other side after upgrading",
-            crate::wire::PROTO_VERSION
-        );
-        return Err(CspError::Protocol(format!(
-            "protocol version mismatch: peer v{peer_proto} != ours v{}",
-            crate::wire::PROTO_VERSION
-        )));
-    }
-    if peer_vault != vault_id {
-        tracing::warn!(
-            "rejecting peer: vault id mismatch (theirs={peer_vault:?}, ours={vault_id:?}) \
-             — both sides must `ctx init --vault-id <same>`"
-        );
-        return Err(CspError::Protocol(format!(
-            "vault id mismatch: {peer_vault} != {vault_id}"
-        )));
-    }
-    let (client_nonce, server_nonce) = match role {
-        Role::Connector => (my_nonce.clone(), peer_nonce.clone()),
-        Role::Listener => (peer_nonce.clone(), my_nonce.clone()),
-    };
-    let script = transcript(&client_nonce, &server_nonce, channel_binding);
-    t.send(&Msg::AuthProof { sig: identity.sign(&script) }).await?;
-    let peer_sig = match t.recv().await {
-        Some(Msg::AuthProof { sig }) => sig,
-        _ => return Err(CspError::Protocol("expected AuthProof".into())),
-    };
-    let peer_node = crate::identity::parse_ssh_pubkey(&peer_ssh)
-        .ok_or_else(|| CspError::BadSignature("bad peer ssh key".into()))?;
-    crate::identity::verify_detached(&peer_node, &script, &peer_sig)?;
-
-    if role == Role::Listener {
-        // Admission is the listener's local policy (§10). TOFU only while
-        // the authorized set is empty.
-        let v = node.vault.lock().await;
-        if !v.admit_peer_tofu(&peer_ssh)? {
-            tracing::warn!(
-                "rejecting unauthorized peer {}…\n  to allow it, run on THIS node:\n  ctx authorize \"{}\"",
-                &peer_node.to_hex()[..12],
-                peer_ssh.trim()
-            );
-            return Err(CspError::Unauthorized(format!(
-                "peer {} not authorized",
-                &peer_node.to_hex()[..12]
-            )));
-        }
-    }
-    match role {
-        Role::Listener => tracing::info!(
-            "peer authenticated: {}… (vault {})",
-            &peer_node.to_hex()[..12],
-            vault_id
-        ),
-        Role::Connector => tracing::info!(
-            "authenticated to listener {}… (vault {})",
-            &peer_node.to_hex()[..12],
-            vault_id
-        ),
-    }
-    Ok(())
-}
-
+/// Thin tokio driver over the sans-IO [`Session`] (§6). The session owns all
+/// protocol logic; this only does I/O: encode/send, recv/decode, and the
+/// native full-node relay bus (§6.1). Behaviour is byte-identical to the
+/// pre-refactor inline handshake + loop.
 async fn run_session(
     node: Node,
     mut t: Transport,
     role: Role,
     channel_binding: Vec<u8>,
 ) -> CspResult<()> {
-    handshake(&node, &mut t, role, &channel_binding).await?;
+    let mut session = Session::new(role, channel_binding, rand_nonce());
 
-    // Catch-up kickoff: advertise our frontier (§6.4).
-    let my_tips = {
+    // Both sides send `Hello` immediately (§10).
+    {
         let v = node.vault.lock().await;
-        v.frontier_tips()?
-            .into_iter()
-            .map(|o| o.to_hex())
-            .collect::<Vec<_>>()
-    };
-    tracing::info!("catch-up: advertised {} frontier tip(s)", my_tips.len());
-    t.send(&Msg::FrontierDigest { tips: my_tips }).await?;
+        t.send(&session.start(&*v)).await?;
+    }
+
+    // Drive the handshake (inbound only) until established. Subscribing to
+    // the relay bus *after* the handshake preserves the original ordering
+    // (no `Live` can be selected mid-handshake).
+    loop {
+        let Some(msg) = t.recv().await else {
+            tracing::info!("peer session ended");
+            return Ok(());
+        };
+        let step = {
+            let mut v = node.vault.lock().await;
+            session.on_msg(&mut *v, msg)?
+        };
+        for m in &step.out {
+            t.send(m).await?;
+        }
+        if session.established() {
+            break;
+        }
+    }
+    tracing::info!("catch-up: handshake complete, frontier advertised");
 
     let mut relay_rx = node.bus.subscribe();
-
     loop {
         tokio::select! {
             biased;
@@ -442,69 +389,46 @@ async fn run_session(
                     tracing::info!("peer session ended");
                     return Ok(());
                 };
-                handle_msg(&node, &t, msg).await?;
+                let step = {
+                    let mut v = node.vault.lock().await;
+                    session.on_msg(&mut *v, msg)?
+                };
+                for m in &step.out {
+                    t.send(m).await?;
+                }
+                if step.integrated > 0 {
+                    let main = node
+                        .vault
+                        .lock()
+                        .await
+                        .main()
+                        .map(|o| o.to_hex())
+                        .unwrap_or_default();
+                    tracing::info!(
+                        "integrated {} new primitive(s); main={}…",
+                        step.integrated,
+                        &main[..main.len().min(12)]
+                    );
+                }
+                if !step.relay.is_empty() {
+                    // Relay onward (§6.1). Idempotent + admitted-gated, so
+                    // gossip terminates.
+                    let _ = node.bus.send(step.relay);
+                }
             }
             relayed = relay_rx.recv() => {
                 match relayed {
-                    Ok(raws) => { t.send(&Msg::Live { raws }).await?; }
+                    Ok(raws) => {
+                        for m in session.on_relay(raws) {
+                            t.send(&m).await?;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
         }
     }
-}
-
-async fn handle_msg(node: &Node, t: &Transport, msg: Msg) -> CspResult<()> {
-    match msg {
-        Msg::FrontierDigest { tips } => {
-            let v = node.vault.lock().await;
-            let mut want = Vec::new();
-            for hex in tips {
-                if let Ok(o) = crate::oid::Oid::from_hex(&hex) {
-                    if !v.repo().store.has(o) || !v.known()?.contains(&o) {
-                        want.push(hex);
-                    }
-                }
-            }
-            drop(v);
-            if !want.is_empty() {
-                t.send(&Msg::WantTips { tips: want }).await?;
-            }
-        }
-        Msg::WantTips { tips } => {
-            let v = node.vault.lock().await;
-            let oids: Vec<_> = tips
-                .iter()
-                .filter_map(|h| crate::oid::Oid::from_hex(h).ok())
-                .collect();
-            let raws = v.export_closure(&oids)?;
-            drop(v);
-            t.send(&Msg::Objects { raws }).await?;
-        }
-        Msg::Objects { raws } | Msg::Live { raws } => {
-            let (admitted, main) = {
-                let mut v = node.vault.lock().await;
-                let a = v.integrate(&raws)?;
-                (a, v.main().map(|o| o.to_hex()).unwrap_or_default())
-            };
-            if admitted > 0 {
-                tracing::info!(
-                    "integrated {admitted} new primitive(s); main={}…",
-                    &main[..main.len().min(12)]
-                );
-                // Relay onward (§6.1). Idempotent + admitted-gated, so
-                // gossip terminates.
-                let _ = node.bus.send(raws);
-            }
-        }
-        Msg::Ping => t.send(&Msg::Pong).await?,
-        Msg::Pong => {}
-        Msg::Hello { .. } | Msg::AuthProof { .. } => {
-            return Err(CspError::Protocol("unexpected handshake msg mid-session".into()));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

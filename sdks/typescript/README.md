@@ -1,38 +1,45 @@
 # @csp/sdk
 
-TypeScript SDK **seam** for the Context Sync Protocol (CSP — see
-[`../../spec.md`](../../spec.md), §16 "one core, thin bindings").
+TypeScript SDK for the Context Sync Protocol — a **thin shim over the one
+Rust engine** (`csp-core`) compiled to wasm. See `../../spec.md` §16 ("one
+core, thin bindings"). It is **not** a reimplementation: every
+sync/merge/fold/identity/auth behavior is a call into the same `csp-core`
+that `ctx` uses, so a host (the Obsidian plugin) computes its own
+**byte-identical `main`**.
 
-This package is the typed surface a thin-node host (the Obsidian plugin,
-`../../plugins/obsidian`) binds to. Today it ships:
+## What it is
 
-- **Types** — the CSP-recast public API contract (`Vault`, `StorageAdapter`,
-  `TransportAdapter`, `VaultEvent`, `CspConfig`, …). No hub, no
-  server-minted vault id (CSP spec §5): a thin node connects to a *peer*
-  (a full node in listen mode) and converges via the engine.
-- **Working helpers** — the lossless `.context/config` TOML codec and the
-  identity-file codec (provisional formats; see below).
-- **An in-memory mock** (`src/mock/`) implementing the `Vault` contract so
-  the plugin is fully buildable and unit/e2e testable **without** the real
-  `csp-wasm` runtime. The mock converges file state between vaults sharing a
-  peer URL; it does **not** implement the CSP fold/merge — the plugin asserts
-  no fold SHAs (CSP spec §13), so this is sufficient and is documented.
+- **`Vault`** (`src/real-vault.ts`) — the thin-node session: owns a
+  file-level working map, drives `engine.commit_from_files` /
+  `materialize_plan` (§5.6) and the shared sans-IO `Session`
+  (`session_start`/`session_feed`) over an injected WebSocket transport, and
+  persists `engine.to_bytes()` via the host `StorageAdapter`. No protocol
+  logic in TS.
+- **`WasmEngine`** — the real `csp_core::MemEngine` + `Session` via wasm.
+  Two wasm-pack targets, one byte-identical core, selected by the package
+  `#engine` imports map:
+  - `pkg/` (nodejs) — Node/Bun: SDK tests, the §18 `ctx`-parity e2e,
+    Obsidian desktop/Electron.
+  - `pkg-web/` (web) — browser/WebView: the Obsidian mobile bundle (esbuild
+    inlines `pkg-web/csp_wasm_bg.wasm`; `initCsp(bytes)` instantiates it).
+- **Config / identity-file codecs** — the lossless `.context/config` TOML
+  and the identity-file format, shared with `ctx`.
+- **`src/mock/`** — an in-memory `MockVault` double, exported **for tests
+  only** (offline UI tests / plugin unit tests). NOT the production path.
 
-## Residual gates (CSP spec §13.2 / obsidian-plugin-spec §14)
+## Verified
 
-Deferred and **isolated entirely behind this package** — when they land, the
-plugin, its tests, and its module boundaries do not change:
+`bun run build:wasm` builds both wasm targets, then:
 
-- The real `crates/csp-wasm` reduced thin-node surface (object encode/decode,
-  sync state machine, auth, framing — no merge, no on-disk odb/packfiles).
-  `scripts/build-wasm.mjs` is the wiring point; it errors clearly until
-  `csp-wasm` exists.
-- The canonical OpenSSH `~/.context/id_ed25519` byte format (CSP spec §10).
-  `src/identity-file.ts` uses a provisional `csp-identity-v1` line.
-- The canonical `.context/config` schema (CSP spec §9.1/§17.1). `src/config.ts`
-  models a provisional `[peer]`/`[identity]`/`[scope]` schema, lossless w.r.t.
-  unknown keys so a newer `ctx` never clobbers an older plugin (and vice
-  versa).
+- `bun test test` — config/identity round-trips, the cross-surface
+  conformance vectors (`test/interop.test.ts` vs `test-vectors.json`: the
+  wasm output is byte-identical to native), the real engine offline, and
+  **`test/e2e/ctx-parity.test.ts`** — spawns the real `ctx` binary as a
+  listener and proves the SDK `Vault` converges with it **bidirectionally**
+  over a real WebSocket (the §18 truth oracle).
 
-When `csp-wasm` is built, implement `Vault`/`Identity`/`Pubkey` over it and
-point `web-init.ts` at the real module instead of `src/mock/`.
+## Honest residual
+
+`build:wasm` uses `wasm-pack --dev` (fast, large). A release build
+(`--release` + `wasm-opt -Oz`) shrinks the inlined wasm substantially and is
+the packaging follow-up; functionally the engine is complete and proven.

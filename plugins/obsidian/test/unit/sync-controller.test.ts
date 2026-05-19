@@ -3,7 +3,7 @@
 // (two controllers sharing a peer URL join the same Room).
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { Identity, _resetBroker, memoryStorage } from '@csp/sdk/web-init';
+import { Identity, MockIdentity, MockVault, _resetBroker, memoryStorage } from '@csp/sdk/web-init';
 import { type CspSettings, DEFAULT_SETTINGS } from '../../src/settings.js';
 import { ObsidianStorageAdapter } from '../../src/storage-adapter.js';
 import { SyncController } from '../../src/sync-controller.js';
@@ -80,15 +80,41 @@ describe('openOrCreate', () => {
   });
 });
 
-describe('peer convergence + events (CSP §6.1 mock Room)', () => {
-  test('two controllers on one peer URL converge; peer key pinned', async () => {
+// Controller↔SDK wiring (connect → 'connected' pins the peer key;
+// 'tree-changed' → applyRemoteState materializes into Obsidian), driven
+// against the in-memory `MockVault` double via the controller's
+// `sdkOverride` test seam. REAL byte-identical convergence against a real
+// `ctx` is proven by `sdks/typescript/test/e2e/ctx-parity.test.ts`.
+describe('controller ⇄ SDK wiring (mock double)', () => {
+  async function mkCtl(peerUrl: string) {
+    const adapter = new FakeDataAdapter();
+    const vault = new FakeVault(adapter);
+    const settings: CspSettings = { ...DEFAULT_SETTINGS, syncEnabled: true, peerUrl };
+    const sdk = await MockVault.create({
+      storage: memoryStorage(),
+      identity: MockIdentity.generate(),
+      peerUrl,
+    });
+    const controller = new SyncController({
+      storage: new ObsidianStorageAdapter(adapter),
+      vault,
+      settings,
+      identity: Identity.generate(),
+      saveSettings: async (s) => {
+        Object.assign(settings, s);
+      },
+      sdkOverride: sdk,
+    });
+    return { controller, vault, settings };
+  }
+
+  test('connect pins the peer key; remote write materializes into Obsidian', async () => {
     const peerUrl = 'wss://peer:7777';
-    const a = makeHarness({ peerUrl });
-    const b = makeHarness({ peerUrl });
+    const a = await mkCtl(peerUrl);
+    const b = await mkCtl(peerUrl);
 
     await a.controller.start({ connect: true });
     await waitFor(() => (a.controller.state === 'connected' ? true : undefined));
-    // First connect pins the peer key (CSP §10 key pinning).
     expect(a.settings.peerPubkey.startsWith('ssh-ed25519 ')).toBe(true);
 
     await a.vault.create('shared.md', 'from A\n');
@@ -98,7 +124,6 @@ describe('peer convergence + events (CSP §6.1 mock Room)', () => {
 
     await b.controller.start({ connect: true });
     await waitFor(() => (b.controller.state === 'connected' ? true : undefined));
-    // b pulls shared.md via tree-changed → applyRemoteState (debounced).
     await waitFor(() => (b.vault.getAbstractFileByPath('shared.md') ? true : undefined));
     expect(await b.vault.read(b.vault.getFiles()[0] as never)).toBe('from A\n');
 

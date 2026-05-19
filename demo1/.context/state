@@ -1,0 +1,16 @@
+{
+  "vault_id": "0f9d2465-9d1c-4dd6-a97d-a796dfb5d1a4",
+  "counter": 4,
+  "observed": 5,
+  "known": [
+    "0a042d8f3604ab5164bb0fb252b5b84b2dba11c3",
+    "6130d5e4e5b55cd6ed380ecd777bab052e808921",
+    "ef8087c57a53bf54d13ed94e118cca97daf214ce",
+    "5f8b6cca20d6b0def6bca13c7871a12213852246",
+    "25fdbad353e533245caab8f04dcd895402cfa942"
+  ],
+  "materialized": {
+    "test": "4f100a8870dc7164905f3cd0cf4b0be217225b99"
+  },
+  "snapshots": {}
+}

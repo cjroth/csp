@@ -1,0 +1,35 @@
+app = "csp"
+primary_region = "ewr"
+
+[build]
+
+# Startup-time configuration. CTX_VAULT_NAME is the human-readable vault
+# name written into .context/config on first launch (used by clients as
+# the default local dir when running `ctx clone <url>`).
+# CTX_AUTHORIZED_KEYS is read directly by `ctx watch` and merged into the
+# synced authorized_keys file on every start — store actual keys as a Fly
+# secret rather than here, e.g.:
+#   fly secrets set CTX_AUTHORIZED_KEYS="$(ctx key)"
+[env]
+  CTX_VAULT_NAME = "vault"
+  CTX_CWD = "/mnt/workspace"
+  # Fly's [http_service] terminates TLS at the edge and forwards plain
+  # HTTP/WS to internal_port — so the in-container hub binds plain WS and
+  # lets the edge handle TLS. Clients still connect via wss://.
+  CTX_NO_TLS = "1"
+
+[http_service]
+  internal_port = 9000
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[mounts]]
+  source = "csp_data"
+  destination = "/mnt/workspace"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512

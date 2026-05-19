@@ -345,6 +345,9 @@ interface FakeElementMethods {
   removeClass(c: string): void;
   hasClass(c: string): boolean;
   empty(): void;
+  /** Test accessors — current text + class set. */
+  _text(): string;
+  _classes: Set<string>;
 }
 
 export type FakeHTMLElement = HTMLElement & FakeElementMethods;

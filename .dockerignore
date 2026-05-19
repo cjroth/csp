@@ -1,0 +1,15 @@
+target
+.git
+.github
+.gitignore
+docs
+desktop
+plugins
+sdks
+demo*
+*.md
+mise.toml
+fly.toml
+railway.toml
+Dockerfile
+.dockerignore

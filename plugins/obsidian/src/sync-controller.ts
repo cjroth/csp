@@ -324,8 +324,12 @@ export class SyncController {
         this.setState('connected');
         // Key-pin the peer identity on first connect (CSP §10 — a
         // connecting node also verifies the listener's key). SSH wire
-        // format, the same representation `ctx` uses.
-        if (!this.deps.settings.peerPubkey) {
+        // format, the same representation `ctx` uses. The engine verifies
+        // the listener's key inside the handshake; it does not surface the
+        // raw bytes to the host yet, so `peer_pubkey` is empty on the real
+        // path — only pin when it actually carries a key (forward-compatible
+        // and avoids a swallowed throw on every connect).
+        if (!this.deps.settings.peerPubkey && e.peer_pubkey.length > 0) {
           const pk = Pubkey.fromBytes(e.peer_pubkey);
           try {
             this.deps.settings.peerPubkey = pk.toSshString();
@@ -369,19 +373,4 @@ function sshPubkeyBytes(ssh: string): Uint8Array {
   } finally {
     pk.free();
   }
-}
-
-export function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-export function hexToBytes(hex: string): Uint8Array {
-  if (hex.length % 2 !== 0) throw new Error('hex string must have even length');
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    const byte = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-    if (Number.isNaN(byte)) throw new Error(`invalid hex at index ${i * 2}`);
-    out[i] = byte;
-  }
-  return out;
 }

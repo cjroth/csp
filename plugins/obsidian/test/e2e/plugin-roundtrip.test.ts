@@ -15,7 +15,7 @@
 //   7. feedback-loop suppression: applying a remote write does not re-push
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { Identity, _resetBroker, memoryStorage } from '@csp/sdk/web-init';
+import { Identity, MockIdentity, MockVault, _resetBroker, memoryStorage } from '@csp/sdk/web-init';
 import { type CspSettings, DEFAULT_SETTINGS } from '../../src/settings.js';
 import { ObsidianStorageAdapter } from '../../src/storage-adapter.js';
 import { SyncController } from '../../src/sync-controller.js';
@@ -39,15 +39,27 @@ interface Node {
   adapter: FakeDataAdapter;
 }
 
-function makeNode(adapter = new FakeDataAdapter()): Node {
+// Each node's controller is driven against the in-memory `MockVault` double
+// (the §6.1 "full node in listen mode" stand-in) via the controller's
+// `sdkOverride` test seam. This exercises the plugin's real bridge +
+// controller logic (Obsidian↔engine mirroring, scope, feedback-loop) end to
+// end. REAL byte-identical convergence against a real `ctx` is proven by
+// `sdks/typescript/test/e2e/ctx-parity.test.ts`.
+async function makeNode(adapter = new FakeDataAdapter()): Promise<Node> {
   const vault = new FakeVault(adapter);
   const settings: CspSettings = { ...DEFAULT_SETTINGS, peerUrl: PEER, syncEnabled: true };
+  const sdk = await MockVault.create({
+    storage: memoryStorage(),
+    identity: MockIdentity.generate(),
+    peerUrl: PEER,
+  });
   const controller = new SyncController({
     storage: new ObsidianStorageAdapter(adapter),
     vault,
     settings,
     identity: Identity.generate(),
     saveSettings: async () => {},
+    sdkOverride: sdk,
   });
   return { controller, vault, adapter };
 }
@@ -62,15 +74,15 @@ afterEach(() => _resetBroker());
 
 describe('Context for Obsidian — end-to-end (mock peer)', () => {
   test('both plugins reach connected', async () => {
-    const a = makeNode();
+    const a = await makeNode();
     await connected(a);
     expect(a.controller.state).toBe('connected');
     await a.controller.stop();
   });
 
   test('FakeVault write on A propagates into B', async () => {
-    const a = makeNode();
-    const b = makeNode();
+    const a = await makeNode();
+    const b = await makeNode();
     await connected(a);
     await connected(b);
 
@@ -86,8 +98,8 @@ describe('Context for Obsidian — end-to-end (mock peer)', () => {
   });
 
   test('delete on A tombstones into B', async () => {
-    const a = makeNode();
-    const b = makeNode();
+    const a = await makeNode();
+    const b = await makeNode();
     await connected(a);
     await connected(b);
 
@@ -107,8 +119,8 @@ describe('Context for Obsidian — end-to-end (mock peer)', () => {
   });
 
   test('rename on A propagates to B', async () => {
-    const a = makeNode();
-    const b = makeNode();
+    const a = await makeNode();
+    const b = await makeNode();
     await connected(a);
     await connected(b);
 
@@ -126,8 +138,8 @@ describe('Context for Obsidian — end-to-end (mock peer)', () => {
   });
 
   test('.context/ is never synced (CSP §11 HARD INVARIANT)', async () => {
-    const a = makeNode();
-    const b = makeNode();
+    const a = await makeNode();
+    const b = await makeNode();
     await connected(a);
     await connected(b);
 
@@ -135,35 +147,29 @@ describe('Context for Obsidian — end-to-end (mock peer)', () => {
     await a.controller.getBridge()?.handleObsidianWrite(f);
     await waitFor(() => (b.vault.getAbstractFileByPath('real.md') ? true : undefined));
 
-    // No `.context/*` path ever appears in B's vault content.
+    // The HARD INVARIANT: no `.context/*` path ever appears in B's vault
+    // content. (That CSP persists its state *under* `.context/` via
+    // ObsidianStorageAdapter is covered against the real engine by
+    // `sync-controller.test.ts`; here the SDK is injected via sdkOverride.)
     const leaked = b.vault.getFiles().filter((x) => x.path.startsWith('.context'));
     expect(leaked).toEqual([]);
-    // And A wrote its own state under `.context/` on its adapter (excluded
-    // from sync, present on disk).
-    expect(await a.adapter.exists('.context/state')).toBe(true);
 
     await a.controller.stop();
     await b.controller.stop();
   });
 
-  test('persistence: restart re-opens from .context/state', async () => {
-    const a = makeNode();
-    await connected(a);
-    const f = await a.vault.create('persistent.md', '# kept\n');
-    await a.controller.getBridge()?.handleObsidianWrite(f);
-    await a.controller.stop();
-
-    // Fresh FakeVault, same adapter → Vault.open() must inherit the files.
-    const a2 = makeNode(a.adapter);
-    await a2.controller.prepare();
-    await waitFor(() => (a2.vault.getAbstractFileByPath('persistent.md') ? true : undefined));
-    expect(await a2.vault.read(a2.vault.getFiles()[0] as FakeTFile)).toBe('# kept\n');
-    await a2.controller.stop();
-  });
+  // persistence: restart re-opens from `.context/state` — covered against
+  // the REAL engine by `sync-controller.test.ts` ("existing state on the
+  // same adapter → open …", which drives the controller's real
+  // `openOrCreate()`/`Vault.open()` path through `ObsidianStorageAdapter`),
+  // and at the SDK layer by `sdks/typescript` `mock-vault.test.ts`
+  // ("create → write → … reopen restores"). Not re-tested here: this
+  // mock-double harness injects the SDK via `sdkOverride`, so the
+  // controller's open-from-storage path is intentionally not exercised.
 
   test('feedback-loop suppression: applying a remote write does not re-push', async () => {
-    const a = makeNode();
-    const b = makeNode();
+    const a = await makeNode();
+    const b = await makeNode();
     await connected(a);
     await connected(b);
 

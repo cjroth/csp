@@ -2,9 +2,9 @@ import {
   ChevronRight,
   FolderOpen,
   GitCommitHorizontal,
+  Layers,
   MoreVertical,
   Trash2,
-  Users,
 } from "lucide-react";
 import { useState } from "react";
 import { useNavigate } from "react-router";
@@ -86,11 +86,11 @@ export function FolderRow({ vault }: { vault: Vault }) {
         </div>
 
         <div className="hidden items-center gap-5 text-xs text-muted-foreground md:flex">
-          <span className="inline-flex items-center gap-1.5" title="Connected peers">
-            <Users className="h-3.5 w-3.5" />
-            {status?.peersConnected ?? 0}
+          <span className="inline-flex items-center gap-1.5" title="Known primitives">
+            <Layers className="h-3.5 w-3.5" />
+            {status?.knownCount ?? 0}
           </span>
-          <span className="w-20 text-right tabular-nums">{relativeTime(status?.lastActivity)}</span>
+          <span className="w-24 text-right tabular-nums">{relativeTime(status?.lastCommit)}</span>
         </div>
 
         <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />

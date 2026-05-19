@@ -10,6 +10,22 @@
 > It is a port of the existing **agentsync Obsidian plugin** onto the CSP
 > TypeScript/wasm SDK in place of the agentsync (Automerge-over-hub) SDK.
 > Working plugin name: **Context for Obsidian** (final name TBD).
+>
+> **REVISED (pre-release, implemented & verified): one engine everywhere.**
+> The original design below treats the plugin as a *thin node that cannot
+> merge* (merge/odb "compiled out of wasm", needs a full node to compute the
+> merged tree). That split is **superseded**: `csp-core`'s deterministic
+> 3-way merge/fold now compiles to `wasm32`, so the plugin runs the
+> **identical Rust engine** as `ctx` and **computes its own byte-identical
+> `main`** (`@csp/sdk` = `WasmEngine`/`csp_core::MemEngine` + the shared
+> sans-IO `Session`). The only real limit is unchanged and platform-bound:
+> a WebView **cannot listen**, so the plugin is outbound-only and still needs
+> a listenable peer (a `ctx watch --listen`/desktop/relay) as rendezvous.
+> Wherever this document says "thin node can't merge / receives the merged
+> tree from a full node / merge compiled out", read instead: *runs the same
+> merge locally; only listen/relay + deep-retention are delegated*. Proven by
+> the §18 SDK⇄real-`ctx` parity suite (`sdks/typescript/test/e2e`). See
+> `spec.md` §4/§7 (also revised).
 
 ---
 

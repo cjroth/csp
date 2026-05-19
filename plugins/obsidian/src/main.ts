@@ -17,11 +17,11 @@
 // unauthorized device key fails). Deleting `.context/` returns the plugin
 // to the unconfigured state rather than silently regenerating anything.
 //
-// The wasm bytes are inlined at build time by esbuild via the
+// The real csp-core wasm bytes are inlined at build time by esbuild via the
 // `__CSP_WASM_B64__` define — no fetch at runtime, the only way mobile
-// WebViews reliably load WebAssembly. (Today the @csp/sdk seam runs on an
-// in-memory mock and ignores the bytes; the inline path stays real so no
-// plugin code changes when csp-wasm lands — CSP spec.md §16.)
+// WebViews reliably load WebAssembly. `initCsp(bytes)` instantiates the same
+// Rust engine `ctx` runs (one engine everywhere — CSP spec.md §16); the
+// plugin then computes its own byte-identical `main`.
 
 import { type IdentityInstance, initCsp, isInitialized } from '@csp/sdk/web-init';
 import { Notice, Platform, Plugin, type TAbstractFile, type TFile } from 'obsidian';
@@ -41,8 +41,16 @@ import { SyncController } from './sync-controller.js';
 
 declare const __CSP_WASM_B64__: string;
 
-/** Decode the build-time inlined wasm base64 into a Uint8Array. Empty when
- * csp-wasm is not yet built (the seam runs on the mock). */
+/** The build-time inlined wasm token. esbuild's `define` replaces this with
+ * a string literal in the bundle; under unit tests (no esbuild) the
+ * identifier is absent, so `typeof` guards the ReferenceError and the SDK's
+ * nodejs glue (loaded by `test/setup.ts`) provides the engine instead. */
+export function inlinedWasmB64(): string {
+  return typeof __CSP_WASM_B64__ === 'string' ? __CSP_WASM_B64__ : '';
+}
+
+/** Decode the build-time inlined csp-core wasm (base64) into a Uint8Array
+ * for `initCsp()`. esbuild errors at build time if the wasm is missing. */
 export function decodeInlinedWasm(b64: string): Uint8Array {
   if (!b64) return new Uint8Array(0);
   const bin = atob(b64);
@@ -66,6 +74,10 @@ export default class ContextSyncPlugin extends Plugin {
   configured = false;
   /** Last setup failure, surfaced in the wizard. Cleared on success. */
   onboardingError: string | null = null;
+  /** Test seam: when set, `resolveIdentityIO()` returns this instead of the
+   * platform default (which writes to the real `~/.context` on desktop).
+   * Production never sets it. */
+  identityIOOverride: IdentityIO | null = null;
 
   private configStore: ConfigStore | null = null;
   private storage: ObsidianStorageAdapter | null = null;
@@ -76,7 +88,7 @@ export default class ContextSyncPlugin extends Plugin {
   override async onload(): Promise<void> {
     this.configStore = new ConfigStore(this.app.vault.adapter);
     this.storage = new ObsidianStorageAdapter(this.app.vault.adapter);
-    this.wasmBytes = decodeInlinedWasm(__CSP_WASM_B64__);
+    this.wasmBytes = decodeInlinedWasm(inlinedWasmB64());
 
     const statusEl = this.addStatusBarItem();
     this.statusBar = new StatusBar(statusEl);
@@ -229,10 +241,13 @@ export default class ContextSyncPlugin extends Plugin {
   // ---- Internal ----
 
   private async initWasm(): Promise<void> {
-    if (!isInitialized() && this.wasmBytes) await initCsp(this.wasmBytes);
+    if (!isInitialized() && this.wasmBytes && this.wasmBytes.length > 0) {
+      await initCsp(this.wasmBytes);
+    }
   }
 
   private resolveIdentityIO(): IdentityIO {
+    if (this.identityIOOverride) return this.identityIOOverride;
     return Platform.isDesktopApp
       ? new NodeHomeIdentityIO()
       : new VaultAdapterIdentityIO(this.app.vault.adapter);
@@ -332,25 +347,32 @@ export default class ContextSyncPlugin extends Plugin {
     });
   }
 
+  /** Run a bridge handler from a vault-event callback, swallowing+logging
+   * any rejection. Without this a benign race (e.g. reading a file Obsidian
+   * just deleted) would surface as an unhandled promise rejection. */
+  private dispatch(what: string, p: Promise<void> | undefined): void {
+    p?.catch((err) => console.error(`[context] ${what} handler failed:`, err));
+  }
+
   private registerObsidianEventListeners(): void {
     this.registerEvent(
       this.app.vault.on('create', (file: TAbstractFile) => {
-        void this.controller?.getBridge()?.handleObsidianWrite(file);
+        this.dispatch('create', this.controller?.getBridge()?.handleObsidianWrite(file));
       }),
     );
     this.registerEvent(
       this.app.vault.on('modify', (file: TAbstractFile) => {
-        void this.controller?.getBridge()?.handleObsidianWrite(file);
+        this.dispatch('modify', this.controller?.getBridge()?.handleObsidianWrite(file));
       }),
     );
     this.registerEvent(
       this.app.vault.on('delete', (file: TAbstractFile) => {
-        void this.controller?.getBridge()?.handleObsidianDelete(file);
+        this.dispatch('delete', this.controller?.getBridge()?.handleObsidianDelete(file));
       }),
     );
     this.registerEvent(
       this.app.vault.on('rename', (file: TAbstractFile, oldPath: string) => {
-        void this.controller?.getBridge()?.handleObsidianRename(file, oldPath);
+        this.dispatch('rename', this.controller?.getBridge()?.handleObsidianRename(file, oldPath));
       }),
     );
   }

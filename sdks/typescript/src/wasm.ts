@@ -1,12 +1,49 @@
-// Real reduced-surface bindings (CSP §4/§7): object encode/decode,
-// identity/auth, and wire framing — NO merge, NO on-disk odb. This is a
-// thin typed passthrough to the *one* Rust engine (`csp-core`) compiled to
-// wasm; it is NOT a reimplementation (§16). Built by `bun run build:wasm`
-// into `../pkg` via `wasm-pack`.
+// Typed passthrough to the *one* Rust engine (`csp-core`) compiled to wasm
+// — **the full engine, merge included** (§4/§7/§16, one engine everywhere):
+// a plugin computes its own byte-identical `main` exactly like `ctx`. NOT a
+// reimplementation. Built by `bun run build:wasm` into `../pkg` via
+// `wasm-pack` (nodejs target for Node/Bun; the SDK ships a `web` target for
+// browser/WebView hosts).
 
 import { createRequire } from 'node:module';
 
+/** The real full engine (`csp_core::MemEngine` + the shared sans-IO
+ * `Session`). Files-in / materialize-ops-out; host owns transport+storage.
+ * Every method mirrors a `csp-core` call — there is no protocol logic in
+ * TypeScript. */
+export interface WasmEngine {
+  free(): void;
+  authorize(sshLine: string): void;
+  /** `{ "path": [byte,…] }` → new primitive oid hex, or undefined (no-op). */
+  commit_from_files(filesJson: string): string | undefined;
+  export_closure(tipsJson: string): string;
+  frontier_tips(): string[];
+  integrate(rawsJson: string): number;
+  known(): string[];
+  main(): string;
+  materialize_plan(onDiskJson: string): string;
+  node_id(): string;
+  node_ssh(): string;
+  restore_snapshot(name: string): string;
+  restore_time(tUnix: bigint): string;
+  /** Feed one inbound wire frame → `{out:[[byte…]…],integrated,established}`. */
+  session_feed(frame: Uint8Array): string;
+  /** Opening `Hello` frame bytes (connector; the plugin never listens, §7). */
+  session_start(channelBinding: Uint8Array): Uint8Array;
+  set_ignore(ignore: string): void;
+  snapshot(name: string): void;
+  snapshots_json(): string;
+  to_bytes(): Uint8Array;
+  vault_id(): string;
+}
+
+interface WasmEngineCtor {
+  create(seed: Uint8Array, vaultId: string, name: string): WasmEngine;
+  open(seed: Uint8Array, persisted: Uint8Array, ignore: string): WasmEngine;
+}
+
 interface CspWasmModule {
+  WasmEngine: WasmEngineCtor;
   blob_oid(content: Uint8Array): string;
   node_id_hex(seed: Uint8Array): string;
   ssh_pubkey(seed: Uint8Array, comment: string): string;
@@ -26,6 +63,14 @@ interface CspWasmModule {
 
 const req = createRequire(import.meta.url);
 const m = req('../pkg/csp_wasm.js') as CspWasmModule;
+
+/** The real full engine class (`csp-core` via wasm). Same code as `ctx`. */
+export const WasmEngine = m.WasmEngine;
+
+/** Node/Bun glue is loaded synchronously by `require` at import — init is a
+ * no-op. (The browser `web` glue in `./wasm-web.ts` instantiates from inlined
+ * bytes; the `#engine` imports map selects per runtime.) */
+export async function initEngine(_input?: unknown): Promise<void> {}
 
 /** SHA-1 object id of raw blob bytes (stock-git identical — §4). */
 export function blobOid(content: Uint8Array): string {

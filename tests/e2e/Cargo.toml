@@ -66,3 +66,7 @@ path = "tests/clone_sync.rs"
 [[test]]
 name = "tls_default"
 path = "tests/tls_default.rs"
+
+[[test]]
+name = "names_and_watch"
+path = "tests/names_and_watch.rs"

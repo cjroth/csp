@@ -1,20 +1,13 @@
-// Tauri runtime detection + lazily-loaded bindings.
-//
-// Tauri v2 sets `window.isTauri = true` (we do NOT rely on the removed
-// `window.__TAURI__`, which only exists with `withGlobalTauri`). Imports
-// are dynamic so a plain browser never evaluates the Tauri modules.
+// Tauri IPC bindings. The app always runs inside the Tauri shell now
+// (the real csp-core backend); there is no browser/mock path.
 
-export function isTauri(): boolean {
-  return typeof window !== "undefined" && window.isTauri === true;
-}
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
-export async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  const { invoke } = await import("@tauri-apps/api/core");
+export function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   return invoke<T>(cmd, args);
 }
 
 export async function tauriListen<T>(event: string, cb: (payload: T) => void): Promise<() => void> {
-  const { listen } = await import("@tauri-apps/api/event");
-  const unlisten = await listen<T>(event, (e) => cb(e.payload));
-  return unlisten;
+  return listen<T>(event, (e) => cb(e.payload));
 }

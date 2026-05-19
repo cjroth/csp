@@ -1,0 +1,171 @@
+/* Starlight cascade layers + Tailwind v4 */
+@layer base, starlight, theme, components, utilities;
+
+@import '@astrojs/starlight-tailwind';
+@import 'tailwindcss/theme.css' layer(theme);
+@import 'tailwindcss/utilities.css' layer(utilities);
+
+/*
+ * Context Sync Protocol — minimalist theme.
+ * Monochrome ink palette, generous whitespace, hairline borders,
+ * typographic emphasis instead of color. Links carry an underline so
+ * affordance survives the near-neutral accent.
+ */
+
+:root {
+	/* Near-neutral "ink" accent (dark mode: light ink on dark). */
+	--sl-color-accent-low: #1f2123;
+	--sl-color-accent: #c8ccd0;
+	--sl-color-accent-high: #f2f4f6;
+
+	--sl-color-white: #f7f8f9;
+	--sl-color-gray-1: #e7e9ea;
+	--sl-color-gray-2: #c2c6ca;
+	--sl-color-gray-3: #8b9196;
+	--sl-color-gray-4: #595f64;
+	--sl-color-gray-5: #353a3e;
+	--sl-color-gray-6: #1f2326;
+	--sl-color-black: #16181a;
+
+	--sl-color-bg: #16181a;
+	--sl-color-bg-nav: #16181a;
+	--sl-color-bg-sidebar: #16181a;
+	--sl-color-bg-inline-code: #232629;
+	--sl-color-hairline: #26292c;
+	--sl-color-hairline-light: #2f3336;
+	--sl-color-hairline-shade: #1c1f21;
+
+	--sl-color-text-accent: #f2f4f6;
+
+	/* Typography */
+	--sl-font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+		'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+	--sl-font-mono: ui-monospace, 'SF Mono', SFMono-Regular, 'JetBrains Mono',
+		'Cascadia Code', Menlo, Consolas, monospace;
+
+	/* Tighter, calmer layout */
+	--sl-content-width: 48rem;
+	--sl-line-height: 1.7;
+	--sl-text-code: 0.875em;
+	--sl-nav-pad-x: 1.5rem;
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent-low: #e8eaec;
+	--sl-color-accent: #3a3f44;
+	--sl-color-accent-high: #16181a;
+
+	--sl-color-white: #16181a;
+	--sl-color-gray-1: #25292d;
+	--sl-color-gray-2: #3a3f44;
+	--sl-color-gray-3: #6b7177;
+	--sl-color-gray-4: #8c9298;
+	--sl-color-gray-5: #d6d9db;
+	--sl-color-gray-6: #eef0f1;
+	--sl-color-gray-7: #f5f6f7;
+	--sl-color-black: #ffffff;
+
+	--sl-color-bg: #ffffff;
+	--sl-color-bg-nav: #ffffff;
+	--sl-color-bg-sidebar: #ffffff;
+	--sl-color-bg-inline-code: #f1f2f4;
+	--sl-color-hairline: #e9eaec;
+	--sl-color-hairline-light: #eef0f1;
+	--sl-color-hairline-shade: #f1f2f4;
+
+	--sl-color-text-accent: #16181a;
+}
+
+/* --- Minimalist refinements ---------------------------------------- */
+
+/* Calmer headings: tighter tracking, lighter weight, real hierarchy. */
+.sl-markdown-content :is(h1, h2, h3, h4) {
+	letter-spacing: -0.018em;
+	font-weight: 650;
+}
+.sl-markdown-content h2 {
+	margin-top: 2.75rem;
+	padding-bottom: 0.4rem;
+	border-bottom: 1px solid var(--sl-color-hairline);
+}
+.sl-markdown-content h3 {
+	margin-top: 2rem;
+}
+
+/* In-content links: underline carries the affordance, not color. */
+.sl-markdown-content a:not(:where(.not-content *)) {
+	color: var(--sl-color-text-accent);
+	text-decoration: underline;
+	text-decoration-color: var(--sl-color-gray-3);
+	text-underline-offset: 0.2em;
+	text-decoration-thickness: 1px;
+	transition: text-decoration-color 0.15s ease;
+}
+.sl-markdown-content a:not(:where(.not-content *)):hover {
+	text-decoration-color: currentColor;
+}
+
+/* Flatten chrome: hairline dividers, no heavy fills or shadows. */
+.sidebar,
+.sidebar-pane {
+	border-inline-end: 1px solid var(--sl-color-hairline);
+}
+header.header {
+	border-bottom: 1px solid var(--sl-color-hairline);
+	backdrop-filter: none;
+}
+.sl-markdown-content :is(pre, .expressive-code) {
+	border-radius: 6px;
+}
+:where(.sl-markdown-content) :not(pre) > code {
+	border: 1px solid var(--sl-color-hairline-light);
+	border-radius: 4px;
+	padding: 0.15em 0.4em;
+}
+
+/* Site title: quieter, monospace wordmark. */
+.site-title {
+	font-family: var(--sl-font-mono);
+	font-weight: 600;
+	letter-spacing: -0.02em;
+	font-size: var(--sl-text-lg);
+}
+
+/* Sidebar: lighter labels, restrained active state. */
+.sidebar-content summary,
+.sidebar-content .group-label {
+	text-transform: uppercase;
+	letter-spacing: 0.08em;
+	font-size: 0.6875rem;
+	color: var(--sl-color-gray-3);
+}
+.sidebar-content a {
+	font-size: 0.875rem;
+}
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:hover {
+	background-color: transparent;
+	font-weight: 600;
+	color: var(--sl-color-text-accent);
+	box-shadow: inset 2px 0 0 var(--sl-color-text-accent);
+	border-radius: 0;
+}
+
+/* Hero: restrained, typographic. */
+.hero h1 {
+	letter-spacing: -0.03em;
+	font-weight: 680;
+}
+.hero .tagline {
+	color: var(--sl-color-gray-3);
+}
+
+/* Cards: hairline outline, no fill. */
+.card {
+	background: transparent;
+	border: 1px solid var(--sl-color-hairline);
+	border-radius: 8px;
+}
+.card:hover {
+	border-color: var(--sl-color-gray-4);
+}

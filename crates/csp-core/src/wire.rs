@@ -24,6 +24,9 @@ fn proto_default() -> u32 {
 pub enum Msg {
     Hello {
         vault_id: String,
+        /// Human label (may be empty) — for display / clone-folder naming.
+        #[serde(default)]
+        name: String,
         node_ssh: String,
         nonce: Vec<u8>,
         #[serde(default = "proto_default")]

@@ -1,17 +1,13 @@
 import { useEffect } from "react";
 import { Outlet, useNavigate } from "react-router";
-import { TofuDialog } from "@/components/dialogs/TofuDialog";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { Toaster } from "@/components/ui/sonner";
 import { EngineProvider } from "@/hooks/useEngine";
-import { runningUnderTauri } from "@/lib/api";
 
-/** Bridge native tray menu items to in-app UI (spec §6.1). Also usable in
- *  the browser via the same window events. */
+/** Bridge native tray menu items to in-app UI (spec §6.1). */
 function TrayBridge() {
   const navigate = useNavigate();
   useEffect(() => {
-    if (!runningUnderTauri) return;
     let cleanups: Array<() => void> = [];
     void import("@tauri-apps/api/event").then(({ listen }) => {
       const wire = async (evt: string, fn: (p: unknown) => void) =>
@@ -47,7 +43,6 @@ export function App() {
           </div>
         </main>
       </div>
-      <TofuDialog />
       <Toaster richColors closeButton position="bottom-right" />
     </EngineProvider>
   );

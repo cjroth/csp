@@ -10,14 +10,19 @@ description = "WebAssembly bindings for csp-core (reduced thin-node surface — 
 crate-type = ["cdylib", "rlib"]
 
 # The SDK is NOT a reimplementation (§16): there is exactly one protocol
-# implementation (csp-core). We depend on it with the merge/odb engine
-# compiled OUT (`default-features = false` → no `full`): object encode/decode,
-# identity/auth, and wire framing only (§4/§7/§13.2 wasm spike).
+# implementation (csp-core). `default-features = false` drops only the
+# native-only on-disk odb / tokio sockets — the **full merge/fold engine is
+# in the always-on surface** (one engine everywhere; a plugin computes its
+# own byte-identical `main`).
 [dependencies]
 csp-core = { path = "../csp-core", default-features = false }
 wasm-bindgen = "0.2"
+serde = { workspace = true }
 serde_json.workspace = true
 hex.workspace = true
+# RNG for handshake nonces. Native build (workspace `cargo test`) uses the
+# OS source; the wasm target adds the `js` feature below.
+getrandom = "0.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"

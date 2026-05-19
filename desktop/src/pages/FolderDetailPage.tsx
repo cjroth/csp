@@ -97,9 +97,9 @@ export function FolderDetailPage() {
           label="main"
           value={<span className="font-mono">{status?.mainShortSha ?? "·······"}</span>}
         />
-        <Stat label="Peers" value={status?.peersConnected ?? 0} />
-        <Stat label="Last activity" value={relativeTime(status?.lastActivity)} />
-        <Stat label="Type" value={vault.isCspVault ? "CSP vault" : "New vault"} />
+        <Stat label="Known" value={status?.knownCount ?? 0} />
+        <Stat label="Last commit" value={relativeTime(status?.lastCommit)} />
+        <Stat label="Frontier" value={`${status?.frontierCount ?? 0} tip(s)`} />
       </div>
 
       <div className="surface divide-y divide-border">

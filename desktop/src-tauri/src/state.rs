@@ -1,24 +1,23 @@
-//! Shared app state. The app is a controller over the engine, not a data
-//! path (spec §12) — it holds only an `Arc` to the engine.
+//! Shared app state. The app is a controller over the real engine, not a
+//! data path (spec §12) — it holds only an `Arc` to `CspEngine`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use context_desktop_engine::StubEngine;
+use context_desktop_engine::CspEngine;
 
 pub struct AppState {
-    /// v1 = `StubEngine`. The real `csp-core`-backed `Engine` slots in here
-    /// unchanged for callers (spec §13 embedding contract).
-    pub engine: Arc<StubEngine>,
+    pub engine: Arc<CspEngine>,
 }
 
 impl AppState {
-    pub fn new() -> Self {
-        Self { engine: Arc::new(StubEngine::new()) }
-    }
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self::new()
+    /// Build the real engine over native csp-core. `app_config_dir` is the
+    /// OS app-config directory (spec §7) — tracked folders + settings live
+    /// there, never inside any vault's `.context/`.
+    pub async fn new(app_config_dir: PathBuf) -> Result<Self, String> {
+        let engine = CspEngine::new(app_config_dir, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Self { engine })
     }
 }
