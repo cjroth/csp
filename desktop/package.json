@@ -8,6 +8,8 @@
     "dev": "tauri dev",
     "build:web": "tsc -p tsconfig.json && tsc -p tsconfig.node.json && vite build",
     "build": "tauri build",
+    "build:app": "tauri build --bundles app",
+    "build:dmg": "tauri build --bundles dmg",
     "tauri": "tauri",
     "lint": "biome lint .",
     "format": "biome format --write .",
