@@ -53,10 +53,14 @@ describe('handleObsidianWrite', () => {
     expect(bridge.pushed).toBe(1);
   });
 
-  test('skips folder-typed events (no extension)', async () => {
+  test('a folder event preserves the empty folder via a .keep sentinel', async () => {
     const folder = { path: 'Drafts', name: 'Drafts' } as FakeTAbstractFile;
     await bridge.handleObsidianWrite(folder);
-    expect(bridge.pushed).toBe(0);
+    expect(sdk.fileExists('Drafts/.keep')).toBe(true);
+    expect(bridge.pushed).toBe(1);
+    // Idempotent: the folder already has its sentinel → no extra push.
+    await bridge.handleObsidianWrite(folder);
+    expect(bridge.pushed).toBe(1);
   });
 
   test('skips paths the filter rejects (binary)', async () => {

@@ -121,6 +121,11 @@ export interface ReconnectOptions {
   initialBackoffMs?: number;
   /** Max backoff in ms (default: 30000). */
   maxBackoffMs?: number;
+  /** Consecutive sessions that never complete the handshake (peer closes
+   * before establish — unauthorized device key or incompatible peer) before
+   * giving up with a terminal, actionable error instead of looping forever
+   * (default: 5). A session that establishes resets the counter. */
+  maxHandshakeFailures?: number;
 }
 
 // ---- `.context/config` typed schema (provisional — CSP spec §9.1/§17.1) ----

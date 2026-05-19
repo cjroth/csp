@@ -22,7 +22,7 @@ use crate::identity::{build_primitive, parse_ssh_pubkey, verify_primitive, Ident
 use crate::object::{read_tree_to_files, write_tree_from_files, GitObject};
 use crate::oid::Oid;
 use crate::order::NodeId;
-use crate::scope::Scope;
+use crate::scope::{canonicalize_keeps, Scope};
 use crate::session::SessionVault;
 use crate::state::{EngineState, Snapshot};
 use crate::store::{MemStore, Store};
@@ -193,11 +193,9 @@ impl MemEngine {
         &mut self,
         files: &BTreeMap<String, Vec<u8>>,
     ) -> CspResult<Option<Oid>> {
-        let scoped: BTreeMap<String, Vec<u8>> = files
-            .iter()
-            .filter(|(p, c)| self.scope.content_in_scope(p, c))
-            .map(|(p, c)| (p.clone(), c.clone()))
-            .collect();
+        // Spec §11: scope-filter real files + canonicalize directory-
+        // preservation sentinels (engine-owned, deterministic → §12).
+        let scoped = canonicalize_keeps(files, &self.scope);
         let mut changed = false;
         for (p, c) in &scoped {
             if self.state.materialized.get(p) != Some(&blob_hash(c)) {
@@ -226,6 +224,17 @@ impl MemEngine {
         let oid = self.store.put(&prim)?;
         self.state.add_known(oid);
         self.recompute()?;
+        // Record what we just materialized (== what we committed). Without
+        // this the §5.6 last-materialized set never reflects host-authored
+        // commits, so `commit_from_files`'s own deletion check
+        // (`for p in materialized: if !scoped.contains(p)`) can't fire when
+        // the working set shrinks to empty — i.e. deleting the last file (or
+        // a whole folder) never produced a removal primitive. Mirrors what
+        // `materialize_plan` and the native `Vault::materialize` already do.
+        self.state.materialized.clear();
+        for (p, c) in &scoped {
+            self.state.materialized.insert(p.clone(), blob_hash(c));
+        }
         Ok(Some(oid))
     }
 

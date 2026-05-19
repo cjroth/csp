@@ -1,4 +1,4 @@
-# 0005 — Vault-level lock to prevent concurrent sync by multiple processes
+# 0006 — Vault-level lock to prevent concurrent sync by multiple processes
 
 - **Severity:** Medium (latent state/working-tree corruption risk; not yet observed in the wild)
 - **Status:** Open — design exploration

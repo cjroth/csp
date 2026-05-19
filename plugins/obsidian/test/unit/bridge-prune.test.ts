@@ -67,9 +67,34 @@ describe('pruneEmptyFolders', () => {
     expect(vault.getAbstractFileByPath('Old')).toBeNull();
   });
 
+  test('remote folder rename removes the old folder even when files first arrived via reconcile', async () => {
+    // runReconcile materializes engine files through applyOneRemoteFile
+    // (NOT applyRemoteState) — the Vault.open path on a reloaded vault.
+    // The removal baseline must still be seeded or a later remote rename
+    // "clones" the folder (old files never deleted).
+    await sdk.writeTextFile('Old/a.md', '1');
+    await sdk.writeTextFile('Old/b.md', '2');
+    for (const m of sdk.listFiles()) await bridge.applyOneRemoteFile(m); // ≈ reconcile
+    expect(vault.getAbstractFileByPath('Old/a.md')).not.toBeNull();
+
+    // Remote folder rename Old/ → New/.
+    await sdk.renameFile('Old/a.md', 'New/a.md');
+    await sdk.renameFile('Old/b.md', 'New/b.md');
+    await bridge.applyRemoteState();
+
+    expect(vault.getAbstractFileByPath('New/a.md')).not.toBeNull();
+    expect(vault.getAbstractFileByPath('New/b.md')).not.toBeNull();
+    expect(vault.getAbstractFileByPath('Old/a.md')).toBeNull();
+    expect(vault.getAbstractFileByPath('Old/b.md')).toBeNull();
+    expect(vault.getAbstractFileByPath('Old')).toBeNull();
+  });
+
   test('tombstone delete via applyOneRemoteFile also prunes', async () => {
     await sdk.writeTextFile('Dir/only.md', 'z');
     await bridge.applyRemoteState();
+    // A real tombstone means the engine no longer has the path; prune must
+    // not keep the folder alive on stale engine state.
+    await sdk.deleteFile('Dir/only.md');
     await bridge.applyOneRemoteFile({
       id: 'x',
       path: 'Dir/only.md',
