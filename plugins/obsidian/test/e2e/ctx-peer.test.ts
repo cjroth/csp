@@ -31,7 +31,14 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { Identity, formatCspIdentity, parseCspIdentity } from '@csp/sdk/web-init';
+import {
+  Identity,
+  Vault,
+  type VaultEvent,
+  formatCspIdentity,
+  memoryStorage,
+  parseCspIdentity,
+} from '@csp/sdk/web-init';
 import type { IdentityIO } from '../../src/identity-store.js';
 import ContextSyncPlugin from '../../src/main.js';
 import { type CspSettings, DEFAULT_SETTINGS } from '../../src/settings.js';
@@ -63,7 +70,7 @@ async function waitFor<T>(f: () => T | undefined | Promise<T | undefined>, ms = 
   throw new Error('timeout');
 }
 
-async function startPeer(tag: string): Promise<Peer> {
+async function startPeer(tag: string, extraWatchArgs: string[] = []): Promise<Peer> {
   const home = mkdtempSync(join(tmpdir(), `csp-ob-home-${tag}-`));
   const dir = mkdtempSync(join(tmpdir(), `csp-ob-vault-${tag}-`));
   const env = { ...process.env, HOME: home, CTX_DIR: dir, CTX_LOG: 'error' };
@@ -72,7 +79,7 @@ async function startPeer(tag: string): Promise<Peer> {
 
   const watch = spawn(
     ctxBin,
-    ['watch', '--listen', '127.0.0.1:0', '--no-tls', '--debounce-ms', '250'],
+    ['watch', '--listen', '127.0.0.1:0', '--no-tls', '--debounce-ms', '250', ...extraWatchArgs],
     { env: { ...env, CTX_LOG: 'ctx=info,csp_core=warn' } },
   );
   const port = await waitFor<number>(
@@ -677,5 +684,43 @@ describe('device-key interop with real ctx (§10 one shared key)', () => {
     back.free();
 
     rmSync(home, { recursive: true, force: true });
+  }, 60_000);
+});
+
+// A peer that rejects this device's key closes the socket cleanly before
+// the handshake — the SDK must NOT loop silently forever; it must surface
+// an actionable, terminal error and stop (the bug the user hit).
+describe('handshake rejection fails fast with an actionable error', () => {
+  test('unauthorized device → terminal error mentioning `ctx authorize`, loop stops', async () => {
+    const foreign = Identity.generate();
+    const foreignSsh = foreign.pubkey().toSshString();
+    foreign.free();
+    // --no-tofu + a foreign authorized key → our device is always rejected.
+    const peer = await startPeer('rej', ['--no-tofu', '--authorized-keys', foreignSsh]);
+    const url = `ws://127.0.0.1:${peer.port}`;
+
+    const v = await Vault.create({
+      storage: memoryStorage(),
+      identity: Identity.generate(),
+      peerUrl: url,
+    });
+    const events: VaultEvent[] = [];
+    v.subscribe((e) => events.push(e));
+
+    // connectWithReconnect must RESOLVE (loop gave up) — not hang forever.
+    await v.connectWithReconnect({
+      maxHandshakeFailures: 3,
+      initialBackoffMs: 50,
+      maxBackoffMs: 100,
+    });
+
+    expect(events.some((e) => e.kind === 'connected')).toBe(false);
+    // It must give up with the terminal, actionable error (not loop forever
+    // and not stay silent) — the message tells the user exactly what to do.
+    const messages = events
+      .filter((e): e is { kind: 'error'; message: string } => e.kind === 'error')
+      .map((e) => e.message);
+    expect(messages.some((m) => /ctx authorize/.test(m))).toBe(true);
+    await v.close();
   }, 60_000);
 });
