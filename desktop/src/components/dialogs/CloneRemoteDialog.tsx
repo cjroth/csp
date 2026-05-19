@@ -77,9 +77,15 @@ export function CloneRemoteDialog({
             <Input
               id="clone-url"
               value={url}
-              placeholder="wss://192.168.1.42:51820"
+              placeholder="your-server.example.com"
               onChange={(e) => setUrl(e.target.value)}
             />
+            <p className="text-xs text-muted-foreground">
+              Scheme and port are optional — a bare domain assumes a secure
+              connection (<code>wss://</code> on port 443). Add an explicit
+              <code> ws://</code> or <code>:port</code> for a plain or
+              non-standard-port peer (e.g. <code>wss://192.168.1.42:51820</code>).
+            </p>
           </div>
           <div className="space-y-2">
             <Label htmlFor="clone-dest">Local destination folder</Label>

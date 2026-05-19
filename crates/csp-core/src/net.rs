@@ -190,11 +190,57 @@ where
     run_session(node, Transport::from_ws(ws), Role::Listener, cb).await
 }
 
+/// Normalize a user-supplied peer address into a canonical `ws(s)://host:port`
+/// URL. Conveniences so users can paste the obvious thing:
+///
+/// - **Scheme optional**: a bare `example.com` is assumed to be `wss://`
+///   (secure); `https`/`http` are accepted as aliases for `wss`/`ws`.
+/// - **Port optional**: when the authority has no explicit port, the scheme
+///   default is supplied — `443` for `wss`, `80` for `ws`.
+///
+/// So `example.com`, `wss://example.com`, and `https://example.com` all
+/// normalize to `wss://example.com:443`. (`TcpStream::connect` rejects a
+/// port-less authority with `invalid socket address` before any DNS, so the
+/// default port must be filled in here.)
+fn normalize_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let (secure, rest) = if let Some(r) = trimmed.strip_prefix("wss://") {
+        (true, r)
+    } else if let Some(r) = trimmed.strip_prefix("ws://") {
+        (false, r)
+    } else if let Some(r) = trimmed.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = trimmed.strip_prefix("http://") {
+        (false, r)
+    } else {
+        (true, trimmed)
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    // An IPv6 literal carries `:` inside `[...]`; its port (if any) is the
+    // `:NNNN` *after* the closing bracket. For names/IPv4 a bare `:` is a port.
+    let has_port = match authority.rsplit_once(']') {
+        Some((_, after)) => after.starts_with(':'),
+        None => authority.contains(':'),
+    };
+    let scheme = if secure { "wss" } else { "ws" };
+    if authority.is_empty() || has_port {
+        format!("{scheme}://{authority}{path}")
+    } else {
+        let port = if secure { 443 } else { 80 };
+        format!("{scheme}://{authority}:{port}{path}")
+    }
+}
+
 /// Dial a peer URL, doing the TLS handshake for `wss://` (accepting any
 /// server cert — trust is the application-layer ed25519 handshake, §10).
 /// Returns the transport and the **channel binding**: the SHA-256 of the
 /// server's TLS cert (empty for plaintext `ws://`).
 async fn dial(url: &str) -> CspResult<(Transport, Vec<u8>)> {
+    let url = normalize_url(url);
+    let url = url.as_str();
     if let Some(rest) = url.strip_prefix("wss://") {
         let authority = rest.split('/').next().unwrap_or(rest);
         let host = authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority);
@@ -443,6 +489,29 @@ mod tests {
 
     fn id(s: u8) -> Identity {
         Identity::from_seed(&[s; 32])
+    }
+
+    #[test]
+    fn normalize_url_assumes_wss_and_default_port() {
+        // bare domain -> wss + 443
+        assert_eq!(normalize_url("example.com"), "wss://example.com:443");
+        // explicit scheme, no port -> scheme default port
+        assert_eq!(normalize_url("wss://example.com"), "wss://example.com:443");
+        assert_eq!(normalize_url("ws://example.com"), "ws://example.com:80");
+        // https/http accepted as wss/ws aliases (e.g. a pasted Railway URL)
+        assert_eq!(normalize_url("https://example.com"), "wss://example.com:443");
+        assert_eq!(normalize_url("http://example.com"), "ws://example.com:80");
+        // explicit port preserved, scheme defaulted when absent
+        assert_eq!(normalize_url("wss://192.168.1.42:51820"), "wss://192.168.1.42:51820");
+        assert_eq!(normalize_url("192.168.1.42:51820"), "wss://192.168.1.42:51820");
+        // path preserved, port still defaulted
+        assert_eq!(normalize_url("example.com/vault"), "wss://example.com:443/vault");
+        assert_eq!(normalize_url("wss://example.com:7777/v"), "wss://example.com:7777/v");
+        // surrounding whitespace trimmed
+        assert_eq!(normalize_url("  example.com \n"), "wss://example.com:443");
+        // IPv6 literal: bracket colons are not a port
+        assert_eq!(normalize_url("wss://[::1]"), "wss://[::1]:443");
+        assert_eq!(normalize_url("wss://[::1]:7777"), "wss://[::1]:7777");
     }
 
     #[tokio::test]
