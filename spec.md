@@ -724,6 +724,28 @@ thin-node retention horizon are explicitly deferred, not a v1 concern.
   `<scope-root>/.context/exclude` (gitignore syntax, never synced — it is under
   `.context/`) adds machine-only excludes — the analog of git's
   `.git/info/exclude`.
+- **Empty directories — the `.keep` sentinel.** The history is stock-git-
+  compatible (§1), and git has no representation for a directory: a tree is
+  derived purely from the paths of the files in it, so an empty directory
+  cannot exist in `main`, replicate, or materialize. To preserve
+  user-created empty folders, an in-scope directory that is otherwise empty
+  is represented by a single zero-byte file `<dir>/.keep`. It is an ordinary
+  in-scope, git-tracked file (default include `**`; *not* under `.context/`;
+  exempt from the text/binary test as a CSP control sentinel, like
+  `.contextignore`). The rule is **engine-owned and deterministic** so every
+  node converges (§12): when the engine builds a primitive's tree it
+  canonicalizes — `<dir>/.keep` is present **iff** no in-scope file exists
+  anywhere under `<dir>/`. Adding the first real file to a folder therefore
+  deterministically drops its `.keep`; deleting the last file
+  deterministically re-adds it; nested empty folders each carry their own
+  `.keep` at the leaf so the full structure round-trips. The host's only
+  duty is to surface its empty in-scope directories (a `ctx` node walks the
+  filesystem; the Obsidian host enumerates vault folders) by injecting the
+  sentinel into the working set it hands the engine; the engine's
+  canonicalization (strip-redundant, normalize-to-empty) makes the result
+  identical regardless of host quirks. Obsidian hides dotfiles, so `.keep`
+  is invisible in its explorer; it is a visible `.keep` in the CLI directory
+  and `git log`, the conventional `.gitkeep`-style marker.
 - **Coexistence with a user-owned git repo (no collision by construction).**
   CSP plants **no `.git` at the scope root**; its repository is
   `<scope-root>/.context/git/` with the worktree being `<scope-root>` (§4, §9).

@@ -216,25 +216,53 @@ export class RealVault implements Vault {
     const initial = opts.initialBackoffMs ?? 500;
     const cap = opts.maxBackoffMs ?? 30_000;
     const max = opts.maxAttempts ?? Number.POSITIVE_INFINITY;
+    const maxHandshakeFailures = opts.maxHandshakeFailures ?? 5;
     let attempt = 0;
+    let handshakeFailures = 0;
     while (!signal.aborted && attempt < max) {
       attempt += 1;
+      let established = false;
       try {
-        await this.runSession(url);
-        attempt = 0;
+        await this.runSession(url, () => {
+          established = true;
+        });
       } catch (e) {
         if (signal.aborted) return;
         this.emit({ kind: 'error', message: `connect failed (attempt ${attempt}): ${e}` });
       }
       if (signal.aborted) return;
       this.connected = false;
-      this.emit({ kind: 'disconnected', reason: 'connection closed' });
+      if (established) {
+        // A working session dropped — transient; reconnect unbounded.
+        attempt = 0;
+        handshakeFailures = 0;
+        this.emit({ kind: 'disconnected', reason: 'connection closed' });
+      } else {
+        // The peer accepted the socket but closed it before the handshake
+        // completed. Repeatedly = this device's key isn't authorized on the
+        // peer (or the peer is an incompatible build). Don't loop silently
+        // forever — surface an actionable, terminal error and stop.
+        handshakeFailures += 1;
+        if (handshakeFailures >= maxHandshakeFailures) {
+          this.emit({
+            kind: 'error',
+            message:
+              `peer rejected this device before the handshake completed ` +
+              `(${handshakeFailures} attempts). Authorize this device's key ` +
+              `on the peer, then reconnect:\n  ctx authorize ` +
+              `"${this.engine.node_ssh()}"\n(If the peer is an older or ` +
+              `incompatible ctx build, update it.)`,
+          });
+          return;
+        }
+        this.emit({ kind: 'disconnected', reason: 'handshake not completed' });
+      }
       const delay = Math.min(initial * 2 ** Math.min(attempt - 1, 20), cap);
       await sleep(delay, signal);
     }
   }
 
-  private async runSession(url: string): Promise<void> {
+  private async runSession(url: string, onEstablished: () => void): Promise<void> {
     const transport = this.opts.transport ?? defaultTransport();
     this.emit({ kind: 'connecting', url });
     const conn = await transport.connect(url);
@@ -251,6 +279,7 @@ export class RealVault implements Vault {
         for (const m of step.out) await conn.send(Uint8Array.from(m));
         if (step.established && !this.connected) {
           this.connected = true;
+          onEstablished();
           this.emit({ kind: 'connected', peer_pubkey: new Uint8Array() });
         }
         if (step.integrated > 0) {

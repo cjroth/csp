@@ -164,12 +164,28 @@ export class FakeVault implements MinimalVault {
       try {
         await this.adapter.remove(file.path);
       } catch {}
-    } else if (this.folders.has(file.path)) {
-      this.folders.delete(file.path);
-    } else {
-      throw new Error(`not found: ${file.path}`);
+      this.emit('delete', file);
+      return;
     }
-    this.emit('delete', file);
+    if (this.folders.has(file.path)) {
+      // Obsidian: deleting a folder removes every descendant and fires ONE
+      // folder-level `delete` (no per-child events). Model that exactly.
+      const prefix = `${file.path}/`;
+      for (const p of [...this.files.keys()]) {
+        if (p.startsWith(prefix)) {
+          this.files.delete(p);
+          try {
+            await this.adapter.remove(p);
+          } catch {}
+        }
+      }
+      for (const p of [...this.folders.keys()]) {
+        if (p === file.path || p.startsWith(prefix)) this.folders.delete(p);
+      }
+      this.emit('delete', file);
+      return;
+    }
+    throw new Error(`not found: ${file.path}`);
   }
 
   async rename(file: FakeTAbstractFile, newPath: string): Promise<void> {
@@ -183,15 +199,35 @@ export class FakeVault implements MinimalVault {
         await this.adapter.rename(oldPath, newPath);
       } catch {}
       this.emit('rename', f, oldPath);
-    } else if (this.folders.has(oldPath)) {
-      const f = this.folders.get(oldPath) as FakeTFolder;
-      this.folders.delete(oldPath);
-      f.path = newPath;
-      this.folders.set(newPath, f);
-      this.emit('rename', f, oldPath);
-    } else {
-      throw new Error(`not found: ${oldPath}`);
+      return;
     }
+    if (this.folders.has(oldPath)) {
+      // Obsidian: renaming a folder re-paths every descendant and fires ONE
+      // folder-level `rename` (no per-child events).
+      const prefix = `${oldPath}/`;
+      for (const p of [...this.files.keys()]) {
+        if (!p.startsWith(prefix)) continue;
+        const child = this.files.get(p) as FakeTFile;
+        const np = `${newPath}${p.slice(oldPath.length)}`;
+        this.files.delete(p);
+        child.path = np;
+        this.files.set(np, child);
+        try {
+          await this.adapter.rename(p, np);
+        } catch {}
+      }
+      for (const p of [...this.folders.keys()]) {
+        if (p !== oldPath && !p.startsWith(prefix)) continue;
+        const fol = this.folders.get(p) as FakeTFolder;
+        const np = p === oldPath ? newPath : `${newPath}${p.slice(oldPath.length)}`;
+        this.folders.delete(p);
+        fol.path = np;
+        this.folders.set(np, fol);
+      }
+      this.emit('rename', file, oldPath);
+      return;
+    }
+    throw new Error(`not found: ${oldPath}`);
   }
 
   async createFolder(path: string): Promise<FakeTFolder> {

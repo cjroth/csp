@@ -317,6 +317,12 @@ export class SyncController {
       }
       if (++k % YIELD_EVERY === 0) await new Promise((r) => setTimeout(r, 0));
     }
+    // Seed the remote-removal baseline from the converged engine set. Without
+    // this, a reload where Obsidian + engine already match makes reconcile a
+    // no-op (no applyOneRemoteFile calls), leaving `knownSdkPaths` empty — so
+    // a later CLI folder delete/rename has nothing to diff against and the
+    // old files/folder never get removed in Obsidian.
+    bridge.seedKnownPaths();
   }
 
   private onVaultEvent(e: VaultEvent): void {

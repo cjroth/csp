@@ -68,9 +68,12 @@ export const DEFAULT_SETTINGS: CspSettings = {
   peerUrl: '',
   peerPubkey: '',
   syncEnabled: false,
-  // Default OFF: a first connect against a populated peer can pull many
-  // files; the user opts in after configuring the peer URL.
-  autoConnectOnStart: false,
+  // Default ON: an onboarded, sync-enabled vault with a peer URL must
+  // actually sync on every launch. Defaulting this OFF made the plugin
+  // silently stop syncing after every Obsidian reload (it opened the
+  // session but never connected). The opt-in is onboarding + the master
+  // `syncEnabled` switch, not a separate connect gate.
+  autoConnectOnStart: true,
   onboarded: false,
   ignoreGlobs: [],
   identityPath: '',

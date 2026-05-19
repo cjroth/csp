@@ -116,7 +116,21 @@ export class ObsidianVaultBridge {
 
   /** Handle a create or modify event from Obsidian. */
   async handleObsidianWrite(file: MinimalAbstractFile): Promise<void> {
-    if (!this.isFile(file)) return;
+    // Obsidian fires `create` for a TFolder. The engine is file-only;
+    // preserve a user-created empty folder with a `.keep` sentinel (§11).
+    // The engine's canonicalization drops it once the folder gains a real
+    // file, so asserting it whenever the folder has no engine content is
+    // safe and idempotent.
+    if (!file) return;
+    if (!this.isFile(file)) {
+      const keep = `${file.path}/.keep`;
+      if (this.deps.filter(keep) && this.engineChildren(file.path).length === 0) {
+        await this.deps.sdk.writeTextFile(keep, '');
+        this.pushed += 1;
+        this.log(`push (empty-dir keep): ${keep}`);
+      }
+      return;
+    }
     if (this.consumeSuppression(file.path)) return;
     if (!this.deps.filter(file.path)) {
       this.skipped += 1;
@@ -136,18 +150,73 @@ export class ObsidianVaultBridge {
     this.log(`push: ${file.path} (${content.length}B)`);
   }
 
+  /** Engine paths at-or-under a folder (the engine is file-only, so a
+   * folder is just a path prefix; Obsidian fires ONE folder-level event). */
+  private engineChildren(folderPath: string): string[] {
+    const prefix = `${folderPath}/`;
+    return this.deps.sdk
+      .listFiles()
+      .map((m) => m.path)
+      .filter((p) => p === folderPath || p.startsWith(prefix));
+  }
+
   /** Handle a delete event from Obsidian. */
   async handleObsidianDelete(file: MinimalAbstractFile): Promise<void> {
     if (this.consumeSuppression(file.path)) return;
+    // Obsidian fires ONE folder-level `delete` for a folder (no per-child
+    // events). Expand to every known engine child.
+    if (file && !this.isFile(file)) {
+      for (const p of this.engineChildren(file.path)) {
+        if (!this.deps.sdk.fileExists(p)) continue;
+        await this.deps.sdk.deleteFile(p);
+        this.pushed += 1;
+        this.log(`delete (folder child): ${p}`);
+      }
+      return;
+    }
     if (!this.deps.sdk.fileExists(file.path)) return;
     await this.deps.sdk.deleteFile(file.path);
     this.pushed += 1;
     this.log(`delete: ${file.path}`);
+    // If deleting the last file emptied its folder (still present in
+    // Obsidian), preserve the now-empty folder with a `.keep` (§11).
+    const parent = parentDir(file.path);
+    if (
+      parent &&
+      this.engineChildren(parent).length === 0 &&
+      this.deps.vault.getAbstractFileByPath(parent)
+    ) {
+      const keep = `${parent}/.keep`;
+      if (this.deps.filter(keep)) {
+        await this.deps.sdk.writeTextFile(keep, '');
+        this.pushed += 1;
+        this.log(`push (empty-dir keep): ${keep}`);
+      }
+    }
   }
 
   /** Handle a rename event from Obsidian. */
   async handleObsidianRename(file: MinimalAbstractFile, oldPath: string): Promise<void> {
     if (this.consumeSuppression(file.path)) return;
+    // Obsidian fires ONE folder-level `rename` for a folder move (no
+    // per-child events). Re-key every known engine child by prefix.
+    if (file && !this.isFile(file)) {
+      const newDir = file.path;
+      for (const p of this.engineChildren(oldPath)) {
+        const to = p === oldPath ? newDir : `${newDir}${p.slice(oldPath.length)}`;
+        const fromOk = this.deps.filter(p);
+        const toOk = this.deps.filter(to);
+        if (fromOk && toOk) {
+          await this.deps.sdk.renameFile(p, to);
+          this.pushed += 1;
+          this.log(`rename (folder child): ${p} → ${to}`);
+        } else if (fromOk && !toOk && this.deps.sdk.fileExists(p)) {
+          await this.deps.sdk.deleteFile(p);
+          this.pushed += 1;
+        }
+      }
+      return;
+    }
     const fromAllowed = this.deps.filter(oldPath);
     const toAllowed = this.deps.filter(file.path);
 
@@ -229,6 +298,24 @@ export class ObsidianVaultBridge {
   }
 
   /**
+   * Seed the remote-removal baseline from the engine's current alive set.
+   * Called after the initial reconcile: on a reloaded vault where Obsidian
+   * and the engine already match, reconcile applies nothing, so neither
+   * `applyOneRemoteFile` nor `applyRemoteState` has run to populate
+   * `knownSdkPaths` — and a later CLI delete/rename would have an empty
+   * baseline and never remove the old files/folder.
+   */
+  seedKnownPaths(): void {
+    const alive = new Set<string>();
+    for (const m of this.deps.sdk.listFiles()) {
+      if (m.kind === 'Text' && !m.deleted_at && this.deps.filter(m.path)) {
+        alive.add(m.path);
+      }
+    }
+    this.knownSdkPaths = alive;
+  }
+
+  /**
    * Apply the engine's current materialized tree to the Obsidian vault.
    * Detects deletions by diffing against the previous live snapshot.
    * Yields to the event loop every YIELD_EVERY files so a large initial
@@ -270,6 +357,9 @@ export class ObsidianVaultBridge {
     const existing = this.deps.vault.getAbstractFileByPath(meta.path);
 
     if (meta.deleted_at) {
+      // Drop it from the removal baseline whether or not it was present
+      // locally, so a later state diff doesn't try to re-delete it.
+      this.knownSdkPaths.delete(meta.path);
       if (existing) {
         this.suppress(meta.path);
         await this.deps.vault.delete(existing);
@@ -279,6 +369,12 @@ export class ObsidianVaultBridge {
       }
       return;
     }
+
+    // Seed the removal baseline here too: files pulled by the initial
+    // reconcile come through this method (NOT applyRemoteState), so without
+    // this a later remote folder rename has an empty `knownSdkPaths` diff
+    // and the old folder is "cloned" instead of removed.
+    this.knownSdkPaths.add(meta.path);
 
     const content = await this.deps.sdk.readTextFile(meta.path);
 
@@ -328,9 +424,13 @@ export class ObsidianVaultBridge {
       const node = this.deps.vault.getAbstractFileByPath(dir);
       if (!node || this.isFile(node)) break;
       const prefix = `${dir}/`;
-      const stillUsed = this.deps.vault
-        .getFiles()
-        .some((f) => f.path === dir || f.path.startsWith(prefix));
+      // In use if Obsidian OR the engine still has any path under it. The
+      // engine check also covers a `.keep`-only folder whose hidden dotfile
+      // Obsidian's `getFiles()` does not surface (§11) — pruning that would
+      // wrongly delete a deliberately-preserved empty folder.
+      const stillUsed =
+        this.deps.vault.getFiles().some((f) => f.path === dir || f.path.startsWith(prefix)) ||
+        this.deps.sdk.listFiles().some((m) => m.path === dir || m.path.startsWith(prefix));
       if (stillUsed) break;
       this.suppress(dir);
       try {

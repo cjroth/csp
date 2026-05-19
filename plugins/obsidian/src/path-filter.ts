@@ -37,6 +37,14 @@ const CONTEXT_DIR = '.context';
  * no text extension, so the exclusion policy replicates between nodes. */
 const SYNCED_CONTROL_FILES: ReadonlySet<string> = new Set(['.contextignore']);
 
+/** The directory-preservation sentinel (CSP spec §11): an in-scope folder
+ * that is otherwise empty is represented by a zero-byte `<dir>/.keep`. It's
+ * an engine-owned control file (exempt from the text-extension rule, like
+ * `.contextignore`), so it must stay in scope or empty folders never sync. */
+export function isKeepSentinel(path: string): boolean {
+  return path === '.keep' || path.endsWith('/.keep');
+}
+
 /** Return the lowercase extension (no dot) of `path`, or '' if none. */
 export function extOf(path: string): string {
   const slash = path.lastIndexOf('/');
@@ -103,6 +111,7 @@ export function shouldSync(path: string, ignoreGlobs: readonly string[]): boolea
   if (isContextInternal(path)) return false;
   if (matchesAnyGlob(path, ignoreGlobs)) return false;
   if (SYNCED_CONTROL_FILES.has(path)) return true;
+  if (isKeepSentinel(path)) return true;
   if (!isTextPath(path)) return false;
   return true;
 }

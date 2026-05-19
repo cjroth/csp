@@ -219,6 +219,65 @@ impl Scope {
     }
 }
 
+/// The directory-preservation sentinel (spec §11). An in-scope directory
+/// that is otherwise empty is represented by a single zero-byte
+/// `<dir>/.keep`.
+pub const KEEP: &str = ".keep";
+
+fn is_keep(p: &str) -> bool {
+    p == KEEP || p.ends_with("/.keep")
+}
+
+/// Directory a sentinel preserves: `""` for a root `.keep`, else the path
+/// with the trailing `/.keep` stripped.
+fn keep_dir(p: &str) -> &str {
+    if p == KEEP {
+        ""
+    } else {
+        &p[..p.len() - "/.keep".len()]
+    }
+}
+
+/// Canonicalize the commit set per spec §11 — **engine-owned, pure,
+/// deterministic**, so every node converges (§12):
+///
+/// 1. In-scope real files (the text/binary rule applies).
+/// 2. Plus exactly one zero-byte `<dir>/.keep` for every directory whose
+///    sentinel the host supplied AND that has **no in-scope file anywhere
+///    under it**. A `.keep` is exempt from the text test (a CSP control
+///    sentinel, like `.contextignore`), is normalized to empty, and is
+///    dropped the moment the directory holds a real file.
+pub fn canonicalize_keeps(
+    files: &std::collections::BTreeMap<String, Vec<u8>>,
+    scope: &Scope,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out: std::collections::BTreeMap<String, Vec<u8>> = std::collections::BTreeMap::new();
+    for (p, c) in files {
+        if is_keep(p) {
+            continue;
+        }
+        if scope.content_in_scope(p, c) {
+            out.insert(p.clone(), c.clone());
+        }
+    }
+    for p in files.keys() {
+        if !is_keep(p) || !scope.path_in_scope(p) {
+            continue;
+        }
+        let d = keep_dir(p);
+        let occupied = if d.is_empty() {
+            !out.is_empty()
+        } else {
+            let prefix = format!("{d}/");
+            out.keys().any(|r| r.starts_with(&prefix))
+        };
+        if !occupied {
+            out.insert(p.clone(), Vec::new());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +465,37 @@ mod tests {
         assert_eq!(g("   ", "x"), None); // blank skipped
         assert_eq!(g("?", "ab"), Some(false)); // single non-`/`
         assert_eq!(g("?", "a"), Some(true));
+    }
+
+    #[test]
+    fn keep_canonicalization_rule() {
+        use std::collections::BTreeMap;
+        let s = Scope::default();
+        let mk = |pairs: &[(&str, &str)]| -> BTreeMap<String, Vec<u8>> {
+            pairs
+                .iter()
+                .map(|(p, c)| (p.to_string(), c.as_bytes().to_vec()))
+                .collect()
+        };
+
+        // Empty dir → sentinel survives, normalized to empty bytes.
+        let out = canonicalize_keeps(&mk(&[("empty/.keep", "junk")]), &s);
+        assert!(out.contains_key("empty/.keep"));
+        assert!(out.get("empty/.keep").unwrap().is_empty());
+
+        // A real file in the dir → that dir's sentinel is dropped.
+        let out = canonicalize_keeps(&mk(&[("d/.keep", ""), ("d/x.md", "hi")]), &s);
+        assert!(!out.contains_key("d/.keep"));
+        assert_eq!(out.get("d/x.md").unwrap(), b"hi");
+
+        // Nested: an empty leaf keeps its own sentinel; a sibling with a
+        // real file does not (the file already represents that path).
+        let out = canonicalize_keeps(&mk(&[("a/b/.keep", ""), ("a/c/x.md", "y")]), &s);
+        assert!(out.contains_key("a/b/.keep"));
+        assert!(out.contains_key("a/c/x.md"));
+        assert!(!out.contains_key("a/c/.keep"));
+
+        // The HARD INVARIANT still wins: nothing under `.context/`.
+        assert!(canonicalize_keeps(&mk(&[(".context/x/.keep", "")]), &s).is_empty());
     }
 }

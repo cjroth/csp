@@ -48,7 +48,8 @@ describe('loadOrCreateIdentity', () => {
     const { identity, created } = await loadOrCreateIdentity(io);
     expect(created).toBe(true);
     expect(io.writes).toBe(1);
-    expect(io.body?.startsWith('csp-identity-v1 ')).toBe(true);
+    // `ctx`-interoperable bare-hex 32-byte seed (64 hex chars).
+    expect(io.body?.trim()).toMatch(/^[0-9a-f]{64}$/);
     expect(io.pub).toBe(`${identity.pubkey().toSshString()}\n`);
     identity.free();
   });

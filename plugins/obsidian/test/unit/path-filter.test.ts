@@ -116,4 +116,12 @@ describe('shouldSync', () => {
     expect(shouldSync('Notes/foo.md', ['Drafts/**'])).toBe(true);
     expect(shouldSync('foo.canvas', [])).toBe(true);
   });
+  test('the .keep directory sentinel is in scope (CSP §11)', () => {
+    expect(shouldSync('Empty/.keep', [])).toBe(true);
+    expect(shouldSync('a/b/c/.keep', [])).toBe(true);
+    expect(shouldSync('.keep', [])).toBe(true);
+    // …but the HARD INVARIANT and ignore globs still win.
+    expect(shouldSync('.context/x/.keep', [])).toBe(false);
+    expect(shouldSync('Drafts/.keep', ['Drafts/**'])).toBe(false);
+  });
 });

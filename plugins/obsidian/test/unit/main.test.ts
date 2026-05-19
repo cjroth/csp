@@ -136,7 +136,7 @@ describe('runSetup — create mode', () => {
     expect(side.syncEnabled).toBe(true);
     expect(side.onboarded).toBe(true);
     // Identity was generated through the injected IO, not ~/.context.
-    expect((plugin.identityIOOverride as MemIO).body?.startsWith('csp-identity-v1 ')).toBe(true);
+    expect((plugin.identityIOOverride as MemIO).body?.trim()).toMatch(/^[0-9a-f]{64}$/);
     await plugin.onunload();
   });
 });

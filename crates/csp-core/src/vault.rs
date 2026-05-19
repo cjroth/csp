@@ -15,7 +15,7 @@ use crate::object::{read_tree_to_files, write_tree_from_files, GitObject};
 use crate::oid::Oid;
 use crate::order::NodeId;
 use crate::repo::Repo;
-use crate::scope::{Scope, CONTEXTIGNORE, CONTEXT_DIR};
+use crate::scope::{canonicalize_keeps, Scope, CONTEXTIGNORE, CONTEXT_DIR};
 use crate::state::{EngineState, Snapshot};
 use crate::config::VaultConfig;
 use crate::store::Store;
@@ -218,9 +218,42 @@ impl Vault {
     /// edit, not a self-write), author one signed primitive parented on the
     /// fold commit this node currently holds, recompute `main`, materialize.
     /// Returns the new primitive oid if a commit was made.
+    /// Surface physically-empty in-scope directories as `<dir>/.keep`
+    /// sentinels (the `ctx` host's spec-§11 duty). The engine's
+    /// `canonicalize_keeps` then strips any that gained a real file.
+    fn inject_empty_dir_keeps(
+        &self,
+        files: &mut BTreeMap<String, Vec<u8>>,
+    ) -> CspResult<()> {
+        for entry in walkdir::WalkDir::new(&self.root)
+            .into_iter()
+            .filter_entry(|e| {
+                let rel = rel_path(&self.root, e.path());
+                rel != CONTEXT_DIR && !rel.starts_with(&format!("{CONTEXT_DIR}/"))
+            })
+        {
+            let entry = entry.map_err(|e| CspError::Io(e.to_string()))?;
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            let rel = rel_path(&self.root, entry.path());
+            if rel.is_empty() || !self.scope.path_in_scope(&rel) {
+                continue;
+            }
+            let mut rd =
+                std::fs::read_dir(entry.path()).map_err(|e| CspError::Io(e.to_string()))?;
+            if rd.next().is_none() {
+                files.insert(format!("{rel}/.keep"), Vec::new());
+            }
+        }
+        Ok(())
+    }
+
     pub fn commit_local_changes(&mut self) -> CspResult<Option<Oid>> {
         self.refresh_scope();
-        let files = self.scan()?;
+        let mut files = self.scan()?;
+        self.inject_empty_dir_keeps(&mut files)?;
+        let files = canonicalize_keeps(&files, &self.scope);
         let mut changed = false;
         for (p, c) in &files {
             let h = blob_hash(c);
@@ -753,6 +786,44 @@ mod tests {
             !tb.path().join("src").exists(),
             "empty source folder must not linger on the receiver"
         );
+    }
+
+    #[test]
+    fn empty_dir_round_trips_and_keep_lifecycle() {
+        let ta = tempdir().unwrap();
+        let tb = tempdir().unwrap();
+        let mut a = Vault::create(ta.path(), id(1), "v").unwrap();
+        let mut b = Vault::create(tb.path(), id(2), "v").unwrap();
+        a.authorize(&id(2).to_ssh_string()).unwrap();
+        b.authorize(&id(1).to_ssh_string()).unwrap();
+
+        // A: a user-created empty directory replicates as a `.keep`.
+        std::fs::create_dir_all(ta.path().join("notes/empty")).unwrap();
+        a.commit_local_changes().unwrap();
+        b.integrate(&a.export_all().unwrap()).unwrap();
+        assert!(tb.path().join("notes/empty").is_dir(), "empty dir replicates");
+        assert!(tb.path().join("notes/empty/.keep").exists());
+
+        // A: a real file lands → the sentinel is deterministically dropped.
+        std::fs::write(ta.path().join("notes/empty/x.md"), "hi").unwrap();
+        a.commit_local_changes().unwrap();
+        b.integrate(&a.export_all().unwrap()).unwrap();
+        assert!(tb.path().join("notes/empty/x.md").exists());
+        assert!(
+            !tb.path().join("notes/empty/.keep").exists(),
+            ".keep dropped once the folder holds a real file"
+        );
+
+        // A: the file is removed → the folder is empty again → `.keep` back.
+        std::fs::remove_file(ta.path().join("notes/empty/x.md")).unwrap();
+        a.commit_local_changes().unwrap();
+        b.integrate(&a.export_all().unwrap()).unwrap();
+        assert!(tb.path().join("notes/empty").is_dir());
+        assert!(
+            tb.path().join("notes/empty/.keep").exists(),
+            ".keep re-added when the folder is emptied"
+        );
+        assert!(!tb.path().join("notes/empty/x.md").exists());
     }
 
     #[test]
