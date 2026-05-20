@@ -6,8 +6,9 @@
   "license": "MIT OR Apache-2.0",
   "type": "module",
   "scripts": {
-    "build": "node esbuild.config.mjs production",
-    "dev": "node esbuild.config.mjs",
+    "build:wasm": "node ../../sdks/typescript/scripts/build-wasm.mjs",
+    "build": "bun run build:wasm && node esbuild.config.mjs production",
+    "dev": "bun run build:wasm && node esbuild.config.mjs",
     "install:vault": "bun run build && node scripts/install-vault.mjs",
     "lint": "biome check src test",
     "lint:fix": "biome check --write src test",
