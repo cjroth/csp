@@ -1,27 +1,29 @@
+import { listen } from "@tauri-apps/api/event";
 import { useEffect } from "react";
 import { Outlet, useNavigate } from "react-router";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { Toaster } from "@/components/ui/sonner";
 import { EngineProvider } from "@/hooks/useEngine";
 
-/** Bridge native tray menu items to in-app UI (spec §6.1). */
+/** Bridge native tray menu items to in-app UI (spec §6.1). Static import to
+ * match `lib/tauri.ts` — a dynamic import here would not split the chunk
+ * (the module is already statically pulled in there) and just adds Promise
+ * overhead; Rollup flags this as INEFFECTIVE_DYNAMIC_IMPORT. */
 function TrayBridge() {
   const navigate = useNavigate();
   useEffect(() => {
     let cleanups: Array<() => void> = [];
-    void import("@tauri-apps/api/event").then(({ listen }) => {
-      const wire = async (evt: string, fn: (p: unknown) => void) =>
-        cleanups.push(await listen(evt, (e) => fn(e.payload)));
-      void wire("tray://add-local", () => {
-        navigate("/");
-        window.dispatchEvent(new CustomEvent("ctx:add-local"));
-      });
-      void wire("tray://connect-remote", () => {
-        navigate("/");
-        window.dispatchEvent(new CustomEvent("ctx:connect-remote"));
-      });
-      void wire("tray://open-folder", (id) => navigate(`/folders/${String(id)}`));
+    const wire = async (evt: string, fn: (p: unknown) => void) =>
+      cleanups.push(await listen(evt, (e) => fn(e.payload)));
+    void wire("tray://add-local", () => {
+      navigate("/");
+      window.dispatchEvent(new CustomEvent("ctx:add-local"));
     });
+    void wire("tray://connect-remote", () => {
+      navigate("/");
+      window.dispatchEvent(new CustomEvent("ctx:connect-remote"));
+    });
+    void wire("tray://open-folder", (id) => navigate(`/folders/${String(id)}`));
     return () => {
       for (const c of cleanups) c();
       cleanups = [];

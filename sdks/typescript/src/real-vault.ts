@@ -246,12 +246,7 @@ export class RealVault implements Vault {
         if (handshakeFailures >= maxHandshakeFailures) {
           this.emit({
             kind: 'error',
-            message:
-              `peer rejected this device before the handshake completed ` +
-              `(${handshakeFailures} attempts). Authorize this device's key ` +
-              `on the peer, then reconnect:\n  ctx authorize ` +
-              `"${this.engine.node_ssh()}"\n(If the peer is an older or ` +
-              `incompatible ctx build, update it.)`,
+            message: `peer rejected this device before the handshake completed (${handshakeFailures} attempts). Authorize this device's key on the peer, then reconnect:\n  ctx authorize "${this.engine.node_ssh()}"\n(If the peer is an older or incompatible ctx build, update it.)`,
           });
           return;
         }
