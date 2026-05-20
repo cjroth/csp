@@ -1,6 +1,6 @@
 {
   "name": "@csp/sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TypeScript SDK for the Context Sync Protocol — a thin shim over the one Rust engine via wasm (csp-core/csp-wasm). One engine everywhere (CSP spec.md §16).",
   "license": "MIT OR Apache-2.0",
   "type": "module",
