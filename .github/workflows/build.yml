@@ -1,0 +1,355 @@
+name: Build
+
+# Unified CI + release for every shippable artifact: ctx CLI (4 OSes), wasm +
+# the TypeScript SDK, the Tauri desktop app (4 OSes), and the Obsidian plugin.
+# One shared version is stamped across every manifest before each build so it
+# is obvious at a glance that a main-branch build is not a real release:
+#   • push to main    → 0.1.0-dev.<run_number>.<short_sha>
+#   • pull request    → 0.1.0-pr<n>.<run_number>.<short_sha>
+#   • tag `v<semver>` → <semver> (must match the VERSION file), and the final
+#                       `release` job attaches every artifact to one GitHub
+#                       Release — including the Obsidian plugin's main.js +
+#                       manifest.json that BRAT reads.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  version:
+    name: Compute version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - id: compute
+        name: Compute unified version
+        run: |
+          base="$(cat VERSION)"
+          sha="$(git rev-parse --short HEAD)"
+          run="${GITHUB_RUN_NUMBER}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"           # e.g. v0.2.0
+            tag_ver="${tag#v}"                 # 0.2.0
+            if [ "${tag_ver}" != "${base}" ]; then
+              echo "::error::Tag ${tag} implies version ${tag_ver}, but VERSION holds ${base}. Bump VERSION and re-tag."
+              exit 1
+            fi
+            version="${tag_ver}"
+          elif [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            version="${base}-pr${{ github.event.pull_request.number }}.${run}.${sha}"
+          else
+            version="${base}-dev.${run}.${sha}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Built version: ${version}"
+
+  cli:
+    name: ctx CLI (${{ matrix.label }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: ctx
+            archive: tar.gz
+          - label: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            bin: ctx
+            archive: tar.gz
+          - label: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            bin: ctx
+            archive: tar.gz
+          - label: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: ctx.exe
+            archive: zip
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          key: ctx-${{ matrix.target }}
+
+      - name: Stamp version (unix)
+        if: runner.os != 'Windows'
+        run: scripts/stamp-version.sh "${{ needs.version.outputs.version }}"
+
+      - name: Stamp version (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: scripts/stamp-version.sh "${{ needs.version.outputs.version }}"
+
+      - name: Build ctx
+        run: cargo build --release -p ctx --target ${{ matrix.target }}
+
+      - name: Smoke test --version
+        shell: bash
+        run: |
+          ./target/${{ matrix.target }}/release/${{ matrix.bin }} --version || true
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          name="ctx-${{ needs.version.outputs.version }}-${{ matrix.label }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "dist/${name}.zip" "./target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          else
+            tar -C "./target/${{ matrix.target }}/release" -czf "dist/${name}.tar.gz" "${{ matrix.bin }}"
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ctx-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+
+  wasm-sdk:
+    name: WASM + TypeScript SDK
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          workspaces: crates/csp-wasm
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: latest
+
+      - name: Stamp version
+        run: scripts/stamp-version.sh "${{ needs.version.outputs.version }}"
+
+      - name: Install SDK deps
+        run: bun install --frozen-lockfile
+        working-directory: sdks/typescript
+
+      - name: Build wasm (nodejs + web targets)
+        run: bun run build:wasm
+        working-directory: sdks/typescript
+
+      - name: Typecheck SDK
+        run: bun run typecheck
+        working-directory: sdks/typescript
+
+      - name: Test SDK
+        run: bun run test
+        working-directory: sdks/typescript
+
+      - name: Package SDK
+        run: |
+          mkdir -p dist
+          tar -czf "dist/csp-sdk-${{ needs.version.outputs.version }}.tar.gz" \
+            -C sdks/typescript \
+            src pkg pkg-web package.json README.md
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: csp-sdk
+          path: dist/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: csp-wasm
+          path: |
+            sdks/typescript/pkg/**
+            sdks/typescript/pkg-web/**
+          if-no-files-found: error
+
+  desktop:
+    name: Desktop (${{ matrix.label }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+            artifact_glob: |
+              desktop/src-tauri/target/release/bundle/deb/*.deb
+              desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          - label: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            bundles: dmg,app
+            artifact_glob: |
+              desktop/src-tauri/target/release/bundle/dmg/*.dmg
+              desktop/src-tauri/target/release/bundle/macos/*.app
+          - label: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            bundles: dmg,app
+            artifact_glob: |
+              desktop/src-tauri/target/release/bundle/dmg/*.dmg
+              desktop/src-tauri/target/release/bundle/macos/*.app
+          - label: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+            artifact_glob: |
+              desktop/src-tauri/target/release/bundle/msi/*.msi
+              desktop/src-tauri/target/release/bundle/nsis/*.exe
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          # Standalone workspace — its own Cargo.lock lives here.
+          workspaces: desktop/src-tauri
+          key: desktop-${{ matrix.target }}
+
+      - name: Install Linux build deps (webkit2gtk etc.)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            file
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: latest
+
+      - name: Stamp version
+        shell: bash
+        run: scripts/stamp-version.sh "${{ needs.version.outputs.version }}"
+
+      - name: Install desktop deps
+        run: bun install --frozen-lockfile
+        working-directory: desktop
+
+      - name: Tauri build
+        shell: bash
+        run: bunx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+        working-directory: desktop
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: desktop-${{ matrix.label }}
+          path: ${{ matrix.artifact_glob }}
+          if-no-files-found: error
+
+  obsidian:
+    name: Obsidian plugin
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          workspaces: crates/csp-wasm
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: latest
+
+      - name: Stamp version
+        run: scripts/stamp-version.sh "${{ needs.version.outputs.version }}"
+
+      - name: Install plugin deps
+        run: bun install --frozen-lockfile
+        working-directory: plugins/obsidian
+
+      - name: Build plugin
+        run: bun run build
+        working-directory: plugins/obsidian
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: obsidian-plugin
+          path: |
+            plugins/obsidian/main.js
+            plugins/obsidian/manifest.json
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    if: github.ref_type == 'tag'
+    needs: [version, cli, wasm-sdk, desktop, obsidian]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          path: artifacts
+
+      - name: Stage release files
+        run: |
+          mkdir -p release
+          # CLI archives (one tar.gz/zip per OS), SDK tarball — flat copy.
+          find artifacts/ctx-* artifacts/csp-sdk -type f -exec cp {} release/ \;
+          # Desktop bundles — copy by extension, flat.
+          find artifacts/desktop-* -type f \
+            \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \
+            -o -name '*.msi' -o -name '*.exe' \) -exec cp {} release/ \;
+          # Obsidian plugin — main.js + manifest.json (BRAT reads these
+          # by exact name, do NOT rename).
+          cp artifacts/obsidian-plugin/main.js release/main.js
+          cp artifacts/obsidian-plugin/manifest.json release/manifest.json
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release/*

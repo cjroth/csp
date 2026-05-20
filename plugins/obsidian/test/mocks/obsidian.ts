@@ -113,10 +113,41 @@ export class FakeEventRef {
   ) {}
 }
 
+/**
+ * How FakeVault fires events for folder operations. Real Obsidian (verified
+ * against community plugins / forum posts):
+ *   - `real-obsidian` (default): a folder rename fires `rename` for the folder
+ *     FIRST, then `rename` for every descendant file with its new/old path; a
+ *     folder delete fires `delete` for every descendant file FIRST, then a
+ *     `delete` for the folder itself. Recursive.
+ *   - `per-child-only`: no folder-level event; per-child events only. Some
+ *     plugins / older builds skip the folder-level event.
+ *   - `folder-only`: legacy assumption the bridge used to bake in — only the
+ *     folder-level event fires, no per-child events. Kept so we can demonstrate
+ *     the bridge still handles it for backward compat.
+ *   - `external`: the move/delete happened outside Obsidian (e.g. on disk).
+ *     Renames decompose into `create` (new path) + `delete` (old path);
+ *     deletes still fire per-child + folder.
+ */
+export type FolderEventStrategy = 'real-obsidian' | 'per-child-only' | 'folder-only' | 'external';
+
 export class FakeVault implements MinimalVault {
   private files = new Map<string, FakeTFile>();
   private folders = new Map<string, FakeTFolder>();
   private listeners = new Map<VaultEventName, Set<VaultEventHandler>>();
+
+  /** Folder-op event strategy. Mutable so a single vault instance can flip
+   * strategies between tests. Defaults to the real-Obsidian behavior. */
+  folderEventStrategy: FolderEventStrategy = 'real-obsidian';
+
+  /** Stale-cache mode for `getAbstractFileByPath`: paths in this set return
+   * null even though the file exists. Used to reproduce the Obsidian metadata
+   * cache returning null while the file is still physically present. */
+  staleLookupPaths = new Set<string>();
+
+  /** Capture every event the vault fires (after suppression-free dispatch),
+   * in order. Tests use this to assert event ordering matches real Obsidian. */
+  readonly emitted: Array<{ name: VaultEventName; path: string; oldPath?: string }> = [];
 
   constructor(public readonly adapter: FakeDataAdapter = new FakeDataAdapter()) {}
 
@@ -134,6 +165,7 @@ export class FakeVault implements MinimalVault {
   }
 
   getAbstractFileByPath(path: string): FakeTAbstractFile | null {
+    if (this.staleLookupPaths.has(path)) return null;
     return this.files.get(path) ?? this.folders.get(path) ?? null;
   }
 
@@ -145,44 +177,56 @@ export class FakeVault implements MinimalVault {
 
   async create(path: string, data: string): Promise<FakeTFile> {
     if (this.files.has(path)) throw new Error(`exists: ${path}`);
-    await this.adapter.write(path, data);
     const f = new FakeTFile(path);
     this.files.set(path, f);
     this.emit('create', f);
+    await this.adapter.write(path, data);
     return f;
   }
 
   async modify(file: FakeTFile, data: string): Promise<void> {
     if (!this.files.has(file.path)) throw new Error(`not found: ${file.path}`);
-    await this.adapter.write(file.path, data);
     this.emit('modify', file);
+    await this.adapter.write(file.path, data);
   }
 
   async delete(file: FakeTAbstractFile): Promise<void> {
     if (this.files.has(file.path)) {
       this.files.delete(file.path);
+      this.emit('delete', file);
       try {
         await this.adapter.remove(file.path);
       } catch {}
-      this.emit('delete', file);
       return;
     }
     if (this.folders.has(file.path)) {
-      // Obsidian: deleting a folder removes every descendant and fires ONE
-      // folder-level `delete` (no per-child events). Model that exactly.
+      // Real Obsidian fires `delete` for each descendant file first, then the
+      // folder itself. Snapshot the descendants BEFORE mutating internal maps
+      // so emission ordering is deterministic.
       const prefix = `${file.path}/`;
-      for (const p of [...this.files.keys()]) {
-        if (p.startsWith(prefix)) {
-          this.files.delete(p);
-          try {
-            await this.adapter.remove(p);
-          } catch {}
-        }
+      const childFiles = [...this.files.values()].filter((f) => f.path.startsWith(prefix));
+      const childFolders = [...this.folders.values()].filter(
+        (f) => f.path !== file.path && f.path.startsWith(prefix),
+      );
+
+      // Remove from internal maps (sync) then emit events (sync) BEFORE the
+      // async adapter removes — matches real Obsidian's order.
+      for (const f of childFiles) this.files.delete(f.path);
+      for (const f of childFolders) this.folders.delete(f.path);
+      this.folders.delete(file.path);
+
+      const strategy = this.folderEventStrategy;
+      if (strategy === 'real-obsidian' || strategy === 'per-child-only') {
+        for (const f of childFiles) this.emit('delete', f);
       }
-      for (const p of [...this.folders.keys()]) {
-        if (p === file.path || p.startsWith(prefix)) this.folders.delete(p);
+      if (strategy !== 'per-child-only') this.emit('delete', file);
+
+      // Adapter removes (async). Errors swallowed — best-effort.
+      for (const f of childFiles) {
+        try {
+          await this.adapter.remove(f.path);
+        } catch {}
       }
-      this.emit('delete', file);
       return;
     }
     throw new Error(`not found: ${file.path}`);
@@ -195,27 +239,43 @@ export class FakeVault implements MinimalVault {
       this.files.delete(oldPath);
       f.path = newPath;
       this.files.set(newPath, f);
+      // Real Obsidian fires the rename event synchronously after the
+      // in-memory rename and BEFORE the on-disk operation completes (per
+      // forum threads documenting "the rename event fires before the file
+      // operation completes"). Modelling that ordering matters: it lets the
+      // bridge's event handler enqueue itself before any other async work
+      // the test starts in the same turn.
+      if (this.folderEventStrategy === 'external') {
+        const tmpOld = new FakeTFile(oldPath);
+        this.emit('create', f);
+        this.emit('delete', tmpOld);
+      } else {
+        this.emit('rename', f, oldPath);
+      }
       try {
         await this.adapter.rename(oldPath, newPath);
       } catch {}
-      this.emit('rename', f, oldPath);
       return;
     }
     if (this.folders.has(oldPath)) {
-      // Obsidian: renaming a folder re-paths every descendant and fires ONE
-      // folder-level `rename` (no per-child events).
+      // Snapshot descendants before mutating state, so emission order is
+      // deterministic.
       const prefix = `${oldPath}/`;
+      const childFiles: Array<{ child: FakeTFile; oldChildPath: string; newChildPath: string }> =
+        [];
       for (const p of [...this.files.keys()]) {
         if (!p.startsWith(prefix)) continue;
         const child = this.files.get(p) as FakeTFile;
         const np = `${newPath}${p.slice(oldPath.length)}`;
-        this.files.delete(p);
-        child.path = np;
-        this.files.set(np, child);
-        try {
-          await this.adapter.rename(p, np);
-        } catch {}
+        childFiles.push({ child, oldChildPath: p, newChildPath: np });
       }
+      // Re-key files in the in-memory map (sync).
+      for (const { child, oldChildPath, newChildPath } of childFiles) {
+        this.files.delete(oldChildPath);
+        child.path = newChildPath;
+        this.files.set(newChildPath, child);
+      }
+      // Re-key folders (folder itself + nested subfolders).
       for (const p of [...this.folders.keys()]) {
         if (p !== oldPath && !p.startsWith(prefix)) continue;
         const fol = this.folders.get(p) as FakeTFolder;
@@ -224,7 +284,31 @@ export class FakeVault implements MinimalVault {
         fol.path = np;
         this.folders.set(np, fol);
       }
-      this.emit('rename', file, oldPath);
+
+      // Emit per the configured strategy, BEFORE the adapter renames (real
+      // Obsidian fires events synchronously after the in-memory rename).
+      const strategy = this.folderEventStrategy;
+      if (strategy === 'external') {
+        for (const { child, oldChildPath } of childFiles) {
+          this.emit('create', child);
+          this.emit('delete', new FakeTFile(oldChildPath));
+        }
+      } else {
+        if (strategy !== 'per-child-only') this.emit('rename', file, oldPath);
+        if (strategy === 'real-obsidian' || strategy === 'per-child-only') {
+          for (const { child, oldChildPath } of childFiles) {
+            this.emit('rename', child, oldChildPath);
+          }
+        }
+      }
+
+      // Now perform the on-disk renames (async). Failures are swallowed —
+      // the adapter rename is best-effort in the fake.
+      for (const { oldChildPath, newChildPath } of childFiles) {
+        try {
+          await this.adapter.rename(oldChildPath, newChildPath);
+        } catch {}
+      }
       return;
     }
     throw new Error(`not found: ${oldPath}`);
@@ -255,6 +339,12 @@ export class FakeVault implements MinimalVault {
   }
 
   private emit(name: VaultEventName, file: FakeTAbstractFile, oldPath?: string): void {
+    const record: { name: VaultEventName; path: string; oldPath?: string } = {
+      name,
+      path: file.path,
+    };
+    if (oldPath !== undefined) record.oldPath = oldPath;
+    this.emitted.push(record);
     const set = this.listeners.get(name);
     if (!set) return;
     for (const h of [...set]) {

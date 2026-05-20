@@ -87,6 +87,14 @@ export class ObsidianVaultBridge {
   private applyTimer: ReturnType<typeof setTimeout> | null = null;
   private applyPending = false;
   private applyInFlight = false;
+  /**
+   * Per-bridge serial queue. Outbound Obsidian-event handlers AND inbound
+   * applyRemoteState all run through this so they never interleave. Without
+   * serialization a remote-apply pass can snapshot SDK state before an
+   * in-flight local rename has propagated, re-create the moved-from file
+   * in Obsidian, and produce the user-visible duplication bug.
+   */
+  private opQueue: Promise<void> = Promise.resolve();
   /** Set in `dispose()` — gates the debounce so a late timer firing after
    * the controller stopped doesn't poke a freed engine session. */
   private disposed = false;
@@ -112,10 +120,29 @@ export class ObsidianVaultBridge {
     return true;
   }
 
+  /**
+   * Chain `fn` onto the bridge's serial queue. Used to ensure outbound
+   * handlers and inbound apply passes never interleave on shared state
+   * (`knownSdkPaths`, the SDK working map, Obsidian's vault). Errors are
+   * propagated to the caller but don't poison the queue for later ops.
+   */
+  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.opQueue.then(fn, fn);
+    this.opQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   // ---- Obsidian → engine ----
 
   /** Handle a create or modify event from Obsidian. */
-  async handleObsidianWrite(file: MinimalAbstractFile): Promise<void> {
+  handleObsidianWrite(file: MinimalAbstractFile): Promise<void> {
+    return this.enqueue(() => this.runHandleObsidianWrite(file));
+  }
+
+  private async runHandleObsidianWrite(file: MinimalAbstractFile): Promise<void> {
     // Obsidian fires `create` for a TFolder. The engine is file-only;
     // preserve a user-created empty folder with a `.keep` sentinel (§11).
     // The engine's canonicalization drops it once the folder gains a real
@@ -161,8 +188,17 @@ export class ObsidianVaultBridge {
   }
 
   /** Handle a delete event from Obsidian. */
-  async handleObsidianDelete(file: MinimalAbstractFile): Promise<void> {
+  handleObsidianDelete(file: MinimalAbstractFile): Promise<void> {
+    return this.enqueue(() => this.runHandleObsidianDelete(file));
+  }
+
+  private async runHandleObsidianDelete(file: MinimalAbstractFile): Promise<void> {
     if (this.consumeSuppression(file.path)) return;
+    // Real Obsidian fires per-child `delete` events for each descendant file
+    // FIRST, then a folder-level `delete`. The bridge handles both correctly:
+    // file events go down the file branch; the trailing folder event finds
+    // no engine children and is a no-op. We still keep the folder branch so a
+    // legacy `folder-only` event sequence (or another host) is also handled.
     // Obsidian fires ONE folder-level `delete` for a folder (no per-child
     // events). Expand to every known engine child.
     if (file && !this.isFile(file)) {
@@ -196,7 +232,11 @@ export class ObsidianVaultBridge {
   }
 
   /** Handle a rename event from Obsidian. */
-  async handleObsidianRename(file: MinimalAbstractFile, oldPath: string): Promise<void> {
+  handleObsidianRename(file: MinimalAbstractFile, oldPath: string): Promise<void> {
+    return this.enqueue(() => this.runHandleObsidianRename(file, oldPath));
+  }
+
+  private async runHandleObsidianRename(file: MinimalAbstractFile, oldPath: string): Promise<void> {
     if (this.consumeSuppression(file.path)) return;
     // Obsidian fires ONE folder-level `rename` for a folder move (no
     // per-child events). Re-key every known engine child by prefix.
@@ -321,7 +361,11 @@ export class ObsidianVaultBridge {
    * Yields to the event loop every YIELD_EVERY files so a large initial
    * catch-up doesn't freeze the renderer.
    */
-  async applyRemoteState(): Promise<void> {
+  applyRemoteState(): Promise<void> {
+    return this.enqueue(() => this.runApplyRemoteState());
+  }
+
+  private async runApplyRemoteState(): Promise<void> {
     const currentPaths = new Set<string>();
     const sdkFiles = this.deps.sdk.listFiles();
     let i = 0;
@@ -337,16 +381,50 @@ export class ObsidianVaultBridge {
     for (const path of this.knownSdkPaths) {
       if (currentPaths.has(path)) continue;
       if (!this.deps.filter(path)) continue;
-      const ex = this.deps.vault.getAbstractFileByPath(path);
+      const ex = this.resolveVaultFile(path);
       if (!ex) continue;
       this.suppress(path);
-      await this.deps.vault.delete(ex);
+      try {
+        await this.deps.vault.delete(ex);
+      } catch (e) {
+        // Don't drop this path from the baseline if the delete failed —
+        // leaving it in `knownSdkPaths` lets a later pass retry, which
+        // matters most when a vault.delete races with an Obsidian internal
+        // operation. The "file already gone" case is reported as a throw
+        // and is safely ignorable.
+        const msg = String((e as Error)?.message ?? e);
+        if (!/not found|no such|enoent/i.test(msg)) {
+          this.log(`pull-delete failed for ${path}: ${msg}`);
+          currentPaths.add(path);
+        }
+        continue;
+      }
       this.pulled += 1;
       this.log(`pull-delete (tombstone): ${path}`);
       await this.pruneEmptyFolders(path);
       if (++j % ObsidianVaultBridge.YIELD_EVERY === 0) await yieldToEventLoop();
     }
     this.knownSdkPaths = currentPaths;
+  }
+
+  /**
+   * Look up a vault file by path with a stale-cache fallback. Obsidian's
+   * metadata cache can return `null` for a path that physically still exists
+   * (cold reopen, or a race between vault.rename / vault.delete and the
+   * cache update). When that happens during a remote tombstone apply, the
+   * file lingers at the old path → the user-reported duplication bug.
+   * Falling back to `vault.getFiles()` reaches past the metadata cache.
+   */
+  private resolveVaultFile(path: string): MinimalAbstractFile | null {
+    const direct = this.deps.vault.getAbstractFileByPath(path);
+    if (direct) return direct;
+    // Linear scan as a safety net. `getFiles()` reflects Obsidian's tracked
+    // file set; on a cold cache it may already be populated even when the
+    // path lookup returns null.
+    for (const f of this.deps.vault.getFiles()) {
+      if (f.path === path) return f;
+    }
+    return null;
   }
 
   /** Apply a single remote file (called from `applyRemoteState` and tests). */

@@ -141,6 +141,46 @@ impl Peer {
         let _ = std::fs::remove_file(self.dir.path().join(rel));
     }
 
+    /// Atomic filesystem rename of `from` → `to` (relative to the peer's
+    /// vault root). Auto-creates the destination parent. This is the path
+    /// the `ctx watch` notify-based watcher sees as a real move — different
+    /// from `write(new) + delete(old)` because the OS emits proper rename
+    /// events.
+    pub fn rename(&self, from: &str, to: &str) {
+        let src = self.dir.path().join(from);
+        let dst = self.dir.path().join(to);
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::rename(src, dst).expect("rename");
+    }
+
+    /// Recursive rename of a directory (same semantics as `mv old/ new/`).
+    /// Auto-creates the destination parent.
+    pub fn rename_dir(&self, from: &str, to: &str) {
+        let src = self.dir.path().join(from);
+        let dst = self.dir.path().join(to);
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::rename(src, dst).expect("rename_dir");
+    }
+
+    /// Recursive directory delete (`rm -rf`).
+    pub fn delete_dir(&self, rel: &str) {
+        let _ = std::fs::remove_dir_all(self.dir.path().join(rel));
+    }
+
+    /// Create a directory tree.
+    pub fn mkdir(&self, rel: &str) {
+        std::fs::create_dir_all(self.dir.path().join(rel)).expect("mkdir");
+    }
+
+    /// Does a path exist on this peer's working tree?
+    pub fn exists(&self, rel: &str) -> bool {
+        self.dir.path().join(rel).exists()
+    }
+
     pub fn stderr_dump(&self) -> String {
         self.stderr.lock().unwrap().join("\n")
     }
