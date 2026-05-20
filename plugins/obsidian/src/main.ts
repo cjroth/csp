@@ -34,7 +34,7 @@ import {
   loadOrCreateIdentity,
 } from './identity-store.js';
 import { ContextSyncSettingTab } from './settings-tab.js';
-import { ConfigStore, type CspSettings, DEFAULT_SETTINGS } from './settings.js';
+import { ConfigStore, type CspSettings, DEFAULT_SETTINGS, normalizePeerUrl } from './settings.js';
 import { StatusBar } from './status-bar.js';
 import { ObsidianStorageAdapter } from './storage-adapter.js';
 import { SyncController } from './sync-controller.js';
@@ -120,8 +120,7 @@ export default class ContextSyncPlugin extends Plugin {
         try {
           await this.ensureController();
           if (this.settings.syncEnabled) {
-            const connect = this.settings.autoConnectOnStart && !!this.settings.peerUrl;
-            await this.controller?.start({ connect });
+            await this.controller?.start({ connect: !!this.settings.peerUrl });
           }
         } catch (err) {
           console.error('[context] start failed:', err);
@@ -157,7 +156,7 @@ export default class ContextSyncPlugin extends Plugin {
 
     const s: CspSettings = { ...DEFAULT_SETTINGS };
     s.syncEnabled = true;
-    if (opts.peerUrl) s.peerUrl = opts.peerUrl.trim();
+    if (opts.peerUrl) s.peerUrl = normalizePeerUrl(opts.peerUrl);
     // Mobile keeps the key in-vault (under the excluded `.context/`); record
     // it so a `ctx` on a synced copy resolves the same file. Desktop leaves
     // it unset (CLI default `~/.context/id_ed25519`).
@@ -221,6 +220,21 @@ export default class ContextSyncPlugin extends Plugin {
     });
   }
 
+  /** Wipe `.context/` (engine state + shared config + plugin sidecar + the
+   * in-vault device key on mobile) and return the plugin to its unconfigured
+   * state. Desktop keeps its key (it lives in `~/.context/`, outside the
+   * vault); on next setup the same key is re-used. */
+  async resetLocalState(): Promise<void> {
+    await this.controller?.resetLocalState();
+    this.controller = null;
+    this.identity?.free();
+    this.identity = null;
+    this.settings = { ...DEFAULT_SETTINGS };
+    this.configured = false;
+    this.onboardingError = null;
+    this.statusBar?.set('idle');
+  }
+
   /** Flip the master sync switch. Persists `syncEnabled` to the sidecar. */
   async setSyncEnabled(on: boolean): Promise<void> {
     if (!this.configured) return;
@@ -228,8 +242,7 @@ export default class ContextSyncPlugin extends Plugin {
     await this.configStore?.save(this.settings);
     if (on) {
       await this.ensureController();
-      const connect = this.settings.autoConnectOnStart && !!this.settings.peerUrl;
-      await this.controller?.start({ connect });
+      await this.controller?.start({ connect: !!this.settings.peerUrl });
     } else {
       await this.controller?.stop();
     }
@@ -277,6 +290,7 @@ export default class ContextSyncPlugin extends Plugin {
     if (this.controller || !this.storage || !this.identity || !this.wasmBytes) return;
     this.controller = new SyncController({
       storage: this.storage,
+      fs: this.app.vault.adapter,
       vault: this.app.vault,
       settings: this.settings,
       identity: this.identity,

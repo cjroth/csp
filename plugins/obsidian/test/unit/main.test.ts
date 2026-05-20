@@ -314,3 +314,58 @@ describe('mobile identity path', () => {
     await plugin.onunload();
   });
 });
+
+describe('runSetup normalizes the peer URL', () => {
+  test('a bare domain becomes `wss://host:443` so the WebSocket can dial it', async () => {
+    const { plugin, adapter } = makePlugin();
+    await plugin.onload();
+    // The URL is unreachable, so connect-mode setup will reject — but the
+    // normalized URL is persisted to the sidecar *before* the engine tries
+    // to dial, which is all we want to observe here.
+    await plugin.runSetup({ mode: 'connect', peerUrl: 'sync.example.com' }).catch(() => {});
+    expect(plugin.settings.peerUrl).toBe('wss://sync.example.com:443');
+    const side = JSON.parse(await adapter.read('.context/obsidian.json'));
+    expect(side.peerUrl).toBe('wss://sync.example.com:443');
+    await plugin.onunload();
+  });
+});
+
+describe('plugin.resetLocalState', () => {
+  test('wipes .context/, frees identity, returns to the unconfigured state', async () => {
+    const { plugin, adapter } = makePlugin();
+    await plugin.onload();
+    await plugin.runSetup({ mode: 'create' });
+    expect(plugin.isConfigured()).toBe(true);
+    expect(await adapter.exists('.context')).toBe(true);
+
+    await plugin.resetLocalState();
+
+    expect(plugin.isConfigured()).toBe(false);
+    expect(plugin.controller).toBeNull();
+    expect(plugin.settings.syncEnabled).toBe(false);
+    expect(plugin.settings.onboarded).toBe(false);
+    expect(await adapter.exists('.context')).toBe(false);
+    expect(await adapter.exists('.context/obsidian.json')).toBe(false);
+    await plugin.onunload();
+  });
+
+  test('on desktop, the home-dir device key survives a reset and is re-used on next setup', async () => {
+    Platform.isDesktopApp = true;
+    const adapter = new FakeDataAdapter();
+    const io = new MemIO();
+    const { plugin } = makePluginWith(adapter, io);
+    await plugin.onload();
+    await plugin.runSetup({ mode: 'create' });
+    const keyBefore = io.body;
+    expect(keyBefore).not.toBeNull();
+
+    await plugin.resetLocalState();
+    // The home-dir key was NOT deleted by the in-vault wipe.
+    expect(io.body).toBe(keyBefore);
+
+    // Next setup picks up the same key — the same SSH pubkey comes back.
+    await plugin.runSetup({ mode: 'create' });
+    expect(io.body).toBe(keyBefore);
+    await plugin.onunload();
+  });
+});

@@ -27,8 +27,11 @@ pub async fn clone_remote(
     state: State<'_, AppState>,
     dest: String,
     url: String,
+    #[allow(non_snake_case)] authKey: Option<String>,
 ) -> R<Vault> {
-    state.engine.clone_remote(dest, url).await
+    // The webview sends `authKey` (camelCase); Rust receives it as
+    // `auth_key` after Tauri's name translation.
+    state.engine.clone_remote(dest, url, authKey).await
 }
 
 #[tauri::command]

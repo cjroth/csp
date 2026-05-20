@@ -30,12 +30,17 @@ import { type MinimalVault, ObsidianVaultBridge } from './bridge.js';
 import { shouldSync } from './path-filter.js';
 import { planReconcile } from './reconcile.js';
 import type { CspSettings } from './settings.js';
+import type { MinimalDataAdapter } from './storage-adapter.js';
 
 export type ControllerState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
 
 export interface ControllerDeps {
   storage: StorageAdapter;
   vault: MinimalVault;
+  /** The host filesystem under the vault. Used only by `resetLocalState()`
+   * to wipe the entire `.context/` folder — the engine's `StorageAdapter`
+   * has no recursive-delete primitive. */
+  fs?: MinimalDataAdapter;
   settings: CspSettings;
   /** The device identity, owned by the plugin (resolved from
    * `~/.context/id_ed25519` on desktop). Passed straight into the engine so
@@ -208,28 +213,28 @@ export class SyncController {
   }
 
   /**
-   * Wipe the local thin-node object/sync state and re-open a fresh session.
-   * Cleared: `.context/{state,frontier,snapshots}`. KEPT: `.context/config`
-   * and the device identity (`~/.context/id_ed25519`, shared with `ctx`).
-   * The Obsidian vault contents are never touched.
+   * Stop the controller and recursively delete the entire `<vault>/.context/`
+   * folder — engine state, snapshots, shared config, plugin sidecar, and (on
+   * mobile, where the device key lives in-vault) the device identity. The
+   * Obsidian vault contents themselves are never touched. After this returns
+   * the plugin is back to its unconfigured state and the setup wizard takes
+   * over.
    *
-   * NOTE (CSP §5.1): this resumes authoring under the SAME device key. If
-   * that key may be live on another replica of this vault, history becomes
-   * confusing; CSP prefers a fresh NodeId. The plugin cannot fork the key
-   * itself — it warns.
+   * Desktop keeps its device key intact: it lives in `~/.context/id_ed25519`
+   * (shared with `ctx`), outside the vault.
    */
   async resetLocalState(): Promise<void> {
     await this.stop();
-    // Zero-length blobs make the adapter report null → the engine treats
-    // them as absent and rebuilds from config on next start().
-    await this.deps.storage.saveState(new Uint8Array(0));
-    await this.deps.storage.saveFrontier(new Uint8Array(0));
-    await this.deps.storage.saveSnapshots(new Uint8Array(0));
-    this.deps.notice?.(
-      'Context: local state cleared. Resuming under the same device key — ' +
-        'per CSP §5.1, prefer a fresh key if it may be active elsewhere.',
-    );
-    await this.prepare();
+    if (this.deps.fs) {
+      await removeDirRecursive(this.deps.fs, '.context');
+    } else {
+      // Fallback for callers that didn't wire `fs` (older tests). Best-effort
+      // zero-out of the engine-owned blobs so the engine rebuilds on restart.
+      await this.deps.storage.saveState(new Uint8Array(0));
+      await this.deps.storage.saveFrontier(new Uint8Array(0));
+      await this.deps.storage.saveSnapshots(new Uint8Array(0));
+    }
+    this.deps.notice?.('Context: local state cleared.');
   }
 
   /** The bridge is exposed for the Obsidian event listeners in main.ts. */
@@ -245,7 +250,7 @@ export class SyncController {
    * no server-minted id — it just catches up its frontier (CSP §6.4).
    */
   private async openOrCreate(): Promise<VaultInstance> {
-    const { peerUrl, peerPubkey } = this.deps.settings;
+    const { peerUrl, peerPubkey, authKey } = this.deps.settings;
     const transport = this.deps.transport;
     const base = {
       storage: this.deps.storage,
@@ -253,6 +258,7 @@ export class SyncController {
       ...(peerUrl ? { peerUrl } : {}),
       ...(peerPubkey ? { peerPubkey: sshPubkeyBytes(peerPubkey) } : {}),
       ...(transport ? { transport } : {}),
+      ...(authKey ? { authKey } : {}),
     };
 
     const existing = await this.deps.storage.loadState();
@@ -261,6 +267,8 @@ export class SyncController {
     }
     if (peerUrl) {
       // CSP §17 `ctx clone <url>` — catch up + materialize from the peer.
+      // §10: `authKey`, if set, is sent on the WS upgrade so a listener
+      // requiring enrollment lets this device in.
       return Vault.clone({ ...base, peerUrl });
     }
     // Offline local create. Per CSP §7 this will NOT converge across
@@ -383,4 +391,29 @@ function sshPubkeyBytes(ssh: string): Uint8Array {
   } finally {
     pk.free();
   }
+}
+
+/** Depth-first delete of every file + folder under `path`, then `path`
+ * itself. Tolerates a missing root so callers can call it unconditionally. */
+async function removeDirRecursive(fs: MinimalDataAdapter, path: string): Promise<void> {
+  if (!(await fs.exists(path))) return;
+  let children: { files: string[]; folders: string[] };
+  try {
+    children = await fs.list(path);
+  } catch {
+    // Path exists but isn't listable (e.g. a stray file at the root): try to
+    // remove it directly below.
+    children = { files: [], folders: [] };
+  }
+  for (const f of children.files) {
+    try {
+      await fs.remove(f);
+    } catch {}
+  }
+  for (const sub of children.folders) {
+    await removeDirRecursive(fs, sub);
+  }
+  try {
+    await fs.remove(path);
+  } catch {}
 }

@@ -11,7 +11,7 @@
 
 import { type App, type ButtonComponent, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type ContextSyncPlugin from './main.js';
-import { parseIgnoreGlobs } from './settings.js';
+import { normalizePeerUrl, parseIgnoreGlobs } from './settings.js';
 
 export class ContextSyncSettingTab extends PluginSettingTab {
   private unsubscribe: (() => void) | null = null;
@@ -62,10 +62,7 @@ export class ContextSyncSettingTab extends PluginSettingTab {
     }
 
     containerEl.createEl('p', {
-      text:
-        'This vault is not set up yet. Setup writes .context/config, but ' +
-        'syncing only activates once setup completes — reaching the peer ' +
-        '(connect) or building the local vault (create).',
+      text: "This vault isn't syncing yet. Choose how to set it up below.",
     });
 
     if (this.plugin.onboardingError) {
@@ -76,7 +73,7 @@ export class ContextSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Setup mode')
-      .setDesc('Connect this device to a peer (recommended), or create a new local vault.')
+      .setDesc("Connect to another device that's already syncing, or start a brand-new vault here.")
       .addDropdown((d) =>
         d
           .addOption('connect', 'Connect to a peer')
@@ -92,33 +89,45 @@ export class ContextSyncSettingTab extends PluginSettingTab {
       new Setting(containerEl)
         .setName('Peer URL')
         .setDesc(
-          'Required — the WebSocket address of a CSP full node in listen ' +
-            'mode (e.g. `ctx watch --listen` or Context Desktop), like ' +
-            '`wss://host:7777`. Your device key must be authorized there.',
+          'Address of the other device, e.g. `sync.example.com` or ' +
+            '`wss://192.168.1.10:7777`. A bare domain assumes `wss://` on ' +
+            'port 443. This device must be authorized on the peer first.',
         )
         .addText((t) =>
           t
-            .setPlaceholder('wss://host:7777')
+            .setPlaceholder('sync.example.com')
             .setValue(this.setupPeerUrl)
             .onChange((v) => {
               this.setupPeerUrl = v;
             }),
         );
+      new Setting(containerEl)
+        .setName('Auth key (optional)')
+        .setDesc(
+          'Only needed if the peer was started with CTX_AUTH_KEY and this device has ' +
+            "not enrolled yet. Used once at clone time; the peer's authorized_keys " +
+            'records this device after a successful connect.',
+        )
+        .addText((t) => {
+          t.inputEl.type = 'password';
+          t.setPlaceholder('paste only if required')
+            .setValue(this.plugin.settings.authKey)
+            .onChange((v) => {
+              this.plugin.settings.authKey = v.trim();
+            });
+        });
     } else {
       containerEl
         .createEl('p', {
-          text:
-            'Heads-up: a local vault with no peer will NOT converge across ' +
-            'devices on its own. CSP requires at least one full node — add a ' +
-            'Peer URL now or later, and authorize this device there.',
+          text: "Heads-up: a vault with no peer won't sync to your other devices.",
         })
         .addClass('mod-warning');
       new Setting(containerEl)
         .setName('Peer URL')
-        .setDesc('Optional now — add it later before syncing across devices.')
+        .setDesc('Optional — add it later to start syncing with another device.')
         .addText((t) =>
           t
-            .setPlaceholder('wss://host:7777')
+            .setPlaceholder('sync.example.com')
             .setValue(this.setupPeerUrl)
             .onChange((v) => {
               this.setupPeerUrl = v;
@@ -168,12 +177,10 @@ export class ContextSyncSettingTab extends PluginSettingTab {
         }, 0);
       }) ?? null;
 
+    const state = this.plugin.controller?.state ?? 'idle';
     new Setting(containerEl)
       .setName('Enable sync')
-      .setDesc(
-        'Master switch. While off, the plugin makes no connection and opens ' +
-          'no session. Turn off to pause syncing without losing config.',
-      )
+      .setDesc(`Turn syncing on or off. Current state: ${state}.`)
       .addToggle((t) =>
         t.setValue(this.plugin.settings.syncEnabled).onChange(async (v) => {
           await this.plugin.setSyncEnabled(v);
@@ -184,10 +191,7 @@ export class ContextSyncSettingTab extends PluginSettingTab {
     const pubkey = this.plugin.controller?.identityPubkeySsh() ?? '(loading…)';
     new Setting(containerEl)
       .setName('Device public key')
-      .setDesc(
-        'Authorize this device on your peer: run `ctx authorize <thiskey>` ' +
-          'on the full node (CSP §10). It is never synced.',
-      )
+      .setDesc("This device's identity. Share it so the other side can authorize it.")
       .addText((t) => t.setValue(pubkey).setDisabled(true))
       .addButton((b: ButtonComponent) =>
         b
@@ -202,36 +206,22 @@ export class ContextSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Peer URL')
       .setDesc(
-        'WebSocket address of a CSP full node in listen mode, e.g. ' +
-          '`wss://host:7777`. Empty = offline-only (will not converge).',
+        'Address of the other device. A bare domain assumes `wss://` on ' +
+          'port 443. Leave empty for offline-only.',
       )
       .addText((t) =>
         t
-          .setPlaceholder('wss://host:7777')
+          .setPlaceholder('sync.example.com')
           .setValue(this.plugin.settings.peerUrl)
           .onChange(async (v) => {
-            this.plugin.settings.peerUrl = v.trim();
+            this.plugin.settings.peerUrl = normalizePeerUrl(v);
             await this.plugin.saveSettings();
           }),
       );
 
     new Setting(containerEl)
-      .setName('Auto-connect on start')
-      .setDesc('Open the peer connection automatically when Obsidian launches.')
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.autoConnectOnStart).onChange(async (v) => {
-          this.plugin.settings.autoConnectOnStart = v;
-          await this.plugin.saveSettings();
-        }),
-      );
-
-    new Setting(containerEl)
       .setName('Ignore patterns')
-      .setDesc(
-        'One glob per line; `#` lines are comments. Layered under the ' +
-          'text-allowlist. (CSP also syncs a shared `.contextignore`; ' +
-          'binary files are always skipped.)',
-      )
+      .setDesc('One glob per line; `#` starts a comment. Files matching these are not synced.')
       .addTextArea((t) =>
         t
           .setPlaceholder('# example\nDrafts/**\n*.tmp.md')
@@ -245,63 +235,21 @@ export class ContextSyncSettingTab extends PluginSettingTab {
     const pinned = this.plugin.settings.peerPubkey || '(none yet)';
     new Setting(containerEl)
       .setName('Pinned peer key')
-      .setDesc(
-        'Set on first successful connect (CSP §10 key pinning), stored as ' +
-          '`[peer] pubkey`. Clear to allow connecting to a different peer.',
-      )
-      .addText((t) => t.setValue(pinned).setDisabled(true))
-      .addButton((b) =>
-        b
-          .setButtonText('Clear pin')
-          .setWarning()
-          .onClick(async () => {
-            this.plugin.settings.peerPubkey = '';
-            await this.plugin.saveSettings();
-            this.display();
-          }),
-      );
-
-    const state = this.plugin.controller?.state ?? 'idle';
-    const connected = state === 'connected';
-    new Setting(containerEl)
-      .setName('Connection')
-      .setDesc(`Current state: ${state}.`)
-      .addButton((b) =>
-        b
-          .setButtonText(connected ? 'Disconnect' : state === 'idle' ? 'Connect' : 'Reconnect')
-          .setCta()
-          .onClick(async () => {
-            await this.plugin.controller?.stop();
-            if (connected) await this.plugin.controller?.prepare();
-            else await this.plugin.controller?.start({ connect: true });
-            this.display();
-          }),
-      )
-      .addButton((b) =>
-        b
-          .setButtonText('Resync now')
-          .setTooltip('Re-run the bidirectional reconcile pass.')
-          .onClick(async () => {
-            await this.plugin.controller?.resyncNow();
-          }),
-      );
+      .setDesc("The peer's identity, remembered on first connect.")
+      .addText((t) => t.setValue(pinned).setDisabled(true));
 
     new Setting(containerEl)
       .setName('Reset local state')
       .setDesc(
-        'Rebuilds .context/{state,frontier,snapshots}; .context/config and ' +
-          'your device key are kept (the key lives in ~/.context, shared ' +
-          'with `ctx`). Your Obsidian vault contents are NOT touched. ' +
-          'Resumes under the same device key (CSP §5.1).',
+        "Delete this device's local sync data and start over. Your Obsidian " +
+          'notes are not touched.',
       )
       .addButton((b) =>
         b
           .setButtonText('Reset')
           .setWarning()
           .onClick(async () => {
-            await this.plugin.controller?.resetLocalState();
-            this.plugin.settings.peerPubkey = '';
-            await this.plugin.saveSettings();
+            await this.plugin.resetLocalState();
             new Notice('Context: local state cleared.');
             this.display();
           }),
@@ -311,7 +259,7 @@ export class ContextSyncSettingTab extends PluginSettingTab {
     const snaps = this.plugin.controller?.listSnapshots() ?? [];
     if (snaps.length === 0) {
       containerEl.createEl('p', {
-        text: 'No snapshots yet. Snapshots are point-in-time recovery points (CSP §8).',
+        text: 'No snapshots yet. A snapshot saves a point-in-time copy you can roll back to.',
       });
     } else {
       for (const snap of snaps) {

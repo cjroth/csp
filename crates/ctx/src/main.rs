@@ -14,11 +14,48 @@ mod sshagent;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
-use cli::{Cli, Cmd, ScopeAction};
+use cli::{AuthAction, Cli, Cmd, ScopeAction};
+use csp_core::authkeys::{self, Expiry};
+use csp_core::config::BUILTIN_DEFAULT_TTL_DAYS;
 use csp_core::net::{probe, Node};
 use csp_core::{Vault, VaultConfig};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Resolve the effective default TTL (days) for new `authorized_keys`
+/// entries. Precedence: `--default-key-ttl` flag/env > config
+/// `default_key_ttl_days` > spec built-in 90. `0` means "no default TTL"
+/// (entries are written without an `expires=` token).
+fn effective_default_ttl_days(cli: &Cli, cfg: &VaultConfig) -> u64 {
+    if let Some(s) = &cli.default_key_ttl {
+        if s.eq_ignore_ascii_case("never") || s == "0" {
+            return 0;
+        }
+        if let Some(d) = authkeys::parse_duration_days(s) {
+            return d;
+        }
+    }
+    cfg.default_key_ttl_days.unwrap_or(BUILTIN_DEFAULT_TTL_DAYS)
+}
+
+/// Parse `--auth-key` / `CTX_AUTH_KEY` into the configured list. Comma-
+/// separated (for rotation). Whitespace-trimmed; empty entries dropped.
+fn parse_auth_keys(spec: Option<&str>) -> Vec<String> {
+    let Some(s) = spec else { return Vec::new() };
+    s.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// First non-empty client auth-key (the one to send on outbound connects).
+fn client_auth_key(cli: &Cli) -> Option<String> {
+    parse_auth_keys(cli.auth_key.as_deref()).into_iter().next()
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
 
 fn root_dir(cli: &Cli) -> PathBuf {
     cli.dir
@@ -214,17 +251,131 @@ async fn run(cli: Cli) -> Result<()> {
             eprintln!("(key file: {})", idpath.display());
         }
 
-        Cmd::Authorize { pubkey } => {
+        Cmd::Authorize { pubkey, ttl } => {
             let (signer, _) = idstore::load_or_create(cli.identity.as_deref())?;
             let v = Vault::open(&root, signer.identity()?).context("open vault")?;
-            v.authorize(pubkey)?;
-            println!("authorized {}", pubkey.split_whitespace().next().unwrap_or(pubkey));
+            // Resolve the effective TTL with explicit `--ttl` overriding the
+            // listener default. No `--ttl` → use the listener default (so
+            // `ctx authorize` and listen-start migration agree on the
+            // window written for fresh entries).
+            let ttl_days = match ttl {
+                Some(s) if s.eq_ignore_ascii_case("never") || s == "0" => None,
+                Some(s) => Some(
+                    authkeys::parse_duration_days(s)
+                        .with_context(|| format!("invalid --ttl: {s}"))?,
+                ),
+                None => {
+                    let d = effective_default_ttl_days(&cli, &v.config);
+                    if d == 0 {
+                        None
+                    } else {
+                        Some(d)
+                    }
+                }
+            };
+            let expiry = match ttl_days {
+                None => Expiry::Never,
+                Some(d) => {
+                    let now = now_unix();
+                    Expiry::At(authkeys::expiry_from_ttl_days(now, d))
+                }
+            };
+            v.authorize_with_expiry(pubkey, expiry)?;
+            let head = pubkey.split_whitespace().next().unwrap_or(pubkey);
+            println!(
+                "authorized {head} ({})",
+                match expiry {
+                    Expiry::At(t) => format!("expires={}", authkeys::format_date_ymd_utc(t)),
+                    Expiry::Never => "expires=never".to_string(),
+                    Expiry::Unset => "no expiry token".to_string(),
+                }
+            );
         }
         Cmd::Revoke { pubkey } => {
             let (signer, _) = idstore::load_or_create(cli.identity.as_deref())?;
             let v = Vault::open(&root, signer.identity()?).context("open vault")?;
             v.revoke(pubkey)?;
             println!("revoked");
+        }
+        Cmd::Auth { action } => {
+            let (signer, _) = idstore::load_or_create(cli.identity.as_deref())?;
+            let v = Vault::open(&root, signer.identity()?).context("open vault")?;
+            match action {
+                AuthAction::List { json } => {
+                    let now = now_unix();
+                    let entries = v.authorized_entries()?;
+                    if *json {
+                        let mut arr = Vec::new();
+                        for e in &entries {
+                            let (status, expires) = match e.expiry {
+                                Expiry::At(t) => (
+                                    if t > now { "valid" } else { "expired" },
+                                    Some(authkeys::format_date_ymd_utc(t)),
+                                ),
+                                Expiry::Never => ("never-expires", None),
+                                Expiry::Unset => ("unmigrated", None),
+                            };
+                            let remaining_days = match e.expiry {
+                                Expiry::At(t) if t > now => Some((t - now) / 86400),
+                                _ => None,
+                            };
+                            arr.push(serde_json::json!({
+                                "node_id": e.node.map(|n| n.to_hex()),
+                                "line": e.raw,
+                                "status": status,
+                                "expires": expires,
+                                "remaining_days": remaining_days,
+                            }));
+                        }
+                        println!("{}", serde_json::to_string_pretty(&arr)?);
+                    } else if entries.is_empty() {
+                        println!("(no authorized keys)");
+                    } else {
+                        for e in &entries {
+                            let nid = e
+                                .node
+                                .map(|n| format!("{}…", &n.to_hex()[..12]))
+                                .unwrap_or_else(|| "?".into());
+                            let status = match e.expiry {
+                                Expiry::At(t) if t > now => {
+                                    let days = (t - now) / 86400;
+                                    format!(
+                                        "expires={} ({}d left)",
+                                        authkeys::format_date_ymd_utc(t),
+                                        days
+                                    )
+                                }
+                                Expiry::At(t) => format!(
+                                    "EXPIRED on {}",
+                                    authkeys::format_date_ymd_utc(t)
+                                ),
+                                Expiry::Never => "never expires".to_string(),
+                                Expiry::Unset => "no expiry (will migrate on listen start)"
+                                    .to_string(),
+                            };
+                            println!("{nid}  {status}");
+                        }
+                    }
+                }
+                AuthAction::Extend { target, duration } => {
+                    let more = if duration.eq_ignore_ascii_case("never")
+                        || duration == "0"
+                    {
+                        None
+                    } else {
+                        Some(
+                            authkeys::parse_duration_days(duration)
+                                .with_context(|| format!("invalid duration: {duration}"))?,
+                        )
+                    };
+                    let n = v.extend_expiry(target, more)?;
+                    println!("updated {n} entry(s)");
+                }
+                AuthAction::Migrate => {
+                    let n = v.migrate_default_expiry()?;
+                    println!("migrated {n} entry(s)");
+                }
+            }
         }
 
         Cmd::Status { json } => {
@@ -374,7 +525,11 @@ async fn run(cli: Cli) -> Result<()> {
                     &id.node_id().to_hex()[..12]
                 );
             }
-            let (vault_id, vault_name, server_ssh) = probe(url, &id)
+            // §10: if the operator passed `--auth-key`, send it on the
+            // probe AND on the post-clone connect so a listener requiring
+            // enrollment lets us in.
+            let ak = client_auth_key(&cli);
+            let (vault_id, vault_name, server_ssh) = probe(url, &id, ak.as_deref())
                 .await
                 .context("probe listener for vault id")?;
             anyhow::ensure!(!vault_id.is_empty(), "listener returned empty vault id");
@@ -434,7 +589,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // Bounded catch-up so `ctx clone` returns with content
                 // (git-clone semantics), then exit.
                 let node = Node::new(Vault::open(&target, id)?);
-                let _conn = node.connect(url.clone());
+                let _conn = node.connect(url.clone(), ak.clone());
                 let start = Instant::now();
                 let mut last = None;
                 let mut stable_since = Instant::now();
@@ -485,11 +640,31 @@ async fn watch_run(
     let no_tls = cli.no_tls.unwrap_or(v.config.no_tls);
     let listen = cli.listen.clone().or_else(|| v.config.listen.clone());
     let debounce_ms = cli.debounce.unwrap_or(v.config.debounce_ms);
+    // §10 auth-key: env/flag wins; otherwise inherit any config-persisted
+    // set. Comma-split. Set into in-memory config so `Node::serve` and
+    // `Vault::admit_peer` both see the same effective list.
+    let cli_auth_keys = parse_auth_keys(cli.auth_key.as_deref());
+    let auth_keys = if !cli_auth_keys.is_empty() {
+        cli_auth_keys.clone()
+    } else {
+        v.config.auth_keys.clone()
+    };
+    v.config.auth_keys = auth_keys.clone();
+    // §10 default TTL: flag/env > config > built-in 90.
+    let ttl_days = effective_default_ttl_days(cli, &v.config);
+    v.config.default_key_ttl_days = Some(ttl_days);
     // Apply the effective TOFU policy to the in-memory config the engine
     // reads — but do NOT persist it (precedence must stay non-sticky).
     v.config.no_tofu = no_tofu;
 
     seed_authorized(&v, &cli.authorized_keys)?;
+    // Listen-start migration (§10): apply default expiry to any
+    // hand-pasted bare lines. Idempotent. Only run when this process will
+    // actually listen — outbound-only nodes have no admission decision to
+    // make.
+    if listen.is_some() {
+        v.migrate_default_expiry().context("listen-start migration")?;
+    }
     let mut peers: Vec<String> = v.config.peers.clone();
     peers.extend(extra_peers);
     let context_dir = v.context_dir().to_path_buf();
@@ -536,8 +711,13 @@ async fn watch_run(
              locally. Add `--peer <url>` or `--listen`."
         );
     }
+    // Outbound: pass `--auth-key` so a listener requiring enrollment lets
+    // this node (re)enroll. After the first successful enrollment the
+    // pubkey is durable in the listener's `authorized_keys`, so the key
+    // is only consulted again if the entry is removed or expires.
+    let client_ak = client_auth_key(cli);
     for p in &peers {
-        let _ = node.connect(p.clone());
+        let _ = node.connect(p.clone(), client_ak.clone());
     }
 
     if once {

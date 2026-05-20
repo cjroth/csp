@@ -128,8 +128,8 @@ describe('onVaultEvent branches', () => {
     b.sdk.emit({ kind: 'connecting', url: 'wss://peer:7777' });
     expect(b.controller.state).toBe('connecting');
 
-    // Real engine emits an EMPTY peer_pubkey — must NOT pin (and must not
-    // throw a swallowed error). settings.peerPubkey stays unset.
+    // An empty peer_pubkey (e.g. when the engine fails to surface the key)
+    // is tolerated: state still flips to connected and no pin is recorded.
     b.sdk.emit({ kind: 'connected', peer_pubkey: new Uint8Array() });
     expect(b.controller.state).toBe('connected');
     expect(b.settings.peerPubkey).toBe('');

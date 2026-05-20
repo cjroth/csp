@@ -52,6 +52,17 @@ pub struct VaultConfig {
     pub allow_binary: bool,
     #[serde(default = "default_include")]
     pub include: Vec<String>,
+    /// Auth-key enrollment secrets (§10). Comma-separated form on the CLI;
+    /// stored as a list. When non-empty, TOFU is implicitly disabled.
+    #[serde(default)]
+    pub auth_keys: Vec<String>,
+    /// Default `expires=` TTL applied to new `authorized_keys` entries
+    /// (enrollment, manual `ctx authorize`, listen-start migration). Days.
+    /// `None` → built-in 90-day default. Set to `0` for "no default TTL"
+    /// (entries are written without `expires=`, treated as non-expiring
+    /// until manually edited).
+    #[serde(default)]
+    pub default_key_ttl_days: Option<u64>,
 }
 
 fn default_debounce_ms() -> u64 {
@@ -60,6 +71,10 @@ fn default_debounce_ms() -> u64 {
 fn default_include() -> Vec<String> {
     vec!["**".into()]
 }
+
+/// The built-in default TTL applied when `default_key_ttl_days` is `None`.
+/// Spec §10: 90 days. `Some(0)` opts out (writes entries without `expires=`).
+pub const BUILTIN_DEFAULT_TTL_DAYS: u64 = 90;
 
 /// TOML basic-string escaping — matches the `toml` crate exactly: `\` `"`
 /// `\n` `\t` `\r` get short escapes, other controls (< 0x20) `\u00XX`.
@@ -158,6 +173,15 @@ impl VaultConfig {
         s.push_str(&format!("debounce_ms = {}\n", self.debounce_ms));
         s.push_str(&format!("allow_binary = {}\n", self.allow_binary));
         s.push_str(&fmt_arr("include", &self.include));
+        // `auth_keys` is omitted entirely when empty (matches serde/toml
+        // semantics for a defaulted empty vec) so existing configs round-
+        // trip unchanged.
+        if !self.auth_keys.is_empty() {
+            s.push_str(&fmt_arr("auth_keys", &self.auth_keys));
+        }
+        if let Some(d) = self.default_key_ttl_days {
+            s.push_str(&format!("default_key_ttl_days = {d}\n"));
+        }
         Ok(s)
     }
 
@@ -177,6 +201,8 @@ impl VaultConfig {
         let mut debounce_ms = default_debounce_ms();
         let mut allow_binary = false;
         let mut include: Option<Vec<String>> = None;
+        let mut auth_keys: Vec<String> = Vec::new();
+        let mut default_key_ttl_days: Option<u64> = None;
 
         let bytes = s.replace("\r\n", "\n");
         let mut lines = bytes.lines().peekable();
@@ -213,6 +239,13 @@ impl VaultConfig {
                 }
                 "allow_binary" => allow_binary = rhs == "true",
                 "include" => include = Some(parse_arr(&rhs).map_err(C)?),
+                "auth_keys" => auth_keys = parse_arr(&rhs).map_err(C)?,
+                "default_key_ttl_days" => {
+                    default_key_ttl_days = Some(
+                        rhs.parse()
+                            .map_err(|_| C(format!("bad default_key_ttl_days: {rhs}")))?,
+                    )
+                }
                 _ => {} // unknown key tolerated (forward-compat)
             }
         }
@@ -227,6 +260,8 @@ impl VaultConfig {
             debounce_ms,
             allow_binary,
             include: include.unwrap_or_else(default_include),
+            auth_keys,
+            default_key_ttl_days,
         })
     }
 }
@@ -384,6 +419,8 @@ mod tests {
             debounce_ms,
             allow_binary,
             include: include.iter().map(|s| s.to_string()).collect(),
+            auth_keys: Vec::new(),
+            default_key_ttl_days: None,
         }
     }
 
@@ -440,6 +477,25 @@ mod tests {
             let via_toml: VaultConfig = toml::from_str(&mine).unwrap();
             assert_eq!(via_toml, c, "toml-reads-ours {c:?}");
         }
+    }
+
+    #[test]
+    fn auth_keys_and_default_ttl_round_trip() {
+        let mut c = cfg("id", "n", &[], None, false, false, None, 1000, false, &["**"]);
+        c.auth_keys = vec!["s3kr1t".into(), "rotation-key".into()];
+        c.default_key_ttl_days = Some(30);
+        let out = c.to_toml_string().unwrap();
+        assert!(out.contains("auth_keys = [\n"));
+        assert!(out.contains("default_key_ttl_days = 30"));
+        assert_eq!(VaultConfig::from_toml_str(&out).unwrap(), c);
+        // Real toml crate parses it identically.
+        let via: VaultConfig = toml::from_str(&out).unwrap();
+        assert_eq!(via, c);
+        // Defaults: empty auth_keys is omitted; None ttl is absent.
+        let bare = cfg("id", "n", &[], None, false, false, None, 1000, false, &["**"]);
+        let out = bare.to_toml_string().unwrap();
+        assert!(!out.contains("auth_keys"));
+        assert!(!out.contains("default_key_ttl_days"));
     }
 
     #[test]

@@ -19,7 +19,17 @@ pub trait Engine: Send + Sync + 'static {
     /// Attach an existing CSP vault, or `ctx init` a new one here (§6.2).
     async fn add_local_folder(&self, path: String) -> EngineResult<Vault>;
     /// `ctx clone <url>` then watch — one continuous flow (§6.2).
-    async fn clone_remote(&self, dest: String, url: String) -> EngineResult<Vault>;
+    /// `auth_key` (§10) is an optional pre-shared enrollment secret sent on
+    /// the WebSocket upgrade — needed when the remote listener requires
+    /// auth-key enrollment for new peers. Not persisted: after a successful
+    /// clone the device's pubkey is in the remote's `authorized_keys` and
+    /// the key isn't consulted again.
+    async fn clone_remote(
+        &self,
+        dest: String,
+        url: String,
+        auth_key: Option<String>,
+    ) -> EngineResult<Vault>;
     /// Stop + detach. Never deletes the folder or `.context/` (§6.2).
     async fn remove_vault(&self, id: VaultId) -> EngineResult<()>;
     async fn set_enabled(&self, id: VaultId, on: bool) -> EngineResult<()>;

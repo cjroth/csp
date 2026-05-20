@@ -25,13 +25,121 @@ use crate::vault::Vault;
 pub use crate::wire::Msg;
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio_tungstenite::tungstenite::handshake::server::{
+    ErrorResponse, Request as WsRequest, Response as WsResponse,
+};
+use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 pub use crate::session::Role;
 use crate::session::{Session, SessionVault};
+
+/// Constant-time byte-string equality (defense against timing oracles when
+/// comparing auth keys at the WS upgrade).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
+/// Extract a candidate auth-key token from a WS upgrade request, trying:
+/// 1. `Authorization: Bearer <token>` (preferred — what `ctx` and Node send).
+/// 2. `Sec-WebSocket-Protocol: bearer.<base64-or-raw-token>` (the
+///    browser-compatible escape hatch; the spec lists this as fallback).
+/// 3. `?auth_key=<token>` query parameter (last-resort fallback when even
+///    setting a subprotocol is awkward).
+///
+/// Returns `(token, source_label)` so callers can log what they matched on
+/// without leaking the token itself.
+fn extract_bearer_token(req: &WsRequest) -> Option<(String, &'static str)> {
+    if let Some(v) = req
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+    {
+        // Case-insensitive on the scheme; tolerant of multiple spaces.
+        let mut it = v.splitn(2, char::is_whitespace);
+        let scheme = it.next().unwrap_or("");
+        let token = it.next().unwrap_or("").trim();
+        if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() {
+            return Some((token.to_string(), "authorization-header"));
+        }
+    }
+    if let Some(v) = req
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|h| h.to_str().ok())
+    {
+        for proto in v.split(',').map(str::trim) {
+            if let Some(t) = proto.strip_prefix("bearer.") {
+                if !t.is_empty() {
+                    return Some((t.to_string(), "subprotocol"));
+                }
+            }
+        }
+    }
+    if let Some(q) = req.uri().query() {
+        for pair in q.split('&') {
+            if let Some(t) = pair.strip_prefix("auth_key=") {
+                if !t.is_empty() {
+                    let token = urldecode(t);
+                    return Some((token, "query-string"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Minimal percent-decode for the `?auth_key=` fallback path. Keeps net.rs
+/// dependency-free of a full URL crate — a token is opaque bytes; we only
+/// need `%XX` and `+ → space`.
+fn urldecode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '+' => out.push(' '),
+            '%' => {
+                let h: String = it.by_ref().take(2).collect();
+                if let Ok(b) = u8::from_str_radix(&h, 16) {
+                    out.push(b as char);
+                } else {
+                    out.push('%');
+                    out.push_str(&h);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// 401-with-message response used when the WS upgrade fails auth. The
+/// tungstenite `ErrorResponse` body is `Option<String>` — the literal
+/// reason text is sent so operator logs on the client side are not
+/// opaque.
+fn unauthorized_response(reason: &str) -> ErrorResponse {
+    use tokio_tungstenite::tungstenite::http::Response;
+    let mut resp: ErrorResponse = Response::new(Some(format!(
+        "auth-key check failed: {reason}"
+    )));
+    *resp.status_mut() = StatusCode::UNAUTHORIZED;
+    resp.headers_mut().insert(
+        "www-authenticate",
+        HeaderValue::from_static("Bearer realm=\"csp\""),
+    );
+    resp
+}
 
 /// A running engine node: the shared vault plus an intra-process relay bus
 /// that fans new object closures out to every live session (§6.1 relay).
@@ -83,6 +191,11 @@ impl Node {
         let bound = listener
             .local_addr()
             .map_err(|e| CspError::Protocol(e.to_string()))?;
+        // Snapshot the configured auth-keys at serve-time (§10). Operators
+        // rotating the set need to restart the listener; this keeps the WS
+        // upgrade callback synchronous and free of vault-lock contention.
+        let auth_keys: Arc<Vec<String>> =
+            Arc::new(self.vault.lock().await.config.auth_keys.clone());
         let node = self.clone();
         let handle = tokio::spawn(async move {
             loop {
@@ -90,6 +203,7 @@ impl Node {
                     Ok((stream, _peer)) => {
                         let node = node.clone();
                         let tls = tls.clone();
+                        let keys = auth_keys.clone();
                         tokio::spawn(async move {
                             let r = match tls {
                                 Some((cfg, cert_fp)) => {
@@ -98,14 +212,14 @@ impl Node {
                                         .await
                                     {
                                         Ok(s) => {
-                                            accept_ws(node, s, cert_fp.to_vec()).await
+                                            accept_ws(node, s, cert_fp.to_vec(), keys).await
                                         }
                                         Err(e) => Err(CspError::Protocol(format!(
                                             "tls accept: {e}"
                                         ))),
                                     }
                                 }
-                                None => accept_ws(node, stream, Vec::new()).await,
+                                None => accept_ws(node, stream, Vec::new(), keys).await,
                             };
                             if let Err(e) = r {
                                 tracing::debug!("session ended: {e}");
@@ -124,13 +238,16 @@ impl Node {
 
     /// Connect to a listening peer and keep the session alive, re-running
     /// catch-up on every reconnect (§6.5: "no separate resync path").
-    pub fn connect(&self, url: String) -> tokio::task::JoinHandle<()> {
+    /// `auth_key` (§10) is sent as `Authorization: Bearer …` on the WS
+    /// upgrade — needed only when the listener requires enrollment and
+    /// this node is not yet in its `authorized_keys`.
+    pub fn connect(&self, url: String, auth_key: Option<String>) -> tokio::task::JoinHandle<()> {
         let node = self.clone();
         tokio::spawn(async move {
             tracing::info!("connecting to {url}");
             let mut warned = false;
             loop {
-                match connect_once(&node, &url).await {
+                match connect_once(&node, &url, auth_key.as_deref()).await {
                     Ok(()) => {
                         warned = false;
                     }
@@ -160,8 +277,9 @@ impl Node {
 pub async fn probe(
     url: &str,
     identity: &Identity,
+    auth_key: Option<&str>,
 ) -> CspResult<(String, String, String)> {
-    let (mut t, _cb) = dial(url).await?;
+    let (mut t, _cb) = dial(url, auth_key).await?;
     t.send(&Msg::Hello {
         vault_id: String::new(),
         name: String::new(),
@@ -182,16 +300,74 @@ pub async fn probe(
 }
 
 /// Wrap a freshly accepted server-side stream (plaintext TCP *or* a
-/// completed TLS stream) as a WebSocket session.
-async fn accept_ws<S>(node: Node, stream: S, cb: Vec<u8>) -> CspResult<()>
+/// completed TLS stream) as a WebSocket session, validating the
+/// auth-key on the upgrade request before any protocol logic runs (§10).
+///
+/// `auth_keys` is the listener-snapshotted set of configured pre-shared
+/// keys. Empty → auth-key auth is disabled and the upgrade is unconditional.
+/// Non-empty → the request must present a matching key via
+/// `Authorization: Bearer …`, `Sec-WebSocket-Protocol: bearer.<key>`, or
+/// `?auth_key=<key>`; **invalid → HTTP 401 with no fall-through**; absent →
+/// upgrade proceeds (the connection still has to clear the ed25519 admit
+/// check, which rejects unknown unenrolled peers when keys are configured).
+async fn accept_ws<S>(
+    node: Node,
+    stream: S,
+    cb: Vec<u8>,
+    auth_keys: Arc<Vec<String>>,
+) -> CspResult<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tracing::info!("inbound connection");
-    let ws = tokio_tungstenite::accept_async(stream)
+    let enrolled_flag = Arc::new(AtomicBool::new(false));
+    let enrolled_flag_cb = enrolled_flag.clone();
+    let keys_for_cb = auth_keys.clone();
+    let callback = move |req: &WsRequest, response: WsResponse| -> Result<WsResponse, ErrorResponse> {
+        if keys_for_cb.is_empty() {
+            // Auth-key auth disabled — defer entirely to ed25519 admit.
+            return Ok(response);
+        }
+        match extract_bearer_token(req) {
+            None => {
+                // Header absent → still allow upgrade; the pubkey path can
+                // succeed for an already-enrolled peer. An unknown peer with
+                // no header will be rejected at admit time anyway.
+                tracing::debug!(
+                    "ws upgrade: no auth-key presented; deferring to pubkey admit"
+                );
+                Ok(response)
+            }
+            Some((token, source)) => {
+                let mut matched = false;
+                for k in keys_for_cb.iter() {
+                    if ct_eq(token.as_bytes(), k.as_bytes()) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched {
+                    // Log only a short prefix — never the full token.
+                    let prefix: String = token.chars().take(4).collect();
+                    tracing::info!(
+                        "ws upgrade: auth-key accepted via {source} (key={prefix}…)"
+                    );
+                    enrolled_flag_cb.store(true, Ordering::SeqCst);
+                    Ok(response)
+                } else {
+                    tracing::warn!(
+                        "ws upgrade: auth-key REJECTED via {source} — 401"
+                    );
+                    Err(unauthorized_response("invalid auth key"))
+                }
+            }
+        }
+    };
+    let ws = tokio_tungstenite::accept_hdr_async(stream, callback)
         .await
         .map_err(|e| CspError::Protocol(format!("ws accept: {e}")))?;
-    run_session(node, Transport::from_ws(ws), Role::Listener, cb).await
+    let enrolled = enrolled_flag.load(Ordering::SeqCst);
+    run_session(node, Transport::from_ws(ws), Role::Listener, cb, enrolled).await
 }
 
 /// Normalize a user-supplied peer address into a canonical `ws(s)://host:port`
@@ -238,13 +414,35 @@ fn normalize_url(url: &str) -> String {
     }
 }
 
+/// Build a client `Request` for `url` with an optional
+/// `Authorization: Bearer …` header (§10 auth-key enrollment). Reuses
+/// tungstenite's URL → Request conversion so all the standard headers
+/// (Host, Upgrade, Sec-WebSocket-Key, …) come out right.
+fn build_client_request(
+    url: &str,
+    auth_key: Option<&str>,
+) -> CspResult<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url
+        .into_client_request()
+        .map_err(|e| CspError::Protocol(format!("bad ws url {url}: {e}")))?;
+    if let Some(k) = auth_key {
+        let v = HeaderValue::from_str(&format!("Bearer {k}"))
+            .map_err(|e| CspError::Protocol(format!("auth-key header: {e}")))?;
+        req.headers_mut().insert("authorization", v);
+    }
+    Ok(req)
+}
+
 /// Dial a peer URL, doing the TLS handshake for `wss://` (accepting any
 /// server cert — trust is the application-layer ed25519 handshake, §10).
 /// Returns the transport and the **channel binding**: the SHA-256 of the
-/// server's TLS cert (empty for plaintext `ws://`).
-async fn dial(url: &str) -> CspResult<(Transport, Vec<u8>)> {
+/// server's TLS cert (empty for plaintext `ws://`). When `auth_key` is set,
+/// it is sent as `Authorization: Bearer …` on the WS upgrade (§10).
+async fn dial(url: &str, auth_key: Option<&str>) -> CspResult<(Transport, Vec<u8>)> {
     let url = normalize_url(url);
     let url = url.as_str();
+    let req = build_client_request(url, auth_key)?;
     if let Some(rest) = url.strip_prefix("wss://") {
         let authority = rest.split('/').next().unwrap_or(rest);
         let host = authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority);
@@ -265,21 +463,33 @@ async fn dial(url: &str) -> CspResult<(Transport, Vec<u8>)> {
                 .map(|c| crate::tls::cert_fingerprint(c.as_ref()).to_vec())
                 .unwrap_or_default()
         };
-        let (ws, _r) = tokio_tungstenite::client_async(url, tls)
+        let (ws, _r) = tokio_tungstenite::client_async(req, tls)
             .await
             .map_err(|e| CspError::Protocol(format!("wss connect: {e}")))?;
         Ok((Transport::from_ws(ws), cb))
     } else {
-        let (ws, _r) = tokio_tungstenite::connect_async(url)
+        // Plaintext: open the TCP stream ourselves so we can pass the
+        // header-bearing request through `client_async` (rather than the
+        // URL-only `connect_async`).
+        let rest = url
+            .strip_prefix("ws://")
+            .ok_or_else(|| CspError::Protocol(format!("unsupported scheme: {url}")))?;
+        let authority = rest.split('/').next().unwrap_or(rest);
+        let tcp = TcpStream::connect(authority)
+            .await
+            .map_err(|e| CspError::Protocol(format!("tcp connect {authority}: {e}")))?;
+        let (ws, _r) = tokio_tungstenite::client_async(req, tcp)
             .await
             .map_err(|e| CspError::Protocol(format!("ws connect: {e}")))?;
         Ok((Transport::from_ws(ws), Vec::new()))
     }
 }
 
-async fn connect_once(node: &Node, url: &str) -> CspResult<()> {
-    let (transport, cb) = dial(url).await?;
-    run_session(node.clone(), transport, Role::Connector, cb).await
+async fn connect_once(node: &Node, url: &str, auth_key: Option<&str>) -> CspResult<()> {
+    let (transport, cb) = dial(url, auth_key).await?;
+    // Connector role: enrollment_authorized is meaningless (the listener
+    // owns the admission decision). Always `false` here.
+    run_session(node.clone(), transport, Role::Connector, cb, false).await
 }
 
 /// A uniform message channel. Both WebSocket and the in-process duplex
@@ -390,8 +600,8 @@ impl SessionVault for Vault {
     fn integrate(&mut self, raws: &[Vec<u8>]) -> CspResult<usize> {
         Vault::integrate(self, raws)
     }
-    fn admit_peer(&mut self, peer_ssh: &str) -> CspResult<bool> {
-        Vault::admit_peer_tofu(self, peer_ssh)
+    fn admit_peer(&mut self, peer_ssh: &str, enrollment_authorized: bool) -> CspResult<bool> {
+        Vault::admit_peer(self, peer_ssh, enrollment_authorized)
     }
 }
 
@@ -404,8 +614,12 @@ async fn run_session(
     mut t: Transport,
     role: Role,
     channel_binding: Vec<u8>,
+    enrollment_authorized: bool,
 ) -> CspResult<()> {
     let mut session = Session::new(role, channel_binding, rand_nonce());
+    // Listener-only: thread the WS-upgrade auth-key result into the session
+    // so `on_auth` can pass it to `Vault::admit_peer` (§10 enrollment path).
+    session.set_enrollment_authorized(enrollment_authorized);
 
     // Both sides send `Hello` immediately (§10).
     {
@@ -556,10 +770,10 @@ mod tests {
         let na2 = na.clone();
         let nb2 = nb.clone();
         tokio::spawn(async move {
-            let _ = run_session(na2, t1, Role::Connector, Vec::new()).await;
+            let _ = run_session(na2, t1, Role::Connector, Vec::new(), false).await;
         });
         tokio::spawn(async move {
-            let _ = run_session(nb2, t2, Role::Listener, Vec::new()).await;
+            let _ = run_session(nb2, t2, Role::Listener, Vec::new(), false).await;
         });
 
         for _ in 0..50 {
@@ -609,10 +823,10 @@ mod tests {
         // Connector "saw" the proxy's TLS cert; listener is `--no-tls`
         // (empty advertised binding).
         tokio::spawn(async move {
-            let _ = run_session(na2, t1, Role::Connector, vec![0xAB; 32]).await;
+            let _ = run_session(na2, t1, Role::Connector, vec![0xAB; 32], false).await;
         });
         tokio::spawn(async move {
-            let _ = run_session(nb2, t2, Role::Listener, Vec::new()).await;
+            let _ = run_session(nb2, t2, Role::Listener, Vec::new(), false).await;
         });
 
         for _ in 0..50 {
@@ -653,10 +867,10 @@ mod tests {
         let nb2 = nb.clone();
         // Different cert fingerprints on each side (the MITM case).
         tokio::spawn(async move {
-            let _ = run_session(na2, t1, Role::Connector, vec![9u8; 32]).await;
+            let _ = run_session(na2, t1, Role::Connector, vec![9u8; 32], false).await;
         });
         tokio::spawn(async move {
-            let _ = run_session(nb2, t2, Role::Listener, vec![8u8; 32]).await;
+            let _ = run_session(nb2, t2, Role::Listener, vec![8u8; 32], false).await;
         });
 
         for _ in 0..20 {

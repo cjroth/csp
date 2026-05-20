@@ -28,11 +28,16 @@ export function CloneRemoteDialog({
   const { cloneRemote } = useEngine();
   const [dest, setDest] = useState("");
   const [url, setUrl] = useState("");
+  // §10 auth-key — one-shot enrollment secret. Only required when the remote
+  // listener was started with `CTX_AUTH_KEY`. Kept in memory only; once the
+  // clone succeeds the device's pubkey is in the peer's authorized_keys.
+  const [authKey, setAuthKey] = useState("");
   const [busy, setBusy] = useState(false);
 
   function reset() {
     setDest("");
     setUrl("");
+    setAuthKey("");
   }
 
   async function browse() {
@@ -45,7 +50,12 @@ export function CloneRemoteDialog({
     if (!dest.trim() || !url.trim()) return;
     setBusy(true);
     try {
-      const v = await cloneRemote(dest.trim(), url.trim());
+      const trimmedKey = authKey.trim();
+      const v = await cloneRemote(
+        dest.trim(),
+        url.trim(),
+        trimmedKey.length > 0 ? trimmedKey : null,
+      );
       toast.success(`Cloned “${v.displayName}” — now watching`);
       reset();
       onOpenChange(false);
@@ -101,6 +111,21 @@ export function CloneRemoteDialog({
                 Browse
               </Button>
             </div>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="clone-auth-key">Auth key (optional)</Label>
+            <Input
+              id="clone-auth-key"
+              type="password"
+              autoComplete="off"
+              value={authKey}
+              placeholder="paste only if the peer requires enrollment"
+              onChange={(e) => setAuthKey(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              Only needed when the peer was started with <code>CTX_AUTH_KEY</code> and you
+              haven’t enrolled this device yet. Used once at clone time; not saved.
+            </p>
           </div>
         </div>
 

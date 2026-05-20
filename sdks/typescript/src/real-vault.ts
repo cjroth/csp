@@ -21,6 +21,16 @@ function filesToJson(files: Map<string, string>): string {
   return JSON.stringify(obj);
 }
 
+/** Append `?auth_key=<urlencoded>` to a peer URL when an auth key is set
+ * (CSP §10 enrollment, browser-compatible fallback path). The standard
+ * `WebSocket` constructor can't set arbitrary headers, so the SDK rides
+ * the query-string form the server also accepts. */
+function withAuthKey(url: string, authKey: string | undefined): string {
+  if (!authKey) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}auth_key=${encodeURIComponent(authKey)}`;
+}
+
 function uuidv4(): string {
   const b = new Uint8Array(16);
   crypto.getRandomValues(b);
@@ -28,6 +38,23 @@ function uuidv4(): string {
   b[8] = ((b[8] as number) & 0x3f) | 0x80;
   const h = Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+/** Decode an OpenSSH `ssh-ed25519 <b64> [comment]` line to the trailing
+ * 32-byte raw key. Returns an empty Uint8Array on a missing/garbled line so
+ * the caller can pass an empty pin without throwing. */
+function sshPubkeyToBytes(ssh: string): Uint8Array {
+  const parts = ssh.trim().split(/\s+/);
+  if (parts.length < 2) return new Uint8Array();
+  const blob = parts[1] as string;
+  try {
+    const bin = atob(blob);
+    const raw = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) raw[i] = bin.charCodeAt(i);
+    return raw.length >= 32 ? raw.slice(raw.length - 32) : new Uint8Array();
+  } catch {
+    return new Uint8Array();
+  }
 }
 
 interface MatOp {
@@ -93,7 +120,10 @@ export class RealVault implements Vault {
     const seed = await seedOf(opts);
     const transport = opts.transport ?? defaultTransport();
     const probeId = EngineCtor.create(seed, 'probe', '');
-    const conn = await transport.connect(opts.peerUrl);
+    // §10: if the caller passed an auth-key for enrollment, the probe MUST
+    // also present it — a listener with `CTX_AUTH_KEY` set rejects the WS
+    // upgrade outright, so even the read-only probe needs the secret.
+    const conn = await transport.connect(withAuthKey(opts.peerUrl, opts.authKey));
     let vaultId = '';
     let name = '';
     let serverSsh = '';
@@ -260,7 +290,10 @@ export class RealVault implements Vault {
   private async runSession(url: string, onEstablished: () => void): Promise<void> {
     const transport = this.opts.transport ?? defaultTransport();
     this.emit({ kind: 'connecting', url });
-    const conn = await transport.connect(url);
+    // §10: post-clone reconnects ride the pubkey path; the auth-key is
+    // still appended so a listener that hasn't yet enrolled this device
+    // (e.g. transient `authorized_keys` loss) can re-enroll on contact.
+    const conn = await transport.connect(withAuthKey(url, this.opts.authKey));
     this.conn = conn;
     try {
       const cb = conn.channelBinding() ?? new Uint8Array();
@@ -270,12 +303,17 @@ export class RealVault implements Vault {
           out: number[][];
           integrated: number;
           established: boolean;
+          peer_ssh?: string;
         };
         for (const m of step.out) await conn.send(Uint8Array.from(m));
         if (step.established && !this.connected) {
           this.connected = true;
           onEstablished();
-          this.emit({ kind: 'connected', peer_pubkey: new Uint8Array() });
+          // The engine carries the verified peer SSH key out of the handshake
+          // (CSP §10). Pass it through as raw bytes so the host can render /
+          // pin a stable peer identity instead of an empty placeholder.
+          const peerBytes = sshPubkeyToBytes(step.peer_ssh ?? '');
+          this.emit({ kind: 'connected', peer_pubkey: peerBytes });
         }
         if (step.integrated > 0) {
           await this.materializeFromMain();

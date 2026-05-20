@@ -658,16 +658,75 @@ thin-node retention horizon are explicitly deferred, not a v1 concern.
   so writer admission converges to managing one set per relay.)
 - **Bootstrap: trust-on-first-use, bounded to the empty-set window.** When a
   listening node has **no** local authorized set yet (genuine first-peer
-  bootstrap), it MAY trust-on-first-use: the first connecting key is recorded
-  into `.context/authorized_keys`, and from then on the local authorized set is
-  authoritative. TOFU applies *only* while the set is empty/absent — never as
-  an ongoing admission policy. `CTX_AUTHORIZED_KEYS` (or `ctx authorize` /
-  seeding at `ctx init`) may pre-populate the set so the TOFU window never
-  opens. A `--no-tofu` switch (and config equivalent) disables TOFU entirely
-  for hardened or internet-exposed deployments. **Honest caveat:** an
-  internet-reachable listener with an empty authorized set and TOFU enabled
-  trusts whichever key connects first — operators exposing a fresh listener
-  publicly must pre-seed keys or disable TOFU.
+  bootstrap) AND no auth key is configured (see below), it MAY trust-on-first-use:
+  the first connecting key is recorded into `.context/authorized_keys`, and
+  from then on the local authorized set is authoritative. TOFU applies *only*
+  while the set is empty/absent — never as an ongoing admission policy.
+  `CTX_AUTHORIZED_KEYS` (or `ctx authorize` / seeding at `ctx init`) may
+  pre-populate the set so the TOFU window never opens. A `--no-tofu` switch
+  (and config equivalent) disables TOFU entirely for hardened or
+  internet-exposed deployments. **Auth keys (below) implicitly disable
+  TOFU**: when any `CTX_AUTH_KEY` is set, enrollment is the bootstrap path
+  and TOFU is off even on an empty authorized set. **Honest caveat:** an
+  internet-reachable listener with an empty authorized set, no auth key, and
+  TOFU enabled trusts whichever key connects first — operators exposing a
+  fresh listener publicly must pre-seed keys, configure an auth key, or
+  disable TOFU.
+- **Bootstrap: auth-key enrollment (the recommended path for fresh
+  deployments).** A listener MAY also be configured with one or more
+  **auth keys** — shared secrets that authorize a *new* peer to enroll
+  itself into the authorized set. Configured via `CTX_AUTH_KEY` (or
+  `--auth-key`; comma-separated for multiple, supports rotation). On
+  connect the client presents the secret in the WebSocket upgrade —
+  preferred form: `Authorization: Bearer <key>`; fallback for clients that
+  cannot set headers (e.g. browser `WebSocket`): the `?auth_key=<key>` query
+  parameter or the `bearer.<key>` WebSocket subprotocol. On match the
+  upgrade succeeds and, after the mutual ed25519 handshake completes, the
+  listener writes the client's public key into `.context/authorized_keys`
+  (with a default expiry — see below) and proceeds normally. **From the
+  next connection onward the client is a plain authorized peer** — the
+  auth key is not used again unless the entry is removed or expires. A
+  mismatching key returns HTTP 401 at the WebSocket upgrade with no
+  fall-through to authorized_keys, so operator misconfiguration fails
+  loudly (a stale rotated key never silently "still works because pubkey
+  auth would have"). Absent the header entirely the upgrade proceeds
+  to the handshake — already-enrolled peers continue to connect without
+  the auth key. The auth key is **a bootstrap secret, not an API key**:
+  rotating or removing it stops *future* enrollments but never severs
+  already-enrolled peers (revoke a specific peer by removing its pubkey
+  line from `authorized_keys`). This separation gives a compromised
+  shared secret a bounded blast radius — only the new pubkeys it could
+  enroll while still valid.
+- **Per-key expiry in `authorized_keys`.** Each entry MAY carry an
+  expiration token in its comment field — extending standard
+  `ssh-ed25519 <base64> <comment>` lines so existing OpenSSH tooling still
+  reads them:
+  - `expires=YYYY-MM-DD` — absolute expiry. After this UTC date the
+    listener refuses admission via this entry (the line is left in place
+    for audit but skipped at admit time).
+  - `expires=never` — explicit opt-out, never expires. Must be set
+    deliberately; never rewritten by listen-start migration.
+  - *(no token)* — interpreted as "unset, please apply default" by
+    listen-start migration; until migrated, treated as non-expiring at
+    admit time (so a manually-pasted line is never silently rejected).
+
+  At startup, when a listener comes up (e.g. `ctx watch --listen`), it
+  scans `.context/authorized_keys` and **rewrites any entry without an
+  expiration token** to include `expires=<today + CTX_DEFAULT_KEY_TTL>`
+  (default 90 days). `expires=never` entries and entries that already
+  have an `expires=` token are left untouched. The migration is atomic
+  (temp file + rename), idempotent, and logged with a one-line summary.
+  Auth-key enrollment writes entries with `expires=<today + default>`
+  by default. An expired entry re-enrolling via a valid auth key
+  refreshes its `expires=` to a fresh default-TTL window — expired peers
+  re-enroll through the front door. The default TTL is configurable via
+  `CTX_DEFAULT_KEY_TTL` (`90d`, `1y`, or `never`) and applies to both
+  enrollment and migration. Per-entry TTL overrides at the CLI:
+  `ctx authorize <pubkey> --ttl 30d|never`, `ctx auth extend <peer> 30d`,
+  `ctx auth list` to inspect. Manual edits in the file work — the parser
+  also accepts `ttl=NNd added=YYYY-MM-DD` as an equivalent input form,
+  normalizing to absolute `expires=` on the next write. Clock skew is
+  irrelevant at the granularity of TTLs measured in days.
 - **Mutual authentication.** The handshake requires each side to sign, with its
   ed25519 key, a transcript covering both nonces and a binding to the
   underlying transport, so a captured handshake cannot be replayed or relayed

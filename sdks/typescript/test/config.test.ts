@@ -65,6 +65,8 @@ describe('serializeConfig (wasm-backed)', () => {
       debounce_ms: 250,
       allow_binary: false,
       include: ['**'],
+      auth_keys: [],
+      default_key_ttl_days: null,
     };
     expect(parseConfig(serializeConfig(cfg))).toEqual(cfg);
   });

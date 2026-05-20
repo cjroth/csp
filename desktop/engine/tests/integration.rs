@@ -181,7 +181,10 @@ async fn two_node_real_sync_and_scope() {
         .unwrap();
 
     let fb = tmp.path().join("B-vault");
-    let vb = b.clone_remote(fb.to_string_lossy().into(), url).await.unwrap();
+    let vb = b
+        .clone_remote(fb.to_string_lossy().into(), url, None)
+        .await
+        .unwrap();
 
     // A → B: an edit on A appears on B.
     std::fs::write(fa.join("note.md"), "hello from A").unwrap();

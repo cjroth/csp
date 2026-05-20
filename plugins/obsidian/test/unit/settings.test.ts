@@ -14,6 +14,7 @@ import {
   ConfigStore,
   type CspSettings,
   DEFAULT_SETTINGS,
+  normalizePeerUrl,
   parseIgnoreGlobs,
 } from '../../src/settings.js';
 import { FakeDataAdapter } from '../mocks/obsidian.js';
@@ -56,7 +57,6 @@ describe('ConfigStore.load — defaults', () => {
         peerUrl: 'wss://sidecar:9',
         peerPubkey: 'ssh-ed25519 AAAApin',
         syncEnabled: true,
-        autoConnectOnStart: true,
         onboarded: true,
         ignoreGlobs: ['Drafts/**'],
         identityPath: '.context/id_ed25519',
@@ -67,11 +67,26 @@ describe('ConfigStore.load — defaults', () => {
       peerUrl: 'wss://sidecar:9',
       peerPubkey: 'ssh-ed25519 AAAApin',
       syncEnabled: true,
-      autoConnectOnStart: true,
       onboarded: true,
       ignoreGlobs: ['Drafts/**'],
       identityPath: '.context/id_ed25519',
+      authKey: '',
     });
+  });
+
+  test('a stale `autoConnectOnStart` from an older sidecar is ignored', async () => {
+    const fs = new FakeDataAdapter();
+    await fs.mkdir('.context');
+    await fs.write(
+      '.context/obsidian.json',
+      JSON.stringify({ autoConnectOnStart: false, syncEnabled: true }),
+    );
+    const s = await new ConfigStore(fs).load();
+    expect(s).toEqual({ ...DEFAULT_SETTINGS, syncEnabled: true });
+    // And writing back doesn't reintroduce the dropped field.
+    await new ConfigStore(fs).save(s);
+    const side = JSON.parse(await fs.read('.context/obsidian.json'));
+    expect('autoConnectOnStart' in side).toBe(false);
   });
 });
 
@@ -156,10 +171,10 @@ describe('plugin-only knobs persist/restore via the sidecar', () => {
       peerUrl: 'wss://peer:7777',
       peerPubkey: 'ssh-ed25519 AAAApin',
       syncEnabled: true,
-      autoConnectOnStart: true,
       onboarded: true,
       ignoreGlobs: ['Drafts/**'],
       identityPath: '.context/id_ed25519',
+      authKey: 'enrollment-secret',
     };
     await store.save(written);
 
@@ -226,6 +241,42 @@ describe('ConfigStore — no canonical config minted on save', () => {
     await fs.mkdir('.context');
     await fs.write('.context/config', cliConfigText());
     expect(await new ConfigStore(fs).exists()).toBe(true);
+  });
+});
+
+describe('normalizePeerUrl', () => {
+  test('bare host → wss://host:443', () => {
+    expect(normalizePeerUrl('sync.example.com')).toBe('wss://sync.example.com:443');
+  });
+  test('bare host:port preserves the port and assumes wss', () => {
+    expect(normalizePeerUrl('sync.example.com:7777')).toBe('wss://sync.example.com:7777');
+  });
+  test('wss:// without port fills 443; with port is preserved', () => {
+    expect(normalizePeerUrl('wss://sync.example.com')).toBe('wss://sync.example.com:443');
+    expect(normalizePeerUrl('wss://sync.example.com:7777')).toBe('wss://sync.example.com:7777');
+  });
+  test('ws:// without port fills 80', () => {
+    expect(normalizePeerUrl('ws://localhost')).toBe('ws://localhost:80');
+    expect(normalizePeerUrl('ws://localhost:9999')).toBe('ws://localhost:9999');
+  });
+  test('https/http schemes are accepted as wss/ws aliases', () => {
+    expect(normalizePeerUrl('https://node.example')).toBe('wss://node.example:443');
+    expect(normalizePeerUrl('http://node.example')).toBe('ws://node.example:80');
+  });
+  test('idempotent — re-normalizing returns the same string', () => {
+    const n = normalizePeerUrl('sync.example.com');
+    expect(normalizePeerUrl(n)).toBe(n);
+  });
+  test('trims surrounding whitespace and keeps a path segment', () => {
+    expect(normalizePeerUrl('  sync.example.com/path  ')).toBe('wss://sync.example.com:443/path');
+  });
+  test('IPv6 literals — port detection respects the bracketed form', () => {
+    expect(normalizePeerUrl('wss://[::1]')).toBe('wss://[::1]:443');
+    expect(normalizePeerUrl('wss://[::1]:7777')).toBe('wss://[::1]:7777');
+  });
+  test('empty / whitespace input → empty string (offline-only)', () => {
+    expect(normalizePeerUrl('')).toBe('');
+    expect(normalizePeerUrl('   ')).toBe('');
   });
 });
 

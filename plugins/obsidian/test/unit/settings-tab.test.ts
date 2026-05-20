@@ -84,6 +84,7 @@ function makeController(over: Record<string, unknown> = {}) {
 function makePlugin(over: Record<string, unknown> = {}) {
   const runSetupCalls: RunSetupCall[] = [];
   const saved: number[] = [];
+  const resets: number[] = [];
   const plugin = {
     settings: { ...DEFAULT_SETTINGS },
     onboardingError: null as string | null,
@@ -104,8 +105,12 @@ function makePlugin(over: Record<string, unknown> = {}) {
     async saveSettings() {
       saved.push(1);
     },
+    async resetLocalState() {
+      resets.push(1);
+    },
     runSetupCalls,
     saved,
+    resets,
     ...over,
   };
   return plugin;
@@ -119,10 +124,10 @@ function makeTab(plugin: unknown) {
 beforeEach(() => __resetObsidian());
 
 describe('setup wizard (unconfigured)', () => {
-  test('defaults to connect mode with a required Peer URL field', () => {
+  test('defaults to connect mode with a peer URL field', () => {
     const tab = makeTab(makePlugin());
     tab.display();
-    expect(__obsidian.hasText('This vault is not set up yet')).toBe(true);
+    expect(__obsidian.hasText("isn't syncing yet")).toBe(true);
     const mode = __obsidian.setting('Setup mode');
     const dd = mode?.components.find((c) => c.kind === 'dropdown');
     expect(dd?.options).toEqual([
@@ -130,16 +135,16 @@ describe('setup wizard (unconfigured)', () => {
       ['create', 'Create a new local vault'],
     ]);
     expect(dd?.selected).toBe('connect');
-    expect(__obsidian.setting('Peer URL')?.desc).toContain('Required');
+    expect(__obsidian.setting('Peer URL')?.desc).toMatch(/bare domain assumes/);
   });
 
-  test('switching to create mode shows the no-converge warning + optional URL', () => {
+  test('switching to create mode shows the no-sync warning + optional URL', () => {
     const tab = makeTab(makePlugin());
     tab.display();
     const dd = __obsidian.setting('Setup mode')?.components.find((c) => c.kind === 'dropdown');
     dd?.onChangeSelect?.('create'); // re-renders synchronously
-    expect(__obsidian.hasText('will NOT converge')).toBe(true);
-    expect(__obsidian.setting('Peer URL')?.desc).toContain('Optional now');
+    expect(__obsidian.hasText("won't sync")).toBe(true);
+    expect(__obsidian.setting('Peer URL')?.desc).toContain('Optional');
   });
 
   test('connect submit with an empty Peer URL is rejected before runSetup', async () => {
@@ -162,6 +167,17 @@ describe('setup wizard (unconfigured)', () => {
     await submit?.onClick?.();
     expect(plugin.runSetupCalls).toEqual([{ mode: 'connect', peerUrl: 'wss://node:7777' }]);
     expect(Notice.log).toContain('Context: setup complete.');
+  });
+
+  test('a bare-domain Peer URL is accepted as-is (plugin normalizes during setup)', async () => {
+    const plugin = makePlugin();
+    const tab = makeTab(plugin);
+    tab.display();
+    const url = __obsidian.setting('Peer URL')?.components.find((c) => c.kind === 'text');
+    url?.onChangeText?.('sync.example.com');
+    const submit = __obsidian.button('Set up Context');
+    await submit?.onClick?.();
+    expect(plugin.runSetupCalls).toEqual([{ mode: 'connect', peerUrl: 'sync.example.com' }]);
   });
 
   test('a runSetup failure surfaces the error notice', async () => {
@@ -231,77 +247,69 @@ describe('configured view', () => {
     expect(clipboardWrites).toContain('ssh-ed25519 AAAAFAKEKEY device');
   });
 
-  test('Peer URL / Auto-connect / Ignore patterns persist via saveSettings', async () => {
+  test('Peer URL / Ignore patterns persist via saveSettings', async () => {
     const plugin = configured();
     makeTab(plugin).display();
     const peer = __obsidian.setting('Peer URL')?.components.find((c) => c.kind === 'text');
     await peer?.onChangeText?.('  wss://edited:7777  ');
     expect(plugin.settings.peerUrl).toBe('wss://edited:7777');
 
-    const auto = __obsidian
-      .setting('Auto-connect on start')
-      ?.components.find((c) => c.kind === 'toggle');
-    await auto?.onChangeToggle?.(true);
-    expect(plugin.settings.autoConnectOnStart).toBe(true);
-
     const ig = __obsidian.setting('Ignore patterns')?.components.find((c) => c.kind === 'textarea');
     await ig?.onChangeText?.('Drafts/**\n# c\n\n*.tmp.md');
     expect(plugin.settings.ignoreGlobs).toEqual(['Drafts/**', '*.tmp.md']);
-    expect(plugin.saved.length).toBeGreaterThanOrEqual(3);
+    expect(plugin.saved.length).toBeGreaterThanOrEqual(2);
   });
 
-  test('Pinned peer key shows (none yet) and Clear pin resets it', async () => {
+  test('a bare-domain Peer URL is normalized to wss://host:443 on save', async () => {
+    const plugin = configured();
+    makeTab(plugin).display();
+    const peer = __obsidian.setting('Peer URL')?.components.find((c) => c.kind === 'text');
+    await peer?.onChangeText?.('sync.example.com');
+    expect(plugin.settings.peerUrl).toBe('wss://sync.example.com:443');
+  });
+
+  test('there is no Auto-connect on start setting', () => {
+    const plugin = configured();
+    makeTab(plugin).display();
+    expect(__obsidian.setting('Auto-connect on start')).toBeUndefined();
+  });
+
+  test('Pinned peer key shows (none yet) when unset, the actual pin once set, and is read-only', () => {
     const plugin = configured();
     plugin.settings.peerPubkey = '';
     makeTab(plugin).display();
-    expect(__obsidian.setting('Pinned peer key')?.components[0]?.value).toBe('(none yet)');
+    const empty = __obsidian.setting('Pinned peer key');
+    expect(empty?.components[0]?.value).toBe('(none yet)');
+    // No clear-pin button — there is no way to unset it from the UI.
+    expect(empty?.components.some((c) => c.kind === 'button')).toBe(false);
+
     plugin.settings.peerPubkey = 'ssh-ed25519 PINNED';
     __resetObsidian();
     makeTab(plugin).display();
     expect(__obsidian.setting('Pinned peer key')?.components[0]?.value).toBe('ssh-ed25519 PINNED');
-    await __obsidian.button('Clear pin')?.onClick?.();
-    expect(plugin.settings.peerPubkey).toBe('');
+    expect(__obsidian.button('Clear pin')).toBeUndefined();
   });
 
-  // `this.display()` at the end of a handler re-subscribes (on/unsub
-  // churn); assert only the meaningful controller actions.
-  const acts = (c: ReturnType<typeof makeController>) =>
-    c.calls.filter((x) => x !== 'on' && x !== 'unsub');
-
-  test('Connection button text + action follow the controller state', async () => {
-    // idle → "Connect" → stop + start({connect:true})
-    let plugin = configured({ state: 'idle' });
+  test('there is no Connection / Resync now setting — the sync toggle covers it', () => {
+    const plugin = configured({ state: 'connected' });
     makeTab(plugin).display();
-    expect(__obsidian.button(/^Connect$/)).toBeDefined();
-    await __obsidian.button(/^Connect$/)?.onClick?.();
-    expect(acts(plugin.controller!)).toEqual(['stop', 'start:true']);
-
-    // connected → "Disconnect" → stop + prepare
-    plugin = configured({ state: 'connected' });
-    __resetObsidian();
-    makeTab(plugin).display();
-    expect(__obsidian.button('Disconnect')).toBeDefined();
-    await __obsidian.button('Disconnect')?.onClick?.();
-    expect(acts(plugin.controller!)).toEqual(['stop', 'prepare']);
-
-    // reconnecting → "Reconnect"
-    plugin = configured({ state: 'reconnecting' });
-    __resetObsidian();
-    makeTab(plugin).display();
-    expect(__obsidian.button('Reconnect')).toBeDefined();
-
-    // Resync now button
-    await __obsidian.button('Resync now')?.onClick?.();
-    expect(plugin.controller?.calls).toContain('resyncNow');
+    expect(__obsidian.setting('Connection')).toBeUndefined();
+    expect(__obsidian.button(/^Disconnect$/)).toBeUndefined();
+    expect(__obsidian.button(/^Reconnect$/)).toBeUndefined();
+    expect(__obsidian.button('Resync now')).toBeUndefined();
   });
 
-  test('Reset local state clears the pin and notifies', async () => {
+  test('Enable sync description reflects the current controller state', () => {
+    const plugin = configured({ state: 'connected' });
+    makeTab(plugin).display();
+    expect(__obsidian.setting('Enable sync')?.desc).toContain('connected');
+  });
+
+  test('Reset local state calls plugin.resetLocalState and notifies', async () => {
     const plugin = configured();
-    plugin.settings.peerPubkey = 'ssh-ed25519 PINNED';
     makeTab(plugin).display();
     await __obsidian.button('Reset')?.onClick?.();
-    expect(plugin.controller?.calls).toContain('resetLocalState');
-    expect(plugin.settings.peerPubkey).toBe('');
+    expect(plugin.resets.length).toBe(1);
     expect(Notice.log).toContain('Context: local state cleared.');
   });
 
@@ -313,7 +321,9 @@ describe('configured view', () => {
     expect(plugin.controller?.calls.some((c) => /^createSnapshot:snapshot-/.test(c))).toBe(true);
 
     // With a snapshot present → a Restore row.
-    plugin.controller!.snapshots = [{ name: 'snap-A', created_at_ms: Date.now(), frontier: [] }];
+    const ctl = plugin.controller;
+    if (!ctl) throw new Error('controller was unexpectedly null');
+    ctl.snapshots = [{ name: 'snap-A', created_at_ms: Date.now(), frontier: [] }];
     __resetObsidian();
     makeTab(plugin).display();
     const snapRow = __obsidian.setting('snap-A');
@@ -342,6 +352,6 @@ describe('configured view', () => {
     plugin.controller = null;
     makeTab(plugin).display();
     expect(__obsidian.setting('Device public key')?.components[0]?.value).toBe('(loading…)');
-    expect(__obsidian.setting('Connection')?.desc).toContain('idle');
+    expect(__obsidian.setting('Enable sync')?.desc).toContain('idle');
   });
 });

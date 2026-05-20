@@ -13,6 +13,7 @@
 // The vault-config model + TOML (de)serialization is always-on / wasm-safe
 // (a plugin shares the exact `.context/config` bytes with `ctx`, §9.1); only
 // its on-disk file I/O is `cfg`-gated inside the module.
+pub mod authkeys;
 pub mod config;
 // The sans-IO, wasm-safe full engine — the *same* protocol/merge/fold core
 // as native `vault`, but files-in / materialize-ops-out (no fs, no sockets).

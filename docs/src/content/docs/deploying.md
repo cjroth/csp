@@ -35,6 +35,8 @@ config), so the headless hub needs no custom command:
 | `CTX_VAULT_NAME` | `vault` | Name written on first init; clients' default `clone` dir. |
 | `CTX_NO_TLS` | unset | `1` → bind plain `ws://` (behind an edge that terminates TLS). |
 | `CTX_AUTHORIZED_KEYS` | unset | `ssh-ed25519 …` lines (or a file path) merged on every start. |
+| `CTX_AUTH_KEY` | unset | Pre-shared enrollment secret (§10). Comma-separated for rotation. When set, TOFU is implicitly disabled and a new peer must present this on the WS upgrade to get its pubkey added to `authorized_keys` (with the default TTL). |
+| `CTX_DEFAULT_KEY_TTL` | `90d` | Default expiry written into each new `authorized_keys` entry (auth-key enrollment, manual `ctx authorize`, listen-start migration). Accepts `90d` / `1y` / `12w` / a bare integer (days) / `never`. |
 | `CTX_LOG` | `info` | Log filter. |
 
 `CTX_NO_TLS=1` is the right setting behind a managed proxy (Fly, Railway,
@@ -102,8 +104,20 @@ ctx clone wss://your-app.up.railway.app --watch
 CSP clones are trust-on-first-use: the first `ctx clone` pins whatever hub
 identity answers, and every later connection must match it — so a deployed
 hub is trusted automatically as long as its identity is stable (which the
-on-volume `CTX_IDENTITY` guarantees). To verify the fingerprint out of band
-before first clone, read the hub's public key from the running container:
+on-volume `CTX_IDENTITY` guarantees).
+
+For **public-internet listeners**, prefer the **auth-key enrollment** path
+over leaving TOFU on: set `CTX_AUTH_KEY=<some-secret>` and tell each new
+peer to clone with `ctx clone wss://your-host --auth-key <secret>`. On a
+successful clone the device's pubkey is appended to `authorized_keys` (with
+a 90-day expiry by default — see `CTX_DEFAULT_KEY_TTL`), and the auth key
+isn't needed on subsequent reconnects. Rotate the secret freely: enrolled
+peers keep working; only *new* enrollments need the new value. Revoke a
+specific peer by removing its line with `ctx revoke <pubkey>`. Inspect
+remaining lifetimes with `ctx auth list`.
+
+To verify the fingerprint out of band before first clone, read the hub's
+public key from the running container:
 
 ```sh
 # Fly

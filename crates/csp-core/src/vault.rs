@@ -6,6 +6,8 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use crate::authkeys::{self, Expiry, KeyEntry};
+use crate::config::{VaultConfig, BUILTIN_DEFAULT_TTL_DAYS};
 use crate::error::{CspError, CspResult};
 use crate::fold::{
     compute_main, frontier, genesis, parse_primitive_meta, reachable, verify_fold_commit,
@@ -17,9 +19,10 @@ use crate::order::NodeId;
 use crate::repo::Repo;
 use crate::scope::{canonicalize_keeps, Scope, CONTEXTIGNORE, CONTEXT_DIR};
 use crate::state::{EngineState, Snapshot};
-use crate::config::VaultConfig;
 use crate::store::Store;
+use fs2::FileExt;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -107,6 +110,8 @@ impl Vault {
             debounce_ms: 1000,
             allow_binary: false,
             include: vec!["**".into()],
+            auth_keys: Vec::new(),
+            default_key_ttl_days: None,
         };
         config.save(&context)?;
         let state = EngineState {
@@ -457,73 +462,276 @@ impl Vault {
         self.context.join("authorized_keys")
     }
 
+    fn authorized_keys_lock_path(&self) -> PathBuf {
+        self.context.join("authorized_keys.lock")
+    }
+
+    /// The configured default TTL for new `authorized_keys` entries (§10).
+    /// Honors `config.default_key_ttl_days` (None → built-in 90, Some(0) →
+    /// no expiry token).
+    fn default_ttl_days(&self) -> u64 {
+        self.config.default_key_ttl_days.unwrap_or(BUILTIN_DEFAULT_TTL_DAYS)
+    }
+
+    /// Currently-valid authorized NodeIds (expired entries are filtered out
+    /// at admit time; lines remain in the file for audit).
     pub fn authorized_node_ids(&self) -> CspResult<BTreeSet<NodeId>> {
+        let now = now_unix();
         let mut set = BTreeSet::new();
         if let Ok(s) = std::fs::read_to_string(self.authorized_keys_path()) {
-            for line in s.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some(n) = parse_ssh_pubkey(line) {
-                    set.insert(n);
+            for e in authkeys::parse_file(&s) {
+                if let Some(n) = e.node {
+                    if e.expiry.is_valid(now) {
+                        set.insert(n);
+                    }
                 }
             }
         }
         Ok(set)
     }
 
-    pub fn authorize(&self, ssh_line: &str) -> CspResult<()> {
-        let p = self.authorized_keys_path();
-        let mut cur = std::fs::read_to_string(&p).unwrap_or_default();
-        if cur.lines().any(|l| l.trim() == ssh_line.trim()) {
-            return Ok(());
-        }
-        if !cur.is_empty() && !cur.ends_with('\n') {
-            cur.push('\n');
-        }
-        cur.push_str(ssh_line.trim());
-        cur.push('\n');
-        std::fs::write(&p, cur)?;
+    /// All authorized entries (including expired). For `ctx auth list`.
+    pub fn authorized_entries(&self) -> CspResult<Vec<KeyEntry>> {
+        let s = std::fs::read_to_string(self.authorized_keys_path()).unwrap_or_default();
+        Ok(authkeys::parse_file(&s)
+            .into_iter()
+            .filter(|e| e.is_key())
+            .collect())
+    }
+
+    /// Take an exclusive file lock on `authorized_keys` for the duration of
+    /// `f`. Ensures enrollment writes, manual `authorize`/`revoke`, and the
+    /// listen-start migration don't race each other (across processes too).
+    fn with_authorized_lock<F, T>(&self, f: F) -> CspResult<T>
+    where
+        F: FnOnce(&Path) -> CspResult<T>,
+    {
+        std::fs::create_dir_all(&self.context)?;
+        let lockp = self.authorized_keys_lock_path();
+        let lf = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lockp)?;
+        FileExt::lock_exclusive(&lf)?;
+        let res = f(&self.authorized_keys_path());
+        let _ = FileExt::unlock(&lf);
+        res
+    }
+
+    /// Atomic write of `authorized_keys` (tmp + rename) inside the file lock.
+    fn write_authorized_atomic(&self, path: &Path, content: &str) -> CspResult<()> {
+        let tmp = path.with_extension("ak-tmp");
+        std::fs::write(&tmp, content)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    /// Add a key to `authorized_keys` with a specific `Expiry`. If an entry
+    /// for the same NodeId already exists, its `expires=` is replaced.
+    pub fn authorize_with_expiry(&self, ssh_line: &str, expiry: Expiry) -> CspResult<()> {
+        let target_node = parse_ssh_pubkey(ssh_line.trim());
+        self.with_authorized_lock(|p| {
+            let cur = std::fs::read_to_string(p).unwrap_or_default();
+            let mut entries = authkeys::parse_file(&cur);
+            let new_line = authkeys::build_line(ssh_line, expiry);
+            if let Some(t) = target_node {
+                if let Some(i) = entries.iter().position(|e| e.node == Some(t)) {
+                    // Replace existing entry with refreshed token / pubkey
+                    // text, keeping the line in-place to preserve ordering.
+                    entries[i] = authkeys::parse_line(&new_line);
+                    self.write_authorized_atomic(p, &authkeys::serialize(&entries))?;
+                    return Ok(());
+                }
+            } else {
+                // Not a valid ssh-ed25519 line. Skip — no-op like before.
+                return Ok(());
+            }
+            entries.push(authkeys::parse_line(&new_line));
+            self.write_authorized_atomic(p, &authkeys::serialize(&entries))?;
+            Ok(())
+        })
+    }
+
+    /// Back-compat wrapper: add a key with no expiry token. Listen-start
+    /// migration applies the default TTL on next startup, matching the
+    /// spec's footgun-guard rule for manually pasted lines.
+    pub fn authorize(&self, ssh_line: &str) -> CspResult<()> {
+        self.authorize_with_expiry(ssh_line, Expiry::Unset)
     }
 
     pub fn revoke(&self, ssh_line: &str) -> CspResult<()> {
-        let p = self.authorized_keys_path();
-        let cur = std::fs::read_to_string(&p).unwrap_or_default();
         let target = parse_ssh_pubkey(ssh_line.trim());
-        let kept: Vec<&str> = cur
-            .lines()
-            .filter(|l| {
-                let t = l.trim();
-                if t.is_empty() || t.starts_with('#') {
-                    return true;
-                }
-                match (parse_ssh_pubkey(t), target) {
+        self.with_authorized_lock(|p| {
+            let cur = std::fs::read_to_string(p).unwrap_or_default();
+            let entries = authkeys::parse_file(&cur);
+            let kept: Vec<KeyEntry> = entries
+                .into_iter()
+                .filter(|e| match (e.node, target) {
                     (Some(a), Some(b)) => a != b,
-                    _ => t != ssh_line.trim(),
-                }
-            })
-            .collect();
-        std::fs::write(&p, format!("{}\n", kept.join("\n")).trim_start().to_string())?;
-        Ok(())
+                    _ => e.raw.trim() != ssh_line.trim(),
+                })
+                .collect();
+            self.write_authorized_atomic(p, &authkeys::serialize(&kept))
+        })
     }
 
-    /// Bootstrap TOFU (§10): while the local authorized set is empty, the
-    /// first connecting key is recorded. Disabled by `no_tofu`. Returns
-    /// `true` if the key was accepted (already-trusted or just TOFU-added).
-    pub fn admit_peer_tofu(&self, ssh_line: &str) -> CspResult<bool> {
-        let set = self.authorized_node_ids()?;
-        if let Some(n) = parse_ssh_pubkey(ssh_line) {
-            if set.contains(&n) {
+    /// Extend (or re-set) the expiry on every entry whose pubkey or comment
+    /// fingerprint matches `ssh_or_prefix` (matches either the full ssh-ed25519
+    /// line head, or a hex prefix of the NodeId, or the `comment` text after
+    /// the base64). `more_days = None` → `expires=never`. Returns the number
+    /// of entries updated.
+    pub fn extend_expiry(&self, ssh_or_prefix: &str, more_days: Option<u64>) -> CspResult<usize> {
+        let now = now_unix();
+        let needle_node = parse_ssh_pubkey(ssh_or_prefix);
+        let needle = ssh_or_prefix.trim().to_ascii_lowercase();
+        self.with_authorized_lock(|p| {
+            let cur = std::fs::read_to_string(p).unwrap_or_default();
+            let mut entries = authkeys::parse_file(&cur);
+            let mut updated = 0;
+            for e in entries.iter_mut() {
+                let Some(n) = e.node else { continue };
+                let matches = needle_node.map(|t| t == n).unwrap_or(false)
+                    || n.to_hex().starts_with(&needle)
+                    || e.raw.to_ascii_lowercase().contains(&needle);
+                if !matches {
+                    continue;
+                }
+                let new_expiry = match more_days {
+                    None => Expiry::Never,
+                    Some(d) => Expiry::At(authkeys::expiry_from_ttl_days(now, d)),
+                };
+                let new_line = authkeys::build_line(&e.raw, new_expiry);
+                *e = authkeys::parse_line(&new_line);
+                updated += 1;
+            }
+            if updated > 0 {
+                self.write_authorized_atomic(p, &authkeys::serialize(&entries))?;
+            }
+            Ok(updated)
+        })
+    }
+
+    /// Listen-start migration (§10): rewrite every entry without an expiry
+    /// token to `expires=<today + default_ttl_days>`. Idempotent. Returns
+    /// the number of entries migrated.
+    pub fn migrate_default_expiry(&self) -> CspResult<usize> {
+        let ttl_days = self.default_ttl_days();
+        if ttl_days == 0 {
+            // Operator opted out of a default TTL — nothing to apply.
+            return Ok(0);
+        }
+        let now = now_unix();
+        self.with_authorized_lock(|p| {
+            let cur = std::fs::read_to_string(p).unwrap_or_default();
+            let mut entries = authkeys::parse_file(&cur);
+            let mut migrated = 0;
+            for e in entries.iter_mut() {
+                if !e.is_key() {
+                    continue;
+                }
+                if matches!(e.expiry, Expiry::Unset) {
+                    let new_line = authkeys::build_line(
+                        &e.raw,
+                        Expiry::At(authkeys::expiry_from_ttl_days(now, ttl_days)),
+                    );
+                    *e = authkeys::parse_line(&new_line);
+                    migrated += 1;
+                }
+            }
+            if migrated > 0 {
+                self.write_authorized_atomic(p, &authkeys::serialize(&entries))?;
+                tracing::info!(
+                    "authorized_keys: applied default {ttl_days}d expiry to \
+                     {migrated} entry(s)"
+                );
+            }
+            Ok(migrated)
+        })
+    }
+
+    /// Enrollment-aware connection admission (§10). Replaces the older
+    /// TOFU-only `admit_peer_tofu`. Returns `true` if the peer is admitted;
+    /// mutates `authorized_keys` to enroll a new peer (auth-key path),
+    /// refresh an expired entry's `expires=`, or TOFU-record a first peer.
+    ///
+    /// - Already-authorized and not expired → accept (no-op).
+    /// - `enrollment_authorized` true (caller validated an auth key) → write
+    ///   or refresh entry with default TTL, accept.
+    /// - `enrollment_authorized` false:
+    ///   - Expired existing entry → reject (operator must extend or
+    ///     re-enroll via auth key).
+    ///   - Unknown peer + no auth keys configured + authorized set empty +
+    ///     `!no_tofu` → TOFU enroll with default TTL.
+    ///   - Otherwise → reject.
+    pub fn admit_peer(&self, ssh_line: &str, enrollment_authorized: bool) -> CspResult<bool> {
+        let now = now_unix();
+        let peer_node = match parse_ssh_pubkey(ssh_line) {
+            Some(n) => n,
+            None => return Ok(false),
+        };
+        let ttl_days = self.default_ttl_days();
+        let enroll_expiry = || -> Expiry {
+            if ttl_days == 0 {
+                Expiry::Unset
+            } else {
+                Expiry::At(authkeys::expiry_from_ttl_days(now, ttl_days))
+            }
+        };
+        self.with_authorized_lock(|p| {
+            let cur = std::fs::read_to_string(p).unwrap_or_default();
+            let mut entries = authkeys::parse_file(&cur);
+            // Existing entry for this pubkey?
+            if let Some(i) = entries.iter().position(|e| e.node == Some(peer_node)) {
+                let valid = entries[i].expiry.is_valid(now);
+                if valid {
+                    return Ok(true);
+                }
+                if enrollment_authorized {
+                    let line = authkeys::build_line(ssh_line, enroll_expiry());
+                    entries[i] = authkeys::parse_line(&line);
+                    self.write_authorized_atomic(p, &authkeys::serialize(&entries))?;
+                    tracing::info!(
+                        "authorized_keys: refreshed expired entry via auth-key \
+                         enrollment for peer={}",
+                        &peer_node.to_hex()[..12]
+                    );
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+            // Unknown peer.
+            if enrollment_authorized {
+                let line = authkeys::build_line(ssh_line, enroll_expiry());
+                entries.push(authkeys::parse_line(&line));
+                self.write_authorized_atomic(p, &authkeys::serialize(&entries))?;
+                tracing::info!(
+                    "authorized_keys: enrolled new peer={} via auth-key",
+                    &peer_node.to_hex()[..12]
+                );
                 return Ok(true);
             }
-        }
-        if set.is_empty() && !self.config.no_tofu {
-            self.authorize(ssh_line)?;
-            return Ok(true);
-        }
-        Ok(false)
+            // TOFU: only when the file has no key entries, no_tofu is off,
+            // and no auth keys are configured (auth-keys disable TOFU).
+            let any_key = entries.iter().any(|e| e.is_key());
+            if !any_key && !self.config.no_tofu && self.config.auth_keys.is_empty() {
+                let line = authkeys::build_line(ssh_line, enroll_expiry());
+                entries.push(authkeys::parse_line(&line));
+                self.write_authorized_atomic(p, &authkeys::serialize(&entries))?;
+                tracing::info!(
+                    "authorized_keys: TOFU-recorded first peer={}",
+                    &peer_node.to_hex()[..12]
+                );
+                return Ok(true);
+            }
+            Ok(false)
+        })
+    }
+
+    /// Legacy name kept so existing call sites (the wasm-side SessionVault)
+    /// still compile. Equivalent to `admit_peer(ssh_line, false)`.
+    pub fn admit_peer_tofu(&self, ssh_line: &str) -> CspResult<bool> {
+        self.admit_peer(ssh_line, false)
     }
 
     // ---- Point-in-time recovery (§8) -----------------------------------

@@ -90,7 +90,11 @@ export type EngineEvent =
 export interface EngineApi {
   listVaults(): Promise<Vault[]>;
   addLocalFolder(path: string): Promise<Vault>;
-  cloneRemote(dest: string, url: string): Promise<Vault>;
+  /** `authKey` (§10) is the optional enrollment secret sent on the WS
+   * upgrade — required only if the listener has `CTX_AUTH_KEY` set. Not
+   * persisted: after a successful clone the device's pubkey is in the
+   * peer's `authorized_keys` and the key isn't used again. */
+  cloneRemote(dest: string, url: string, authKey?: string | null): Promise<Vault>;
   removeVault(id: VaultId): Promise<void>;
   setEnabled(id: VaultId, on: boolean): Promise<void>;
   setAllowConnections(id: VaultId, on: boolean): Promise<ListenerInfo>;

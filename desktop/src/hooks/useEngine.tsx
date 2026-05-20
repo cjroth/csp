@@ -25,7 +25,7 @@ interface EngineCtx {
   reloadAll: () => Promise<void>;
   reloadVault: (id: string) => Promise<void>;
   addLocalFolder: (path: string) => Promise<Vault>;
-  cloneRemote: (dest: string, url: string) => Promise<Vault>;
+  cloneRemote: (dest: string, url: string, authKey?: string | null) => Promise<Vault>;
   removeVault: (id: string) => Promise<void>;
   setEnabled: (id: string, on: boolean) => Promise<void>;
   setAllowConnections: (id: string, on: boolean) => Promise<void>;
@@ -148,7 +148,7 @@ export function EngineProvider({ children }: { children: ReactNode }) {
       () => void reloadAll(),
     ),
     cloneRemote: wrap(
-      (d: string, u: string) => api.cloneRemote(d, u),
+      (d: string, u: string, ak?: string | null) => api.cloneRemote(d, u, ak),
       () => void reloadAll(),
     ),
     removeVault: wrap(

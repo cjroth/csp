@@ -27,6 +27,8 @@ export function defaultConfig(vaultId: string): VaultConfig {
     debounce_ms: 1000,
     allow_binary: false,
     include: ['**'],
+    auth_keys: [],
+    default_key_ttl_days: null,
   };
 }
 

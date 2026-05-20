@@ -362,7 +362,10 @@ impl CspEngine {
         let last_commit = Arc::new(Mutex::new(None));
         let mut tasks = Vec::new();
         for p in peers {
-            tasks.push(node.connect(p));
+            // Managed-vault outbound: no auth-key (enrollment already
+            // happened at clone time; subsequent reconnects ride the
+            // pubkey already in the peer's authorized_keys, §10).
+            tasks.push(node.connect(p, None));
         }
         tasks.push(spawn_watcher(
             node.clone(),
@@ -601,16 +604,22 @@ impl Engine for CspEngine {
         })
     }
 
-    async fn clone_remote(&self, dest: String, url: String) -> EngineResult<Vault> {
+    async fn clone_remote(
+        &self,
+        dest: String,
+        url: String,
+        auth_key: Option<String>,
+    ) -> EngineResult<Vault> {
         let root = PathBuf::from(&dest);
         if root.join(".context").exists() {
             return Err(EngineError::engine(format!(
                 "{dest} is already a CSP vault (refusing to clobber)"
             )));
         }
-        let (vault_id, vname, server_ssh) = probe(&url, &self.identity)
-            .await
-            .map_err(|e| EngineError::network(format!("probe {url}: {e}")))?;
+        let (vault_id, vname, server_ssh) =
+            probe(&url, &self.identity, auth_key.as_deref())
+                .await
+                .map_err(|e| EngineError::network(format!("probe {url}: {e}")))?;
         std::fs::create_dir_all(&root)?;
         let name = if vname.is_empty() { basename(&dest) } else { vname };
         {

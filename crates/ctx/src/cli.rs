@@ -69,6 +69,23 @@ pub struct Cli {
     #[arg(long, env = "CTX_AUTHORIZED_KEYS", global = true)]
     pub authorized_keys: Option<String>,
 
+    /// Pre-shared **auth key(s)** (§10) — enrollment secrets that authorize
+    /// a new peer to write its pubkey into this listener's
+    /// `authorized_keys`. Comma-separated for multiple (supports rotation).
+    /// When non-empty, TOFU is implicitly disabled. On a connecting node
+    /// this same value is sent as `Authorization: Bearer …` on the WS
+    /// upgrade so the listener accepts the enrollment. Config key:
+    /// `auth_keys`.
+    #[arg(long, env = "CTX_AUTH_KEY", global = true)]
+    pub auth_key: Option<String>,
+
+    /// Default expiry for new `authorized_keys` entries: `90d`, `1y`,
+    /// `12w`, a bare integer (days), or `never`. Default `90d`. Applies to
+    /// new enrollments AND the listen-start migration pass. Config key:
+    /// `default_key_ttl_days` (an integer).
+    #[arg(long, env = "CTX_DEFAULT_KEY_TTL", global = true)]
+    pub default_key_ttl: Option<String>,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -126,9 +143,21 @@ pub enum Cmd {
     /// Generate / show the node SSH key; print the public key (OpenSSH).
     Key,
     /// Add a public key to this node's local authorized_keys.
-    Authorize { pubkey: String },
+    Authorize {
+        pubkey: String,
+        /// Expiry for this entry: `90d`, `1y`, `never`, etc. Default:
+        /// the value of `--default-key-ttl` / `CTX_DEFAULT_KEY_TTL`
+        /// (built-in default 90 days).
+        #[arg(long)]
+        ttl: Option<String>,
+    },
     /// Remove a public key from this node's local authorized_keys.
     Revoke { pubkey: String },
+    /// Inspect / extend authorized_keys entries.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Node identity, peers, sync state, head/main SHA.
     Status {
         #[arg(long)]
@@ -171,6 +200,21 @@ pub enum ScopeAction {
     Ignore { pattern: String },
     /// Add an allowlist include pattern to the vault config.
     Include { pattern: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuthAction {
+    /// Print each authorized peer with its remaining TTL.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Extend (or set) the expiry on entries matching `target` (a NodeId
+    /// hex prefix, a substring of the entry, or the full ssh-ed25519 line).
+    /// `duration` is `90d`, `1y`, `never`, etc.
+    Extend { target: String, duration: String },
+    /// Run the listen-start expiry migration pass manually. Idempotent.
+    Migrate,
 }
 
 #[cfg(test)]

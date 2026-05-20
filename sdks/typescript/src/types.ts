@@ -110,6 +110,14 @@ export interface VaultOptions {
   /** Pin the peer's identity pubkey (TOFU/key pinning, CSP §10 — a
    * connecting node also verifies the listener's key). */
   peerPubkey?: Uint8Array;
+  /** Pre-shared auth key (CSP §10) — enrollment secret sent on the WS
+   * upgrade. Required only when the peer listener was started with
+   * `CTX_AUTH_KEY` and this device is not yet in its `authorized_keys`.
+   * Sent as a `?auth_key=` query parameter (browser-WebSocket-compatible
+   * — the browser `WebSocket` constructor cannot set arbitrary headers).
+   * One-shot: after a successful enrollment the device's pubkey is in
+   * the peer's authorized_keys and the auth-key is no longer consulted. */
+  authKey?: string;
   /** WebSocket transport. Defaults to the runtime-appropriate adapter. */
   transport?: TransportAdapter;
 }
@@ -157,4 +165,11 @@ export interface VaultConfig {
   allow_binary: boolean;
   /** The explicit include allowlist (CSP §11). */
   include: string[];
+  /** Pre-shared bearer auth keys that gate `Authorization: Bearer …` HTTP
+   * upgrade headers and let the listener enroll the connecting peer's pubkey
+   * (CSP §10 auth-key bootstrap). Empty by default. */
+  auth_keys: string[];
+  /** Default TTL (days) applied when enrolling a peer pubkey via an auth
+   * key. `null` → the engine's built-in default. */
+  default_key_ttl_days: number | null;
 }

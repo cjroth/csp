@@ -145,6 +145,11 @@ struct StepJson {
     out: Vec<Vec<u8>>,
     integrated: usize,
     established: bool,
+    /// The peer's SSH-format pubkey once `established` flips true; empty
+    /// before that. Lets the host pin the peer identity (CSP §10) without
+    /// needing a second wasm call.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    peer_ssh: String,
 }
 
 /// The plugin-facing full engine: the *same* `MemEngine` + `Session` as
@@ -304,10 +309,16 @@ impl WasmEngine {
             out.push(m.encode().map_err(|e| JsError::new(&e))?);
         }
         let established = session.established();
+        let peer_ssh = if established {
+            session.peer_ssh().unwrap_or("").to_string()
+        } else {
+            String::new()
+        };
         serde_json::to_string(&StepJson {
             out,
             integrated: step.integrated,
             established,
+            peer_ssh,
         })
         .map_err(je)
     }

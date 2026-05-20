@@ -21,11 +21,11 @@
 //                             and is excluded from the engine repo — the same
 //                             rationale that makes `authorized_keys`/`exclude`
 //                             node-local. It holds every plugin-only knob
-//                             (peerPubkey, syncEnabled, autoConnectOnStart,
-//                             onboarded, ignoreGlobs, identityPath) plus a
-//                             fallback copy of peerUrl for the pre-config
-//                             window. To keep the file minimal, a knob is only
-//                             written when it differs from its default.
+//                             (peerPubkey, syncEnabled, onboarded, ignoreGlobs,
+//                             identityPath) plus a fallback copy of peerUrl
+//                             for the pre-config window. To keep the file
+//                             minimal, a knob is only written when it differs
+//                             from its default.
 //
 // The Rust config codec is strict and flat: it only round-trips the known
 // `VaultConfig` fields, so plugin-only knobs could never have lived safely in
@@ -48,9 +48,6 @@ export interface CspSettings {
   /** Master switch. While false the plugin opens no engine session and makes
    * no connection. Plugin-owned (sidecar). */
   syncEnabled: boolean;
-  /** Open the peer connection on launch (vs. staying prepared). Only
-   * meaningful while `syncEnabled`. Plugin-owned (sidecar). */
-  autoConnectOnStart: boolean;
   /** True only once setup fully succeeded (create: local vault built;
    * connect: peer handshake + first catch-up reached). Plugin-owned
    * (sidecar). */
@@ -62,21 +59,20 @@ export interface CspSettings {
    * defaults to the CLI-shared `~/.context/id_ed25519`. Plugin-owned
    * (sidecar). */
   identityPath: string;
+  /** §10 enrollment secret used at clone time. Persisted in the sidecar
+   * (under the never-synced `.context/`) so the user doesn't have to
+   * re-paste during setup retries. Plugin-owned. */
+  authKey: string;
 }
 
 export const DEFAULT_SETTINGS: CspSettings = {
   peerUrl: '',
   peerPubkey: '',
   syncEnabled: false,
-  // Default ON: an onboarded, sync-enabled vault with a peer URL must
-  // actually sync on every launch. Defaulting this OFF made the plugin
-  // silently stop syncing after every Obsidian reload (it opened the
-  // session but never connected). The opt-in is onboarding + the master
-  // `syncEnabled` switch, not a separate connect gate.
-  autoConnectOnStart: true,
   onboarded: false,
   ignoreGlobs: [],
   identityPath: '',
+  authKey: '',
 };
 
 /** Parse a textarea value (one glob per line) into a clean list. */
@@ -85,6 +81,38 @@ export function parseIgnoreGlobs(input: string): string[] {
     .split('\n')
     .map((s) => s.trim())
     .filter((s) => s.length > 0 && !s.startsWith('#'));
+}
+
+/** Normalize a user-entered peer URL so a bare domain like `host.example`
+ * dials `wss://host.example:443` — what every TLS-terminating front (Fly,
+ * Railway, …) actually exposes. Browsers' `WebSocket` rejects schemeless
+ * inputs, so we fill in `wss://` (or `ws://` when explicitly requested) and
+ * supply the default port if the authority is portless. Idempotent. */
+export function normalizePeerUrl(input: string): string {
+  const trimmed = input.trim();
+  if (trimmed === '') return '';
+  let secure = true;
+  let rest = trimmed;
+  if (trimmed.startsWith('wss://')) rest = trimmed.slice('wss://'.length);
+  else if (trimmed.startsWith('ws://')) {
+    secure = false;
+    rest = trimmed.slice('ws://'.length);
+  } else if (trimmed.startsWith('https://')) rest = trimmed.slice('https://'.length);
+  else if (trimmed.startsWith('http://')) {
+    secure = false;
+    rest = trimmed.slice('http://'.length);
+  }
+  const slash = rest.indexOf('/');
+  const authority = slash === -1 ? rest : rest.slice(0, slash);
+  const path = slash === -1 ? '' : rest.slice(slash);
+  // IPv6 literal: `[::1]:port` — the port is the `:` after `]`. For
+  // names/IPv4 a bare `:` in the authority is the port.
+  const closeBracket = authority.lastIndexOf(']');
+  const hasPort =
+    closeBracket === -1 ? authority.includes(':') : authority.slice(closeBracket).startsWith(']:');
+  const scheme = secure ? 'wss' : 'ws';
+  if (authority === '' || hasPort) return `${scheme}://${authority}${path}`;
+  return `${scheme}://${authority}:${secure ? 443 : 80}${path}`;
 }
 
 // ---- Pure config ⇄ settings mapping (unit-testable) ----
@@ -96,10 +124,10 @@ interface SidecarJson {
   peerUrl?: string;
   peerPubkey?: string;
   syncEnabled?: boolean;
-  autoConnectOnStart?: boolean;
   onboarded?: boolean;
   ignoreGlobs?: string[];
   identityPath?: string;
+  authKey?: string;
 }
 
 /** Project a (possibly absent) canonical config + sidecar onto the merged
@@ -111,14 +139,12 @@ export function settingsFromParts(cfg: VaultConfig | null, side: SidecarJson | n
     if (typeof side.peerUrl === 'string') s.peerUrl = side.peerUrl;
     if (typeof side.peerPubkey === 'string') s.peerPubkey = side.peerPubkey;
     if (typeof side.syncEnabled === 'boolean') s.syncEnabled = side.syncEnabled;
-    if (typeof side.autoConnectOnStart === 'boolean') {
-      s.autoConnectOnStart = side.autoConnectOnStart;
-    }
     if (typeof side.onboarded === 'boolean') s.onboarded = side.onboarded;
     if (Array.isArray(side.ignoreGlobs)) {
       s.ignoreGlobs = side.ignoreGlobs.filter((g): g is string => typeof g === 'string');
     }
     if (typeof side.identityPath === 'string') s.identityPath = side.identityPath;
+    if (typeof side.authKey === 'string') s.authKey = side.authKey;
   }
   // The shared canonical config is authoritative for the peer URL whenever it
   // exists (it is what `ctx` and the engine actually read).
@@ -134,12 +160,10 @@ export function sidecarFromSettings(s: CspSettings): SidecarJson {
   if (s.peerUrl !== DEFAULT_SETTINGS.peerUrl) out.peerUrl = s.peerUrl;
   if (s.peerPubkey !== DEFAULT_SETTINGS.peerPubkey) out.peerPubkey = s.peerPubkey;
   if (s.syncEnabled !== DEFAULT_SETTINGS.syncEnabled) out.syncEnabled = s.syncEnabled;
-  if (s.autoConnectOnStart !== DEFAULT_SETTINGS.autoConnectOnStart) {
-    out.autoConnectOnStart = s.autoConnectOnStart;
-  }
   if (s.onboarded !== DEFAULT_SETTINGS.onboarded) out.onboarded = s.onboarded;
   if (s.ignoreGlobs.length > 0) out.ignoreGlobs = s.ignoreGlobs.slice();
   if (s.identityPath !== DEFAULT_SETTINGS.identityPath) out.identityPath = s.identityPath;
+  if (s.authKey !== DEFAULT_SETTINGS.authKey) out.authKey = s.authKey;
   return out;
 }
 

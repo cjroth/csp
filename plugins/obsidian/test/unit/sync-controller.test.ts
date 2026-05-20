@@ -148,15 +148,52 @@ describe('snapshots', () => {
 });
 
 describe('resetLocalState', () => {
-  test('clears state, warns about the same device key (CSP §5.1)', async () => {
+  test('fully wipes the .context folder when `fs` is wired', async () => {
+    const adapter = new FakeDataAdapter();
+    const vault = new FakeVault(adapter);
+    const storage = new ObsidianStorageAdapter(adapter);
+    const settings: CspSettings = { ...DEFAULT_SETTINGS, syncEnabled: true };
+    const notices: string[] = [];
+    const controller = new SyncController({
+      storage,
+      fs: adapter,
+      vault,
+      settings,
+      identity: Identity.generate(),
+      saveSettings: async (s) => {
+        Object.assign(settings, s);
+      },
+      notice: (m) => notices.push(m),
+    });
+    await controller.prepare();
+    await vault.create('x.md', 'data\n');
+    await controller.resyncNow();
+    // Drop a stray file so we verify the recursive wipe catches non-engine
+    // bytes (e.g. the plugin sidecar or the mobile device key).
+    await adapter.write('.context/obsidian.json', '{}');
+    expect(await adapter.exists('.context/state')).toBe(true);
+    expect(await adapter.exists('.context/obsidian.json')).toBe(true);
+
+    await controller.resetLocalState();
+
+    // The entire folder is gone — engine state, snapshots, sidecar, all of it.
+    expect(await adapter.exists('.context/state')).toBe(false);
+    expect(await adapter.exists('.context/obsidian.json')).toBe(false);
+    expect(await adapter.exists('.context')).toBe(false);
+    expect(notices.some((n) => /local state cleared/.test(n))).toBe(true);
+    // The Obsidian vault contents are untouched.
+    expect(vault.getAbstractFileByPath('x.md')).not.toBeNull();
+  });
+
+  test('without `fs`, falls back to zeroing the engine blobs', async () => {
+    // Older callers may not pass `fs`. We still clear engine state so the next
+    // start() rebuilds from scratch instead of silently re-opening.
     const h = makeHarness();
     await h.controller.prepare();
     await h.vault.create('x.md', 'data\n');
     await h.controller.resyncNow();
     await h.controller.resetLocalState();
-    expect(h.notices.some((n) => /CSP §5.1/.test(n))).toBe(true);
-    expect(await h.adapter.exists('.context/state')).toBe(true); // re-prepared
-    await h.controller.stop();
+    expect(h.notices.some((n) => /local state cleared/.test(n))).toBe(true);
   });
 });
 

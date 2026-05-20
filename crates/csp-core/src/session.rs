@@ -67,9 +67,17 @@ pub trait SessionVault {
     fn export_closure(&self, tips: &[Oid]) -> CspResult<Vec<Vec<u8>>>;
     /// Integrate received raw objects (§6.3); returns new primitives admitted.
     fn integrate(&mut self, raws: &[Vec<u8>]) -> CspResult<usize>;
-    /// Listener-side TOFU admission of the connector key (§10). Returns
-    /// `true` if the peer is admitted.
-    fn admit_peer(&mut self, peer_ssh: &str) -> CspResult<bool>;
+    /// Listener-side connection admission of the connector key (§10).
+    /// Returns `true` if the peer is admitted.
+    ///
+    /// `enrollment_authorized` is set by the driver (the WS layer in
+    /// `net.rs` on native; always `false` for outbound-only thin nodes)
+    /// when the connection presented a valid pre-shared auth key in its
+    /// `Authorization: Bearer …` upgrade header (or fallback form). The
+    /// implementation may then enroll the peer's pubkey into the local
+    /// authorized set with a default TTL — see `Vault::admit_peer` for
+    /// the full decision table.
+    fn admit_peer(&mut self, peer_ssh: &str, enrollment_authorized: bool) -> CspResult<bool>;
 }
 
 enum Phase {
@@ -101,6 +109,15 @@ pub struct Session {
     channel_binding: Vec<u8>,
     my_nonce: Vec<u8>,
     phase: Phase,
+    /// The peer's SSH-format pubkey (`ssh-ed25519 …`), set once the mutual
+    /// auth completes (CSP §10). Hosts use this to surface a pinned-peer
+    /// indicator without re-deriving it from the handshake messages.
+    peer_ssh: Option<String>,
+    /// Set by the driver (`net::run_session` on native) when the WS upgrade
+    /// validated a pre-shared auth key (§10). Consumed in `on_auth` and
+    /// passed to `SessionVault::admit_peer`. Always `false` for connectors
+    /// (the listener owns the admission decision).
+    enrollment_authorized: bool,
 }
 
 impl Session {
@@ -110,7 +127,16 @@ impl Session {
             channel_binding,
             my_nonce: nonce,
             phase: Phase::AwaitHello,
+            peer_ssh: None,
+            enrollment_authorized: false,
         }
+    }
+
+    /// Mark this listener-side session as having presented a valid auth-key
+    /// at the WS upgrade (§10). Must be set before `on_msg` reaches
+    /// `on_auth`. No effect when the role is `Connector`.
+    pub fn set_enrollment_authorized(&mut self, ok: bool) {
+        self.enrollment_authorized = ok;
     }
 
     /// True once the mutual-auth handshake has completed (frontier
@@ -118,6 +144,12 @@ impl Session {
     /// to preserve the original message ordering.
     pub fn established(&self) -> bool {
         matches!(self.phase, Phase::Established)
+    }
+
+    /// The peer's SSH-format pubkey once the handshake has completed.
+    /// `None` before `established()` flips true.
+    pub fn peer_ssh(&self) -> Option<&str> {
+        self.peer_ssh.as_deref()
     }
 
     /// The opening frame (both sides send `Hello` immediately, §10).
@@ -240,7 +272,9 @@ impl Session {
             .ok_or_else(|| CspError::BadSignature("bad peer ssh key".into()))?;
         verify_detached(&peer_node, &script, &peer_sig)?;
 
-        if self.role == Role::Listener && !v.admit_peer(&peer_ssh)? {
+        if self.role == Role::Listener
+            && !v.admit_peer(&peer_ssh, self.enrollment_authorized)?
+        {
             return Err(CspError::Unauthorized(format!(
                 "peer {} not authorized",
                 &peer_node.to_hex()[..12]
@@ -253,6 +287,7 @@ impl Session {
             .into_iter()
             .map(|o| o.to_hex())
             .collect::<Vec<_>>();
+        self.peer_ssh = Some(peer_ssh);
         self.phase = Phase::Established;
         Ok(Step {
             out: vec![Msg::FrontierDigest { tips }],
@@ -348,7 +383,7 @@ mod tests {
         fn integrate(&mut self, _r: &[Vec<u8>]) -> CspResult<usize> {
             Ok(0)
         }
-        fn admit_peer(&mut self, _p: &str) -> CspResult<bool> {
+        fn admit_peer(&mut self, _p: &str, _enrolled: bool) -> CspResult<bool> {
             Ok(true)
         }
     }

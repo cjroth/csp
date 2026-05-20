@@ -9,6 +9,11 @@
 #   CTX_NO_TLS = 1                      # bind plain ws; edge handles TLS
 #   CTX_CWD    = /mnt/workspace         # match the attached volume's mount
 #   CTX_AUTHORIZED_KEYS = ssh-ed25519…  # secret; merged on every start
+#   CTX_AUTH_KEY = <enrollment-secret>  # optional (§10); enables auth-key
+#                                       # enrollment (comma-sep for rotation).
+#                                       # Setting this implicitly disables TOFU.
+#   CTX_DEFAULT_KEY_TTL = 90d           # optional; default expiry for new
+#                                       # `authorized_keys` entries.
 #   CTX_VAULT_NAME = vault              # optional; default clone dir name
 #
 # Attach a Railway Volume and set its mount path to the same value as

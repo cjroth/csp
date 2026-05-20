@@ -74,3 +74,11 @@ path = "tests/tls_default.rs"
 [[test]]
 name = "names_and_watch"
 path = "tests/names_and_watch.rs"
+
+[[test]]
+name = "auth_key"
+path = "tests/auth_key.rs"
+
+[[test]]
+name = "key_expiry"
+path = "tests/key_expiry.rs"

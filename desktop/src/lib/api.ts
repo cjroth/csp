@@ -24,7 +24,8 @@ const ENGINE_EVENT = "engine://event";
 export const api: EngineApi = {
   listVaults: () => tauriInvoke<Vault[]>("list_vaults"),
   addLocalFolder: (path) => tauriInvoke<Vault>("add_local_folder", { path }),
-  cloneRemote: (dest, url) => tauriInvoke<Vault>("clone_remote", { dest, url }),
+  cloneRemote: (dest, url, authKey) =>
+    tauriInvoke<Vault>("clone_remote", { dest, url, authKey: authKey ?? null }),
   removeVault: (id) => tauriInvoke<void>("remove_vault", { id }),
   setEnabled: (id, on) => tauriInvoke<void>("set_enabled", { id, on }),
   setAllowConnections: (id, on) => tauriInvoke<ListenerInfo>("set_allow_connections", { id, on }),

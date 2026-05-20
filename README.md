@@ -135,6 +135,17 @@ Every deployment knob also has a `CTX_*` env var and a config-file key
 CTX_DIR=/data/vault CTX_AUTHORIZED_KEYS="$KEYS" ctx watch --listen
 ```
 
+For internet-reachable listeners, prefer the **auth-key enrollment** path
+over leaving TOFU on. Set `CTX_AUTH_KEY=<secret>` (comma-separated for
+rotation); each new peer clones with `ctx clone wss://host --auth-key
+<secret>` and the listener appends their pubkey to `authorized_keys` with
+a 90-day default expiry (override via `CTX_DEFAULT_KEY_TTL`). Inspect
+remaining lifetimes with `ctx auth list`; bump them with
+`ctx auth extend <peer> <duration>`; an expired peer re-enrolls by
+re-presenting the auth-key. Rotating or removing the secret stops *new*
+enrollments but never severs already-enrolled peers (revoke a specific
+peer by removing its `authorized_keys` line).
+
 The synced folder is plain files plus one `.context/` directory (engine state, never
 synced). The engine keeps a real, stock-git-compatible history at
 `.context/git` — inspect it with the bundled read-only `ctx git`, or point an

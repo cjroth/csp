@@ -95,6 +95,8 @@ impl MemEngine {
             debounce_ms: 1000,
             allow_binary: false,
             include: vec!["**".into()],
+            auth_keys: Vec::new(),
+            default_key_ttl_days: None,
         };
         let state = EngineState {
             vault_id: vault_id.to_string(),
@@ -367,43 +369,109 @@ impl MemEngine {
 
     // ---- Authorization (§10): in-memory; host persists `authorized` text --
 
+    /// Currently-valid authorized NodeIds (expired entries filtered out).
     pub fn authorized_node_ids(&self) -> BTreeSet<NodeId> {
+        let now = now_unix();
         let mut set = BTreeSet::new();
-        for line in self.authorized.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some(n) = parse_ssh_pubkey(line) {
-                set.insert(n);
+        for e in crate::authkeys::parse_file(&self.authorized) {
+            if let Some(n) = e.node {
+                if e.expiry.is_valid(now) {
+                    set.insert(n);
+                }
             }
         }
         set
     }
 
-    pub fn authorize(&mut self, ssh_line: &str) {
-        if self.authorized.lines().any(|l| l.trim() == ssh_line.trim()) {
-            return;
-        }
-        if !self.authorized.is_empty() && !self.authorized.ends_with('\n') {
-            self.authorized.push('\n');
-        }
-        self.authorized.push_str(ssh_line.trim());
-        self.authorized.push('\n');
+    fn default_ttl_days(&self) -> u64 {
+        self.config
+            .default_key_ttl_days
+            .unwrap_or(crate::config::BUILTIN_DEFAULT_TTL_DAYS)
     }
 
-    pub fn admit_peer_tofu(&mut self, ssh_line: &str) -> CspResult<bool> {
-        let set = self.authorized_node_ids();
-        if let Some(n) = parse_ssh_pubkey(ssh_line) {
-            if set.contains(&n) {
+    /// Add a pubkey to `authorized` with no expiry token (host-managed
+    /// surface; equivalent to a manually pasted line). The listen-start
+    /// migration on the embedding host (if any) applies a default TTL.
+    pub fn authorize(&mut self, ssh_line: &str) {
+        self.authorize_with_expiry(ssh_line, crate::authkeys::Expiry::Unset);
+    }
+
+    /// Add a pubkey with a specific expiry; replaces any existing entry for
+    /// the same NodeId.
+    pub fn authorize_with_expiry(
+        &mut self,
+        ssh_line: &str,
+        expiry: crate::authkeys::Expiry,
+    ) {
+        let target = parse_ssh_pubkey(ssh_line.trim());
+        let mut entries = crate::authkeys::parse_file(&self.authorized);
+        let new_line = crate::authkeys::build_line(ssh_line, expiry);
+        if let Some(t) = target {
+            if let Some(i) = entries.iter().position(|e| e.node == Some(t)) {
+                entries[i] = crate::authkeys::parse_line(&new_line);
+                self.authorized = crate::authkeys::serialize(&entries);
+                return;
+            }
+        } else {
+            return;
+        }
+        entries.push(crate::authkeys::parse_line(&new_line));
+        self.authorized = crate::authkeys::serialize(&entries);
+    }
+
+    /// Enrollment-aware admit (§10) — same decision table as `Vault::admit_peer`
+    /// but in-memory: see `vault.rs` docs. `enrollment_authorized` is wired
+    /// from the host's transport layer; for outbound-only thin nodes (the
+    /// SDK) it is always `false`.
+    pub fn admit_peer(
+        &mut self,
+        ssh_line: &str,
+        enrollment_authorized: bool,
+    ) -> CspResult<bool> {
+        let now = now_unix();
+        let Some(peer_node) = parse_ssh_pubkey(ssh_line) else {
+            return Ok(false);
+        };
+        let ttl_days = self.default_ttl_days();
+        let enroll_expiry = || -> crate::authkeys::Expiry {
+            if ttl_days == 0 {
+                crate::authkeys::Expiry::Unset
+            } else {
+                crate::authkeys::Expiry::At(crate::authkeys::expiry_from_ttl_days(now, ttl_days))
+            }
+        };
+        let mut entries = crate::authkeys::parse_file(&self.authorized);
+        if let Some(i) = entries.iter().position(|e| e.node == Some(peer_node)) {
+            if entries[i].expiry.is_valid(now) {
                 return Ok(true);
             }
+            if enrollment_authorized {
+                let line = crate::authkeys::build_line(ssh_line, enroll_expiry());
+                entries[i] = crate::authkeys::parse_line(&line);
+                self.authorized = crate::authkeys::serialize(&entries);
+                return Ok(true);
+            }
+            return Ok(false);
         }
-        if set.is_empty() && !self.config.no_tofu {
-            self.authorize(ssh_line);
+        if enrollment_authorized {
+            let line = crate::authkeys::build_line(ssh_line, enroll_expiry());
+            entries.push(crate::authkeys::parse_line(&line));
+            self.authorized = crate::authkeys::serialize(&entries);
+            return Ok(true);
+        }
+        let any_key = entries.iter().any(|e| e.is_key());
+        if !any_key && !self.config.no_tofu && self.config.auth_keys.is_empty() {
+            let line = crate::authkeys::build_line(ssh_line, enroll_expiry());
+            entries.push(crate::authkeys::parse_line(&line));
+            self.authorized = crate::authkeys::serialize(&entries);
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Back-compat: `admit_peer(ssh, false)`.
+    pub fn admit_peer_tofu(&mut self, ssh_line: &str) -> CspResult<bool> {
+        self.admit_peer(ssh_line, false)
     }
 
     // ---- PITR (§8) -----------------------------------------------------
@@ -514,8 +582,8 @@ impl SessionVault for MemEngine {
     fn integrate(&mut self, raws: &[Vec<u8>]) -> CspResult<usize> {
         MemEngine::integrate(self, raws)
     }
-    fn admit_peer(&mut self, peer_ssh: &str) -> CspResult<bool> {
-        self.admit_peer_tofu(peer_ssh)
+    fn admit_peer(&mut self, peer_ssh: &str, enrollment_authorized: bool) -> CspResult<bool> {
+        MemEngine::admit_peer(self, peer_ssh, enrollment_authorized)
     }
 }
 
