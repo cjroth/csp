@@ -369,10 +369,13 @@ impl Vault {
     }
 
     /// Integrate received raw objects (§6.3): object layer first, then admit
-    /// **signed** primitives whose author key is in this node's local
-    /// authorized set (per-author, not per-connection — §6.1/§10).
-    /// Synthetic fold commits are accepted only by recompute-verification.
-    /// Returns the number of new primitives admitted.
+    /// every primitive whose author signature verifies. **Admission is
+    /// connection-level (§6.1/§10), not per-primitive**: the author NodeId is
+    /// not required to be in this node's `authorized_keys`. The signature
+    /// check is content integrity only — a missing or invalid signature means
+    /// a corrupt/forged primitive (dropped). Synthetic fold commits are
+    /// admitted only by recompute-verification. Returns the number of new
+    /// primitives admitted.
     pub fn integrate(&mut self, raws: &[Vec<u8>]) -> CspResult<usize> {
         for r in raws {
             // Content-addressed + hash-verified on put.
@@ -399,17 +402,14 @@ impl Vault {
                 }
             }
         }
-        let authorized = self.authorized_node_ids()?;
         let mut admitted = 0;
         for r in raws {
             if let Ok(GitObject::Commit(c)) = GitObject::decompress_and_parse(r) {
                 if let Some((counter, _node)) = parse_primitive_meta(&c) {
-                    let author = match verify_primitive(&c) {
-                        Ok(n) => n,
-                        Err(_) => continue, // unverifiable → drop, don't forward
-                    };
-                    if !authorized.is_empty() && !authorized.contains(&author) {
-                        continue; // unauthorized author → drop (§6.1/§10)
+                    if verify_primitive(&c).is_err() {
+                        // Corrupt / forged primitive — drop and don't
+                        // forward. Structural, not policy.
+                        continue;
                     }
                     let oid = GitObject::Commit(c).oid();
                     if !self.state.known.contains(&oid.to_hex()) {
@@ -827,23 +827,58 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_author_is_dropped() {
-        let ta = tempdir().unwrap();
+    fn unknown_author_with_valid_signature_is_admitted() {
+        // New model (§6.1/§10): admission is connection-level. A primitive
+        // signed by a key the receiver does not locally know — but with a
+        // valid signature — is *admitted* and materialized. The trust gate
+        // is the connection (`authorized_keys` on the listener); per-author
+        // checks at integrate time would only re-implement that gate in a
+        // more expensive form, and broke multi-writer convergence through a
+        // relay because each reader had to enumerate every writer.
         let tb = tempdir().unwrap();
-        let mut a = Vault::create(ta.path(), id(1), "v").unwrap();
         let mut b = Vault::create(tb.path(), id(2), "v").unwrap();
-        // a authorizes nobody-but-itself is empty → but b authorizes only a.
+        // b's authorized set is non-empty but does NOT include id(9).
         b.authorize(&id(1).to_ssh_string()).unwrap();
-        // c is an unauthorized author
+        // c authors under a key b has never heard of (id(9)).
         let tc = tempdir().unwrap();
         let mut c = Vault::create(tc.path(), id(9), "v").unwrap();
-        let _ = &mut a;
-        std::fs::write(c.root().join("evil.md"), "pwned").unwrap();
+        std::fs::write(c.root().join("from-stranger.md"), "hello").unwrap();
         c.commit_local_changes().unwrap();
         let cx = c.export_all().unwrap();
         let admitted = b.integrate(&cx).unwrap();
-        assert_eq!(admitted, 0, "unauthorized-author primitive must be dropped");
-        assert!(!tb.path().join("evil.md").exists());
+        assert!(admitted > 0, "unknown-but-valid-signature primitive admits");
+        assert_eq!(
+            std::fs::read_to_string(tb.path().join("from-stranger.md")).unwrap(),
+            "hello",
+            "and materializes into the working tree"
+        );
+    }
+
+    #[test]
+    fn bad_signature_primitive_is_dropped() {
+        // Content-integrity check still runs: a primitive whose signature
+        // does not verify against the claimed author key is structurally
+        // corrupt and dropped — even when the receiver's authorized_keys is
+        // empty (no admission policy at all). This is the *only* drop case
+        // for primitives under the new model (§6.3).
+        let tb = tempdir().unwrap();
+        let mut b = Vault::create(tb.path(), id(2), "v").unwrap();
+        // Build a real, valid signed primitive (parented on a parent oid
+        // that doesn't actually need to resolve — admitted=0 short-circuits
+        // recompute, so the unresolved parent is never walked).
+        let parent = b.main().expect("M₀ at create");
+        let tree = parent; // any Oid; unused on the admit-rejection path
+        let prim_obj = build_primitive(&id(9), tree, parent, 1, 0, "ctx edit");
+        let mut commit = match prim_obj {
+            GitObject::Commit(c) => c,
+            _ => panic!("build_primitive must return a Commit"),
+        };
+        // Mutate the message after signing — the embedded signature now
+        // covers the pre-tamper payload, so verify_primitive will fail.
+        commit.message = commit.message.replace("ctx edit", "evil edit");
+        let tampered = GitObject::Commit(commit).compress();
+        let admitted = b.integrate(&[tampered]).unwrap();
+        assert_eq!(admitted, 0, "tampered primitive must be dropped");
     }
 
     #[test]

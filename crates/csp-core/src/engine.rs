@@ -247,8 +247,9 @@ impl MemEngine {
     }
 
     /// Integrate received raw objects (§6.3): identical policy to the native
-    /// `Vault` — content-addressed put, then admit **signed** primitives
-    /// whose author key is in the local authorized set (per-author, §6.1/§10).
+    /// `Vault` — content-addressed put, then admit every primitive whose
+    /// author signature verifies. Admission is connection-level (§6.1/§10);
+    /// signatures gate corruption only, not authorship policy.
     pub fn integrate(&mut self, raws: &[Vec<u8>]) -> CspResult<usize> {
         for r in raws {
             self.store.put_raw(r)?;
@@ -273,16 +274,12 @@ impl MemEngine {
                 }
             }
         }
-        let authorized = self.authorized_node_ids();
         let mut admitted = 0;
         for r in raws {
             if let Ok(GitObject::Commit(c)) = GitObject::decompress_and_parse(r) {
                 if let Some((counter, _)) = parse_primitive_meta(&c) {
-                    let author = match verify_primitive(&c) {
-                        Ok(n) => n,
-                        Err(_) => continue,
-                    };
-                    if !authorized.is_empty() && !authorized.contains(&author) {
+                    if verify_primitive(&c).is_err() {
+                        // Corrupt / forged primitive — structural drop.
                         continue;
                     }
                     let oid = GitObject::Commit(c).oid();
@@ -552,10 +549,11 @@ mod tests {
 
     #[test]
     fn two_engines_converge_same_main_as_each_other() {
+        // Authorization is connection-level (§6.1/§10); integrate admits any
+        // primitive with a valid signature regardless of author. Neither
+        // engine authorizes the other's key here — convergence must still hold.
         let mut a = MemEngine::create(id(1), "v", "").unwrap();
         let mut b = MemEngine::create(id(2), "v", "").unwrap();
-        a.authorize(&id(2).to_ssh_string());
-        b.authorize(&id(1).to_ssh_string());
         a.commit_from_files(&files(&[("a.md", "AAA")])).unwrap();
         b.commit_from_files(&files(&[("b.md", "BBB")])).unwrap();
         let ax = a.export_closure(&a.known().unwrap()).unwrap();
@@ -563,6 +561,49 @@ mod tests {
         a.integrate(&bx).unwrap();
         b.integrate(&ax).unwrap();
         assert_eq!(a.main(), b.main(), "deterministic fold → identical main");
+    }
+
+    #[test]
+    fn unknown_author_with_valid_signature_is_admitted() {
+        // §6.1/§10: integrate admits primitives signed by keys the receiver
+        // does not locally know — the trust gate is connection admission
+        // (out-of-band here; this is the engine-only path), not per-author.
+        let mut a = MemEngine::create(id(1), "v", "").unwrap();
+        let mut b = MemEngine::create(id(2), "v", "").unwrap();
+        // Non-empty authorized set on b, but DOES NOT contain id(1).
+        b.authorize(&id(99).to_ssh_string());
+        a.commit_from_files(&files(&[("from-stranger.md", "hello")])).unwrap();
+        let ax = a.export_closure(&a.known().unwrap()).unwrap();
+        let admitted = b.integrate(&ax).unwrap();
+        assert!(admitted > 0, "unknown-but-valid-signature primitive must admit");
+        let plan = b.materialize_plan(&BTreeMap::new()).unwrap();
+        assert!(
+            plan.contains(&MaterializeOp::Write {
+                path: "from-stranger.md".into(),
+                content: b"hello".to_vec(),
+            }),
+            "and the content reaches the materialize plan"
+        );
+    }
+
+    #[test]
+    fn bad_signature_primitive_is_dropped() {
+        use crate::identity::build_primitive;
+        // Content-integrity check: a primitive whose signature does not
+        // verify is structurally corrupt and dropped — the only drop case
+        // for primitives under §6.3.
+        let mut b = MemEngine::create(id(2), "v", "").unwrap();
+        let parent = b.main().expect("M₀ at create");
+        let prim_obj = build_primitive(&id(9), parent, parent, 1, 0, "ctx edit");
+        let mut commit = match prim_obj {
+            GitObject::Commit(c) => c,
+            _ => panic!("primitive must be a Commit"),
+        };
+        // Mutate after signing — the embedded signature no longer matches.
+        commit.message = commit.message.replace("ctx edit", "evil edit");
+        let tampered = GitObject::Commit(commit).compress();
+        let admitted = b.integrate(&[tampered]).unwrap();
+        assert_eq!(admitted, 0, "tampered primitive must be dropped");
     }
 
     /// "Verified, not trusted": a received synthetic fold commit that does

@@ -36,8 +36,12 @@ name = "same_nodeid"
 path = "tests/same_nodeid.rs"
 
 [[test]]
-name = "unauthorized_relay"
-path = "tests/unauthorized_relay.rs"
+name = "relay_trust_transitive"
+path = "tests/relay_trust_transitive.rs"
+
+[[test]]
+name = "relay_two_clones"
+path = "tests/relay_two_clones.rs"
 
 [[test]]
 name = "snapshot_restore"

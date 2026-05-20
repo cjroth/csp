@@ -14,7 +14,7 @@ pub enum CspError {
     BadSignature(String),
     #[error("channel binding mismatch: {0}")]
     ChannelBinding(String),
-    #[error("unauthorized author: {0}")]
+    #[error("peer not authorized: {0}")]
     Unauthorized(String),
     #[error("fold verification failed: {0}")]
     FoldVerify(String),

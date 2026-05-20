@@ -359,15 +359,25 @@ so no listener is privileged. Because object integration is idempotent and the
 merge deterministic, any topology (star, mesh, chain, gossip) converges to the
 same `main`.
 
-**Relays confer no trust.** A relay forwards objects but its having forwarded
-them grants them nothing. Authorization is **per primitive author, not per
-connection** (§10): a receiver accepts a primitive only if (a) its author
-signature verifies and (b) the author NodeId key is in the *receiver's own*
-local authorized set — regardless of which peer relayed it. So `A` trusting
-`B`, and `B` trusting `C`, does **not** make `A` accept `C`-authored content
-relayed via `B`; content does not gain trust transitively. Synthetic fold
-commits are unsigned and instead admitted only if they recompute-verify
-(§5.2) from already-accepted primitives.
+**Trust is connection-level; signatures are content integrity.** Each listener
+admits inbound connections against its local `authorized_keys` (§10) — that
+admission is the load-bearing trust gate. Once a peer is admitted, every
+primitive it sends or relays is integrated regardless of who originally
+authored it. Primitives still carry their author signature for *integrity*:
+the signature must verify (a primitive with a missing or invalid signature is
+corrupt and dropped, the same way a fold commit that fails recompute-verify
+is dropped, §5.2) — but the author NodeId is **not** required to appear in
+the receiver's `authorized_keys`. Trust is therefore *intentionally
+transitive through admitted connections*: `A → relay → B` converges because
+both `A` and `B` admit the relay and the relay admits both of them; content
+authored by anyone the relay admits flows to every reader. This is what
+makes a multi-writer single-relay topology — the common hub-and-spoke
+deployment — converge without each reader having to enumerate every writer's
+key. The trade-off: a compromised relay can forward primitives signed by
+anyone (including freshly-minted keys), so the operator's responsibility is
+to gate writers at each listener's admission. Synthetic fold commits are
+unsigned and admitted only by recompute-verification (§5.2) from
+already-accepted primitives.
 
 ### 6.2 Transport
 
@@ -383,9 +393,12 @@ carries that fold commit, its parents, transitively to `M₀`: synthetic fold
 commits **are** transmitted as ordinary reachable git objects (a dangling
 parent is an invalid DAG). They are **verified, not trusted** — each
 recompute-verifies from its own parent list (§5.2). Primitive commits are
-**accepted only if the author signature verifies and the author key is in the
-receiver's local authorized set** (§6.1/§10), independent of the relaying
-peer; unauthorized or unverifiable objects are dropped and not forwarded.
+**accepted iff the author signature verifies** (§6.1/§10) — a primitive with
+a missing or invalid signature is corrupt and dropped. The author NodeId is
+*not* required to be in any local set: admission is the connection-level
+gate (§10), not per-primitive. Unverifiable objects (bad signature, malformed
+commit, or a fold commit that fails recompute-verify) are dropped and not
+forwarded.
 **Every node — browser/WebView included — recomputes its own current `main`**
 (one engine everywhere, §4/§7); no node recomputes *historical* fold commits
 (those are recompute-verified once on receipt, §5.2, then trusted). Snapshots
@@ -399,7 +412,7 @@ connect each side advertises a compact **digest of its current frontier**
 lineage). Each side requests the tip SHAs it lacks, then pulls each tip's
 reachable closure (which backfills its parent fold commits → `M₀`); objects
 are content-addressed, deduplicated, idempotent, hash-verified, and
-authorized per-author (§6.3). Then both sides recompute `main` and
+signature-verified per primitive (§6.3). Then both sides recompute `main` and
 materialize.
 
 A scalar per-NodeId version vector is **unsound as the correctness
@@ -627,18 +640,22 @@ thin-node retention horizon are explicitly deferred, not a v1 concern.
   and is never synced. A per-vault key is an opt-in for stronger isolation
   (a compromised vault dir can't then expose a key used elsewhere), at the
   cost of key sprawl.
-- **Authorization via node-local `authorized_keys`.** A listening (full) node
-  admits only peers whose public key appears in
-  `<scope-root>/.context/authorized_keys` — one key per line, `#` comments, same
-  syntax/semantics as SSH's. It is **node-local and NOT synced** (it is under
-  `.context/`, which §11's HARD INVARIANT excludes from replication entirely):
+- **Authorization via node-local `authorized_keys` — the load-bearing trust
+  gate.** A listening (full) node admits only peers whose public key appears
+  in `<scope-root>/.context/authorized_keys` — one key per line, `#` comments,
+  same syntax/semantics as SSH's. **This is the *only* trust gate**:
+  primitives received over an admitted connection are integrated regardless
+  of who originally authored them (§6.1) — signatures gate *integrity*, not
+  admission. The set is **node-local and NOT synced** (it is under `.context/`,
+  which §11's HARD INVARIANT excludes from replication entirely):
   authorization is per-node config, never propagated. Managed via
   `ctx authorize <pubkey>` / `ctx revoke <pubkey>`, the `CTX_AUTHORIZED_KEYS`
   env var (merge-on-start, idempotent), or seeding at `ctx init`. `ctx key`
   prints a node's own public key for sharing. (Trade-off, chosen
   deliberately: adding a key must be done on each listener and does not
-  propagate — simpler and removes the "a peer pushes a malicious key to every
-  node" vector; acceptable because listeners are few full nodes, §7.)
+  propagate — simpler, removes the "a peer pushes a malicious key to every
+  node" vector, and matches the topology — listeners are few full nodes, §7,
+  so writer admission converges to managing one set per relay.)
 - **Bootstrap: trust-on-first-use, bounded to the empty-set window.** When a
   listening node has **no** local authorized set yet (genuine first-peer
   bootstrap), it MAY trust-on-first-use: the first connecting key is recorded
@@ -684,17 +701,29 @@ thin-node retention horizon are explicitly deferred, not a v1 concern.
   A handshake-transcript or framing change is a coordinated break: the wire
   `proto` version is bumped so skew is reported as a clear version-mismatch
   rather than an opaque signature error.
-- **Per-author authorization (not per-connection).** Transport auth alone is
-  insufficient in a relay protocol. Every **primitive commit is signed by its
-  author NodeId key** (§5.1/§5.2). A node accepts a primitive only if (a) the
-  author signature verifies and (b) the author key is in *its own* local
-  `authorized_keys` — **regardless of which peer relayed it**. Relays forward
-  but confer no trust (§6.1); content does not gain trust transitively.
-  Synthetic fold commits are unsigned and admitted only by recompute-
-  verification (§5.2). Bootstrap of a new replica: `ctx clone` conveys the
-  source's authorized-key set for the user to accept (or TOFU /
-  `CTX_AUTHORIZED_KEYS` seeds it) — a freshly cloned node thus starts with a
-  workable authorized set rather than rejecting everything.
+- **Per-primitive signature verification (not a second admission filter).**
+  Transport admission (above) is the trust gate; primitive signatures are
+  *content integrity*, not policy. Every **primitive commit is signed by its
+  author NodeId key** (§5.1/§5.2); receivers verify that signature on receipt
+  and drop any primitive whose signature is missing or invalid — that is a
+  corrupt or forged object, structurally not a valid CSP primitive. Once the
+  signature verifies, the primitive is admitted regardless of whether the
+  author key is locally known: relays explicitly extend trust to whatever
+  their admitted peers send, and content authored by anyone the relay admits
+  flows through to readers connected to that relay. This makes a multi-writer
+  single-relay topology converge naturally — `A`, `B`, both connect through
+  relay `R`; `R` admits both at the connection layer; `A`'s primitives reach
+  `B` (and vice versa) via `R`'s broadcast without either side enumerating
+  the other's key. Synthetic fold commits are unsigned and admitted only by
+  recompute-verification (§5.2). Bootstrap of a new replica: `ctx clone`
+  pins the peer's NodeId for connection-level trust on subsequent
+  reconnects; no per-author authorization set needs to be conveyed.
+  **Trade-off:** a compromised listener admits forged authors as freely as
+  legitimate ones. The mitigation is operational — gate writers at each
+  listener's admission, treat a relay compromise as a vault compromise — not
+  cryptographic re-verification at every hop (which would only reproduce
+  connection-level admission in a more expensive form, since each hop is
+  already mutually authenticated).
 - **Identity / single-writer protection.** A NodeId is the ed25519 key.
   Reusing it across *different* vaults is fine; the *same key actively writing
   two replicas of one vault* is the hazard (§5.1). The counter is durably
@@ -725,9 +754,11 @@ thin-node retention horizon are explicitly deferred, not a v1 concern.
   received object is stored under the SHA recomputed from its own bytes, so a
   corrupted or substituted object cannot masquerade as another and is never
   referenced by a valid DAG. Trust does **not** come from the bytes hashing —
-  it comes from per-author **primitive signatures** (§5.1/§10) and **fold-
-  commit recompute-verification on receipt** (§5.2/§6.3). Unsigned,
-  unauthorized, or recompute-failing data is dropped and not forwarded.
+  it comes from **connection-level admission** (§10) plus *content integrity*:
+  **primitive signatures** (§5.1/§10) ensure each primitive is well-formed by
+  its claimed author, and **fold-commit recompute-verification on receipt**
+  (§5.2/§6.3) ensures synthetic fold commits are derivable. Unsigned,
+  signature-invalid, or recompute-failing data is dropped and not forwarded.
 
 ---
 
@@ -894,8 +925,8 @@ thin-node retention horizon are explicitly deferred, not a v1 concern.
 - **THE HEADLINE GATE — the binary-left-fold protocol (§5.1–§5.4, §6.3–§6.4,
   §10), as one interlocking unit.** CSP's single highest-risk, make-or-break
   property. The fold-chain, frontier anti-entropy, the strict total order, and
-  per-author signatures share invariants and must be validated *together*, not
-  as independent pieces. Correctness hinges, co-equally, on:
+  per-primitive signatures share invariants and must be validated *together*,
+  not as independent pieces. Correctness hinges, co-equally, on:
   1. **Complete DAG** — synthetic fold commits are transmitted as reachable
      objects; no node ever has a dangling parent (§5.2/§6.3).
   2. **Deterministic per-step base** — `git-merge-base(accₖ₋₁, Tₖ)` over the
@@ -906,16 +937,20 @@ thin-node retention horizon are explicitly deferred, not a v1 concern.
   4. **Byte-pinned, unsigned fold commit object** (§5.4).
   5. **Frontier-set anti-entropy** delivers the full primitive set under
      arbitrary gossip/mesh; a scalar VV does not (§6.4).
-  6. **Per-author signature + local authorization** so relays confer no trust
-     (§6.1/§10).
+  6. **Per-primitive signature verification** for content integrity, plus
+     **connection-level admission** as the trust gate (§6.1/§10) — relays are
+     trusted by virtue of admission, primitive signatures gate corruption not
+     authorship policy.
   **Conformance suite (hard, CI-blocking).** N simulated independent nodes;
   scenarios MUST include: concurrent commits with *differing parent fold
   commits* and multi-tip frontiers; the **offline-then-merge** case (A authors
   off a fold commit B never computed; B resolves it from the transmitted
   object); **same-NodeId concurrent authoring** (two replicas of one vault,
   equal counter → SHA tiebreak keeps a strict total order, convergence holds);
-  a **relay delivering an unauthorized-author primitive** (dropped, not
-  forwarded, not trusted via the relaying peer); and **gossip/mesh delivery**
+  a **relay delivering a primitive signed by a NodeId the receiver does not
+  locally know** (admitted — connection admission is the trust gate, §10);
+  a **relay delivering a primitive with an invalid signature** (dropped, not
+  forwarded; corruption defense, not policy); and **gossip/mesh delivery**
   that would defeat a scalar VV. Assert: (a) identical `main` SHA *and* tree
   across all nodes and all delivery orders; (b) every received synthetic fold
   commit **recursively recompute-verifies** from its own parent list to its
@@ -1000,8 +1035,10 @@ End-to-end (file saved on A → visible on B), with the dominant terms:
   **synthetic fold commits** replicate as ordinary reachable, deterministic,
   recompute-*verifiable* objects (DAG never dangling); only the *current*
   `main` is recomputed, byte-identically, everywhere (convergent, no authority,
-  stock-git-coherent). Frontier-set anti-entropy and per-author signatures keep
-  this sound under gossip topology and untrusted relays.
+  stock-git-coherent). Frontier-set anti-entropy keeps replication sound under
+  arbitrary gossip topology; per-primitive signatures keep content well-formed;
+  connection-level admission (§10) is the trust gate — relays are trusted
+  through that gate, not bypassed by signature checks.
 - **Realtime transport, not git’s.** Persistent push + delta catch-up gives
   near-real-time sync with zero polling and no commit-then-wait latency.
 - **One Rust/wasm engine; one behavior.** The same core runs everywhere and

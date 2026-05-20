@@ -1,10 +1,11 @@
 //! Replication protocol (§6, §10). Persistent, reliable, ordered,
 //! message-oriented, bidirectional, fully symmetric (§6.2). Git's smart
 //! protocol is not used; there is no polling. Mutual ed25519 handshake over
-//! a nonce transcript (§10); **per-author** authorization enforced in
-//! `Vault::integrate` regardless of the relaying peer (§6.1/§10);
-//! frontier-set anti-entropy catch-up (§6.4); immediate live push (§6.5);
-//! full nodes relay (§6.1).
+//! a nonce transcript (§10) gates **connection admission** against the
+//! listener's local `authorized_keys` — this is the load-bearing trust gate
+//! (§6.1/§10); `Vault::integrate` verifies primitive signatures for content
+//! integrity but does not re-authorize per author. Frontier-set anti-entropy
+//! catch-up (§6.4); immediate live push (§6.5); full nodes relay (§6.1).
 //!
 //! Default transport is wss:// using a self-signed certificate the listener
 //! generates and persists; connectors accept any server cert at the TLS
@@ -415,8 +416,27 @@ async fn run_session(
     // Drive the handshake (inbound only) until established. Subscribing to
     // the relay bus *after* the handshake preserves the original ordering
     // (no `Live` can be selected mid-handshake).
+    //
+    // Connection admission is the load-bearing trust gate (§6.1/§10), so the
+    // handshake must complete in bounded wall time — otherwise an
+    // unauthenticated peer can hold a session task open indefinitely
+    // (slow-loris on tokio task + Session struct + relay-channel slot). The
+    // deadline is enforced as a budget across all handshake recvs, not per-
+    // recv, so a peer that drip-feeds bytes still gets dropped on time.
+    const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
-        let Some(msg) = t.recv().await else {
+        let recv = match tokio::time::timeout_at(deadline, t.recv()).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(
+                    "handshake did not complete within {:?} — dropping connection",
+                    HANDSHAKE_TIMEOUT
+                );
+                return Err(CspError::Protocol("handshake timeout".into()));
+            }
+        };
+        let Some(msg) = recv else {
             tracing::info!("peer session ended");
             return Ok(());
         };
