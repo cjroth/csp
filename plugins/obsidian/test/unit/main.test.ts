@@ -80,6 +80,26 @@ describe('inlined-wasm helpers', () => {
   });
 });
 
+describe('missing WebAssembly (iOS Lockdown Mode, ancient Android WebView)', () => {
+  test('runSetup surfaces an actionable error instead of ReferenceError', async () => {
+    const { plugin } = makePlugin();
+    await plugin.onload();
+    // Simulate a WebView without WebAssembly. The plugin can't init the
+    // engine without it — we want a clear error pointing at the cause.
+    const saved = (globalThis as { WebAssembly?: unknown }).WebAssembly;
+    delete (globalThis as { WebAssembly?: unknown }).WebAssembly;
+    try {
+      await expect(plugin.runSetup({ mode: 'create' })).rejects.toThrow(
+        /WebAssembly.*Lockdown Mode|Android System WebView/,
+      );
+      expect(plugin.isConfigured()).toBe(false);
+    } finally {
+      (globalThis as { WebAssembly?: unknown }).WebAssembly = saved;
+    }
+    await plugin.onunload();
+  });
+});
+
 describe('onload — unconfigured', () => {
   test('registers commands, status bar idle, stays unconfigured', async () => {
     const { plugin } = makePlugin();

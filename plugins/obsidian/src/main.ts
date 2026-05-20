@@ -255,7 +255,24 @@ export default class ContextSyncPlugin extends Plugin {
   // ---- Internal ----
 
   private async initWasm(): Promise<void> {
-    if (!isInitialized() && this.wasmBytes && this.wasmBytes.length > 0) {
+    // The engine is a Rust crate compiled to wasm — there is no JS fallback.
+    // The most common reasons WebAssembly is unavailable in a host that
+    // otherwise runs the plugin: iOS Lockdown Mode (turns off JIT, kills
+    // Wasm) and very old Android WebViews. Surface that up front so the
+    // user gets an actionable message instead of `ReferenceError`. We
+    // assert this even when `isInitialized()` is true so a host that lost
+    // the runtime mid-session (or a test that simulates the missing global)
+    // still gets the readable error.
+    if (typeof WebAssembly === 'undefined') {
+      throw new Error(
+        "this device's WebView doesn't support WebAssembly. On iOS, " +
+          'turn off Lockdown Mode (Settings → Privacy & Security → ' +
+          'Lockdown Mode) and reopen Obsidian. On Android, update the ' +
+          'system WebView (Google Play → Android System WebView).',
+      );
+    }
+    if (isInitialized()) return;
+    if (this.wasmBytes && this.wasmBytes.length > 0) {
       await initCsp(this.wasmBytes);
     }
   }

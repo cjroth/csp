@@ -43,6 +43,26 @@ if (!hasWasmOpt) {
 }
 const mb = (p) => (statSync(p).size / 1048576).toFixed(2);
 
+// Pin the wasm feature set to the wasm "MVP-plus" baseline that every
+// shipping WebView understands. Recent rustc/LLVM enable reference-types,
+// multivalue, bulk-memory, sign-ext, mutable-globals, and nontrapping-fptoint
+// by default; the type tags they introduce break parsing on older iOS Safari
+// (the symptom we hit was `CompileError: WebAssembly.Module doesn't parse at
+// byte N: ...Type is non-Func, non-Struct, and non-Array`). Disabling
+// reference-types is the load-bearing knob — without it the Type section
+// only ever emits `funcref` / non-ref types — but we drop the whole 2.0
+// bundle for the widest reach. The native (`ctx`) build is unaffected: this
+// is the `wasm32-unknown-unknown` target only, scoped to this subprocess.
+const WASM_MVP_FEATURES = [
+  '-reference-types',
+  '-multivalue',
+  '-bulk-memory',
+  '-sign-ext',
+  '-mutable-globals',
+  '-nontrapping-fptoint',
+].join(',');
+const RUSTFLAGS = `${process.env.RUSTFLAGS ?? ''} -C target-feature=${WASM_MVP_FEATURES}`.trim();
+
 for (const [target, out] of [
   ['nodejs', resolve(root, 'pkg')],
   ['web', resolve(root, 'pkg-web')],
@@ -57,6 +77,7 @@ for (const [target, out] of [
       ...process.env,
       CARGO_PROFILE_RELEASE_OPT_LEVEL: 'z',
       CARGO_PROFILE_RELEASE_PANIC: 'abort',
+      RUSTFLAGS,
     },
   });
   if (res.status !== 0) {
