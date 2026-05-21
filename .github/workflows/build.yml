@@ -320,7 +320,18 @@ jobs:
 
   release:
     name: GitHub Release
-    if: github.ref_type == 'tag'
+    # BRAT installs the Obsidian plugin from this release, so we cut a Release
+    # whenever the Obsidian build succeeds — even if an unrelated job (a
+    # flaky Windows cargo build, a transient SDK test, a Tauri artifact
+    # upload glitch) failed. The CLI / SDK / desktop bundles are attached
+    # best-effort: present when their job succeeded, simply omitted when it
+    # didn't. Without this the whole release tag silently produced no
+    # downloadable plugin, which is exactly what BRAT can't recover from.
+    if: |
+      always() &&
+      github.ref_type == 'tag' &&
+      needs.version.result == 'success' &&
+      needs.obsidian.result == 'success'
     needs: [version, cli, wasm-sdk, desktop, obsidian]
     runs-on: ubuntu-latest
     permissions:
@@ -333,14 +344,21 @@ jobs:
       - name: Stage release files
         run: |
           mkdir -p release
-          # CLI archives (one tar.gz/zip per OS), SDK tarball — flat copy.
-          find artifacts/ctx-* artifacts/csp-sdk -type f -exec cp {} release/ \;
-          # Desktop bundles — copy by extension, flat.
-          find artifacts/desktop-* -type f \
+          # CLI archives (one tar.gz/zip per OS) — best effort. `find` is
+          # already missing-dir-tolerant; the trailing `|| true` covers the
+          # case where no `ctx-*` artifacts exist at all.
+          find artifacts -maxdepth 1 -type d -name 'ctx-*' \
+            -exec find {} -type f -exec cp {} release/ \; \; || true
+          # SDK tarball — best effort.
+          if [ -d artifacts/csp-sdk ]; then
+            find artifacts/csp-sdk -type f -exec cp {} release/ \; || true
+          fi
+          # Desktop bundles — best effort, by extension, flat.
+          find artifacts -maxdepth 2 -type f \
             \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \
-            -o -name '*.msi' -o -name '*.exe' \) -exec cp {} release/ \;
-          # Obsidian plugin — main.js + manifest.json (BRAT reads these
-          # by exact name, do NOT rename).
+            -o -name '*.msi' -o -name '*.exe' \) -exec cp {} release/ \; || true
+          # Obsidian plugin — REQUIRED. main.js + manifest.json (BRAT reads
+          # these by exact name, do NOT rename).
           cp artifacts/obsidian-plugin/main.js release/main.js
           cp artifacts/obsidian-plugin/manifest.json release/manifest.json
           ls -la release/
@@ -351,5 +369,7 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           generate_release_notes: true
+          # The two Obsidian files are always staged (the step above fails
+          # otherwise); the rest are attached when their job succeeded.
           fail_on_unmatched_files: true
           files: release/*
