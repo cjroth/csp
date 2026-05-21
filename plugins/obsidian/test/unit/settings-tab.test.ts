@@ -31,6 +31,7 @@ beforeAll(() => {
 interface RunSetupCall {
   mode: 'create' | 'connect';
   peerUrl?: string;
+  authKey?: string;
 }
 
 function makeController(over: Record<string, unknown> = {}) {
@@ -165,7 +166,9 @@ describe('setup wizard (unconfigured)', () => {
     url?.onChangeText?.('wss://node:7777');
     const submit = __obsidian.button('Set up Context');
     await submit?.onClick?.();
-    expect(plugin.runSetupCalls).toEqual([{ mode: 'connect', peerUrl: 'wss://node:7777' }]);
+    expect(plugin.runSetupCalls).toEqual([
+      { mode: 'connect', peerUrl: 'wss://node:7777', authKey: '' },
+    ]);
     expect(Notice.log).toContain('Context: setup complete.');
   });
 
@@ -177,7 +180,31 @@ describe('setup wizard (unconfigured)', () => {
     url?.onChangeText?.('sync.example.com');
     const submit = __obsidian.button('Set up Context');
     await submit?.onClick?.();
-    expect(plugin.runSetupCalls).toEqual([{ mode: 'connect', peerUrl: 'sync.example.com' }]);
+    expect(plugin.runSetupCalls).toEqual([
+      { mode: 'connect', peerUrl: 'sync.example.com', authKey: '' },
+    ]);
+  });
+
+  test('the auth-key field flows through runSetup and is NOT clobbered by defaults', async () => {
+    const plugin = makePlugin();
+    const tab = makeTab(plugin);
+    tab.display();
+    const url = __obsidian.setting('Peer URL')?.components.find((c) => c.kind === 'text');
+    url?.onChangeText?.('wss://node:7777');
+    const ak = __obsidian.setting('Auth key (optional)')?.components.find((c) => c.kind === 'text');
+    ak?.onChangeText?.('  shhh-bearer-token  ');
+    const submit = __obsidian.button('Set up Context');
+    await submit?.onClick?.();
+    // The wizard passes the auth key through (whitespace preserved here —
+    // runSetup trims). What we're verifying is that it isn't dropped on
+    // the way through `runSetup`'s settings reset.
+    expect(plugin.runSetupCalls).toEqual([
+      {
+        mode: 'connect',
+        peerUrl: 'wss://node:7777',
+        authKey: '  shhh-bearer-token  ',
+      },
+    ]);
   });
 
   test('a runSetup failure surfaces the error notice', async () => {
@@ -191,7 +218,7 @@ describe('setup wizard (unconfigured)', () => {
     dd?.onChangeSelect?.('create'); // create mode → no URL needed
     const submit = __obsidian.button('Set up Context');
     await submit?.onClick?.();
-    expect(plugin.runSetupCalls).toEqual([{ mode: 'create', peerUrl: '' }]);
+    expect(plugin.runSetupCalls).toEqual([{ mode: 'create', peerUrl: '', authKey: '' }]);
     expect(Notice.log.some((m) => /setup failed — Error: handshake refused/.test(m))).toBe(true);
   });
 

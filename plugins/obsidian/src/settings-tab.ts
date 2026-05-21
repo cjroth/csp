@@ -20,6 +20,11 @@ export class ContextSyncSettingTab extends PluginSettingTab {
   // Transient wizard state (not persisted until the user submits setup).
   private setupMode: 'create' | 'connect' = 'connect';
   private setupPeerUrl = '';
+  // Hold the auth-key locally instead of writing through to
+  // `plugin.settings.authKey` on every keystroke — `runSetup` rebuilds
+  // settings from DEFAULT_SETTINGS and used to clobber the in-flight value
+  // before it ever reached `Vault.clone`.
+  private setupAuthKey = '';
   private busy = false;
   private seeded = false;
 
@@ -58,6 +63,7 @@ export class ContextSyncSettingTab extends PluginSettingTab {
         this.setupMode = 'connect';
         this.setupPeerUrl = s.peerUrl;
       }
+      if (s.authKey) this.setupAuthKey = s.authKey;
       this.seeded = true;
     }
 
@@ -111,9 +117,9 @@ export class ContextSyncSettingTab extends PluginSettingTab {
         .addText((t) => {
           t.inputEl.type = 'password';
           t.setPlaceholder('paste only if required')
-            .setValue(this.plugin.settings.authKey)
+            .setValue(this.setupAuthKey)
             .onChange((v) => {
-              this.plugin.settings.authKey = v.trim();
+              this.setupAuthKey = v;
             });
         });
     } else {
@@ -151,6 +157,7 @@ export class ContextSyncSettingTab extends PluginSettingTab {
             await this.plugin.runSetup({
               mode: this.setupMode,
               peerUrl: this.setupPeerUrl,
+              authKey: this.setupAuthKey,
             });
             new Notice('Context: setup complete.');
           } catch (err) {

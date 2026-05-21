@@ -64,6 +64,11 @@ export interface SetupOptions {
   /** Peer (full-node listener) URL. Required for connect; optional for
    * create (CSP §7 — a local vault won't converge without a peer). */
   peerUrl?: string;
+  /** Pre-shared bearer auth-key (CSP §10). Sent on the WebSocket upgrade
+   * so the listener — when it has `CTX_AUTH_KEY` set — enrolls this
+   * device's pubkey into its `authorized_keys`. Optional: omit when
+   * the listener is in TOFU mode or this device is already enrolled. */
+  authKey?: string;
 }
 
 export default class ContextSyncPlugin extends Plugin {
@@ -157,6 +162,14 @@ export default class ContextSyncPlugin extends Plugin {
     const s: CspSettings = { ...DEFAULT_SETTINGS };
     s.syncEnabled = true;
     if (opts.peerUrl) s.peerUrl = normalizePeerUrl(opts.peerUrl);
+    // Auth-key: the listener's WS upgrade reads this as a bearer token and
+    // (on match) enrolls our device pubkey into its `authorized_keys`.
+    // Take it from opts when the wizard passes one explicitly; fall back to
+    // whatever is already in-memory (the wizard's auth-key field binds
+    // directly to `plugin.settings.authKey` so re-runs after a partial
+    // setup don't lose it).
+    if (opts.authKey !== undefined) s.authKey = opts.authKey.trim();
+    else if (this.settings.authKey) s.authKey = this.settings.authKey;
     // Mobile keeps the key in-vault (under the excluded `.context/`); record
     // it so a `ctx` on a synced copy resolves the same file. Desktop leaves
     // it unset (CLI default `~/.context/id_ed25519`).
