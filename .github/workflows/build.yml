@@ -59,16 +59,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # macos-x86_64 (Intel Mac) is intentionally absent: the macos-13
+      # GitHub-hosted runner pool routinely backs up for >24h, so jobs
+      # queued on it never run and block the release. aarch64 covers every
+      # shipping Mac.
       matrix:
         include:
           - label: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin: ctx
-            archive: tar.gz
-          - label: macos-x86_64
-            os: macos-13
-            target: x86_64-apple-darwin
             bin: ctx
             archive: tar.gz
           - label: macos-aarch64
@@ -197,6 +196,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # Note on bundle paths: Tauri puts artifacts under
+      # `target/<triple>/release/bundle/<kind>/...` when --target is passed
+      # (which we always do here). The artifact_glob entries below carry
+      # that triple — an earlier version had `target/release/bundle/...`
+      # and silently dropped every bundle from the Release. macos-x86_64
+      # (Intel) is intentionally absent: the macos-13 GitHub-hosted runner
+      # pool routinely backs up for >24h, so jobs queued on it never run
+      # and block downstream steps. aarch64 covers every shipping Mac.
       matrix:
         include:
           - label: linux-x86_64
@@ -204,29 +211,21 @@ jobs:
             target: x86_64-unknown-linux-gnu
             bundles: deb,appimage
             artifact_glob: |
-              desktop/src-tauri/target/release/bundle/deb/*.deb
-              desktop/src-tauri/target/release/bundle/appimage/*.AppImage
-          - label: macos-x86_64
-            os: macos-13
-            target: x86_64-apple-darwin
-            bundles: dmg,app
-            artifact_glob: |
-              desktop/src-tauri/target/release/bundle/dmg/*.dmg
-              desktop/src-tauri/target/release/bundle/macos/*.app
+              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
           - label: macos-aarch64
             os: macos-14
             target: aarch64-apple-darwin
-            bundles: dmg,app
+            bundles: dmg
             artifact_glob: |
-              desktop/src-tauri/target/release/bundle/dmg/*.dmg
-              desktop/src-tauri/target/release/bundle/macos/*.app
+              desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
           - label: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: msi,nsis
             artifact_glob: |
-              desktop/src-tauri/target/release/bundle/msi/*.msi
-              desktop/src-tauri/target/release/bundle/nsis/*.exe
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 

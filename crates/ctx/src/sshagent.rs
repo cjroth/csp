@@ -15,11 +15,19 @@
 //! `Identity` and signs synchronously, so an agent-held key currently stops
 //! at a loud, documented seam (see `idstore::Signer::identity`). The code is
 //! kept so wiring the seam later is a local change, not a rewrite.
+//
+// The socket transport is Unix-only (`SSH_AUTH_SOCK` is a `AF_UNIX` socket on
+// every platform `ssh` ships with that protocol). Windows builds reach the
+// same surface through a `#[cfg(not(unix))]` stub at the bottom of the file:
+// `Agent::from_env()` returns `None` so identity resolution naturally falls
+// through to the in-process path, and the other entry points bail with a
+// clear "ssh-agent transport is Unix-only" error if anything does invoke
+// them. Without this gating the entire `ctx` Windows build broke at
+// `use std::os::unix::net::UnixStream;` even though no Windows user can
+// actually drive the agent path.
 #![allow(dead_code)]
 
-use anyhow::{anyhow, bail, Context, Result};
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use anyhow::{anyhow, bail, Result};
 
 const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
@@ -58,103 +66,140 @@ fn take_str<'a>(buf: &'a [u8], off: &mut usize) -> Result<&'a [u8]> {
     Ok(s)
 }
 
-/// One length-framed request → one length-framed reply on the agent socket.
-fn round_trip(sock: &mut UnixStream, body: &[u8]) -> Result<Vec<u8>> {
-    let mut framed = Vec::with_capacity(body.len() + 4);
-    put_u32(&mut framed, body.len() as u32);
-    framed.extend_from_slice(body);
-    sock.write_all(&framed).context("ssh-agent: write request")?;
-    let mut len = [0u8; 4];
-    sock.read_exact(&mut len)
-        .context("ssh-agent: read reply length")?;
-    let n = u32::from_be_bytes(len) as usize;
-    let mut reply = vec![0u8; n];
-    sock.read_exact(&mut reply)
-        .context("ssh-agent: read reply body")?;
-    Ok(reply)
-}
+#[cfg(unix)]
+mod unix_impl {
+    use super::{
+        put_str, put_u32, take_str, take_u32, SSH_AGENTC_REQUEST_IDENTITIES,
+        SSH_AGENTC_SIGN_REQUEST, SSH_AGENT_IDENTITIES_ANSWER, SSH_AGENT_SIGN_RESPONSE,
+    };
+    use anyhow::{bail, Context, Result};
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
 
-/// A handle to the running SSH agent named by `SSH_AUTH_SOCK`.
-pub struct Agent {
-    path: String,
-}
-
-impl Agent {
-    /// The agent advertised via `SSH_AUTH_SOCK`, if any.
-    pub fn from_env() -> Option<Agent> {
-        let path = std::env::var("SSH_AUTH_SOCK").ok()?;
-        if path.is_empty() {
-            return None;
-        }
-        Some(Agent { path })
+    /// One length-framed request → one length-framed reply on the agent socket.
+    fn round_trip(sock: &mut UnixStream, body: &[u8]) -> Result<Vec<u8>> {
+        let mut framed = Vec::with_capacity(body.len() + 4);
+        put_u32(&mut framed, body.len() as u32);
+        framed.extend_from_slice(body);
+        sock.write_all(&framed).context("ssh-agent: write request")?;
+        let mut len = [0u8; 4];
+        sock.read_exact(&mut len)
+            .context("ssh-agent: read reply length")?;
+        let n = u32::from_be_bytes(len) as usize;
+        let mut reply = vec![0u8; n];
+        sock.read_exact(&mut reply)
+            .context("ssh-agent: read reply body")?;
+        Ok(reply)
     }
 
-    /// Point at a specific agent socket (used by tests that spawn their own
-    /// `ssh-agent`; production always goes through `SSH_AUTH_SOCK`).
-    #[cfg(test)]
-    pub fn for_test(path: &str) -> Agent {
-        Agent { path: path.to_string() }
+    /// A handle to the running SSH agent named by `SSH_AUTH_SOCK`.
+    pub struct Agent {
+        path: String,
     }
 
-    fn connect(&self) -> Result<UnixStream> {
-        UnixStream::connect(&self.path)
-            .with_context(|| format!("connect ssh-agent at {}", self.path))
-    }
-
-    /// Every `ssh-ed25519` public key the agent currently holds, as its raw
-    /// OpenSSH key blob (`string(algo) || string(key)`).
-    pub fn ed25519_key_blobs(&self) -> Result<Vec<Vec<u8>>> {
-        let mut sock = self.connect()?;
-        let reply = round_trip(&mut sock, &[SSH_AGENTC_REQUEST_IDENTITIES])?;
-        if reply.first() != Some(&SSH_AGENT_IDENTITIES_ANSWER) {
-            bail!("ssh-agent: unexpected reply to identities request");
-        }
-        let mut off = 1usize;
-        let n = take_u32(&reply, &mut off)?;
-        let mut out = Vec::new();
-        for _ in 0..n {
-            let blob = take_str(&reply, &mut off)?.to_vec();
-            let _comment = take_str(&reply, &mut off)?;
-            let mut bo = 0usize;
-            if take_str(&blob, &mut bo)? == b"ssh-ed25519" {
-                out.push(blob);
+    impl Agent {
+        pub fn from_env() -> Option<Agent> {
+            let path = std::env::var("SSH_AUTH_SOCK").ok()?;
+            if path.is_empty() {
+                return None;
             }
+            Some(Agent { path })
         }
-        Ok(out)
+
+        #[cfg(test)]
+        pub fn for_test(path: &str) -> Agent {
+            Agent { path: path.to_string() }
+        }
+
+        fn connect(&self) -> Result<UnixStream> {
+            UnixStream::connect(&self.path)
+                .with_context(|| format!("connect ssh-agent at {}", self.path))
+        }
+
+        pub fn ed25519_key_blobs(&self) -> Result<Vec<Vec<u8>>> {
+            let mut sock = self.connect()?;
+            let reply = round_trip(&mut sock, &[SSH_AGENTC_REQUEST_IDENTITIES])?;
+            if reply.first() != Some(&SSH_AGENT_IDENTITIES_ANSWER) {
+                bail!("ssh-agent: unexpected reply to identities request");
+            }
+            let mut off = 1usize;
+            let n = take_u32(&reply, &mut off)?;
+            let mut out = Vec::new();
+            for _ in 0..n {
+                let blob = take_str(&reply, &mut off)?.to_vec();
+                let _comment = take_str(&reply, &mut off)?;
+                let mut bo = 0usize;
+                if take_str(&blob, &mut bo)? == b"ssh-ed25519" {
+                    out.push(blob);
+                }
+            }
+            Ok(out)
+        }
+
+        pub fn sign(&self, key_blob: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
+            let mut sock = self.connect()?;
+            let mut body = vec![SSH_AGENTC_SIGN_REQUEST];
+            put_str(&mut body, key_blob);
+            put_str(&mut body, msg);
+            put_u32(&mut body, 0); // no flags: plain ssh-ed25519
+            let reply = round_trip(&mut sock, &body)?;
+            match reply.first() {
+                Some(&SSH_AGENT_SIGN_RESPONSE) => {}
+                _ => bail!(
+                    "ssh-agent: refused to sign (is the key loaded? `ssh-add -l`)"
+                ),
+            }
+            let mut off = 1usize;
+            let wrapped = take_str(&reply, &mut off)?;
+            let mut wo = 0usize;
+            let algo = take_str(wrapped, &mut wo)?;
+            if algo != b"ssh-ed25519" {
+                bail!(
+                    "ssh-agent: signed with {} (expected ssh-ed25519)",
+                    String::from_utf8_lossy(algo)
+                );
+            }
+            let sig = take_str(wrapped, &mut wo)?;
+            if sig.len() != 64 {
+                bail!("ssh-agent: ed25519 signature was {} bytes", sig.len());
+            }
+            Ok(sig.to_vec())
+        }
+    }
+}
+
+#[cfg(unix)]
+pub use unix_impl::Agent;
+
+/// Windows stub. `from_env()` always returns `None` so the identity-resolution
+/// flow naturally falls through to the in-process or OpenSSH-private-key
+/// signers without paying a platform check at the call site. The other
+/// methods exist purely for type compatibility with `idstore.rs`; nothing on
+/// Windows can reach them via `from_env()`, but if a future caller bypasses
+/// that and constructs an `Agent` directly they get a clear error rather
+/// than a UB / panic.
+#[cfg(not(unix))]
+pub struct Agent {
+    _private: (),
+}
+
+#[cfg(not(unix))]
+impl Agent {
+    pub fn from_env() -> Option<Agent> {
+        None
     }
 
-    /// Ask the agent to sign `msg` with the key identified by `key_blob`.
-    /// Returns the raw 64-byte ed25519 signature (the agent wraps it as
-    /// `string(algo) || string(sig)`; we unwrap to the bare signature so it
-    /// drops straight into the protocol's detached-signature slot).
-    pub fn sign(&self, key_blob: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
-        let mut sock = self.connect()?;
-        let mut body = vec![SSH_AGENTC_SIGN_REQUEST];
-        put_str(&mut body, key_blob);
-        put_str(&mut body, msg);
-        put_u32(&mut body, 0); // no flags: plain ssh-ed25519
-        let reply = round_trip(&mut sock, &body)?;
-        match reply.first() {
-            Some(&SSH_AGENT_SIGN_RESPONSE) => {}
-            _ => bail!(
-                "ssh-agent: refused to sign (is the key loaded? `ssh-add -l`)"
-            ),
-        }
-        let mut off = 1usize;
-        let wrapped = take_str(&reply, &mut off)?;
-        let mut wo = 0usize;
-        let algo = take_str(wrapped, &mut wo)?;
-        if algo != b"ssh-ed25519" {
-            bail!(
-                "ssh-agent: signed with {} (expected ssh-ed25519)",
-                String::from_utf8_lossy(algo)
-            );
-        }
-        let sig = take_str(wrapped, &mut wo)?;
-        if sig.len() != 64 {
-            bail!("ssh-agent: ed25519 signature was {} bytes", sig.len());
-        }
-        Ok(sig.to_vec())
+    #[cfg(test)]
+    pub fn for_test(_path: &str) -> Agent {
+        Agent { _private: () }
+    }
+
+    pub fn ed25519_key_blobs(&self) -> Result<Vec<Vec<u8>>> {
+        bail!("ssh-agent transport is Unix-only; this build is Windows")
+    }
+
+    pub fn sign(&self, _key_blob: &[u8], _msg: &[u8]) -> Result<Vec<u8>> {
+        bail!("ssh-agent transport is Unix-only; this build is Windows")
     }
 }
 

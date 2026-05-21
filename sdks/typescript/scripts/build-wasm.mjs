@@ -117,12 +117,18 @@ for (const [target, out] of [
       ],
       { stdio: 'inherit' },
     );
+    // wasm-opt is purely a size optimization. If the installed binaryen
+    // doesn't recognize a flag (Ubuntu's apt package can be a few versions
+    // behind upstream) we'd rather ship the larger un-optimized wasm than
+    // tank the entire Release pipeline — which is exactly what an earlier
+    // `process.exit(1)` here did.
     if (o.status !== 0) {
-      console.error('[build-wasm] wasm-opt failed');
-      process.exit(o.status ?? 1);
+      console.warn('[build-wasm] wasm-opt failed; shipping un-optimized wasm');
+      console.log(`[build-wasm]   ${target}: ${before} MB (release; wasm-opt skipped)`);
+    } else {
+      spawnSync('mv', [tmp, wasm]);
+      console.log(`[build-wasm]   ${target}: ${before} MB → ${mb(wasm)} MB (wasm-opt -Oz)`);
     }
-    spawnSync('mv', [tmp, wasm]);
-    console.log(`[build-wasm]   ${target}: ${before} MB → ${mb(wasm)} MB (wasm-opt -Oz)`);
   } else {
     console.log(`[build-wasm]   ${target}: ${mb(wasm)} MB (release; no wasm-opt)`);
   }
