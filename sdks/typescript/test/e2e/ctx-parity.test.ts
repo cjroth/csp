@@ -70,7 +70,10 @@ beforeAll(async () => {
         setTimeout(() => res(undefined), 300);
       }),
   );
-}, 180_000);
+  // 10 min: cold `cargo build -p ctx` on ubuntu-latest (no cache for the
+  // workspace target in this job — see `wasm-sdk` in the build workflow)
+  // comfortably exceeds the prior 3 min budget.
+}, 600_000);
 
 afterAll(() => {
   if (watch) watch.kill('SIGTERM');
