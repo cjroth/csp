@@ -41,10 +41,16 @@ EXPOSE 9000
 #
 # Environment knobs:
 #   PORT                  bind port (default 9000)
-#   CTX_CWD               vault directory (default /data/vault). Set this
-#                         when the platform mounts the persistent volume
-#                         somewhere else — e.g. Fly/Railway use
-#                         /mnt/workspace.
+#   CTX_DIR               vault directory (default /data/vault). Set this
+#                         to the persistent-volume mount path on your
+#                         platform — e.g. Railway typically uses
+#                         /mnt/vault, Fly /mnt/workspace. The previous
+#                         name `CTX_CWD` is still honored for back-compat
+#                         but is deprecated; the CLI itself reads
+#                         `CTX_DIR` (the `--dir` global flag's env),
+#                         and using two different names led to `ctx
+#                         init` overwriting the persisted config on
+#                         every restart.
 #   CTX_NO_TLS=1          bind plain WS instead of WSS — use behind a
 #                         reverse proxy that already terminates TLS
 #                         (Fly.io, Railway, Render, Cloudflare Tunnel, …).
@@ -52,4 +58,4 @@ EXPOSE 9000
 #                         needed.
 #   CTX_AUTHORIZED_KEYS   ssh-ed25519 lines (or a file path) merged into the
 #                         synced authorized_keys on every start.
-CMD ["/bin/sh", "-c", "VAULT_DIR=\"${CTX_CWD:-/data/vault}\" && mkdir -p \"$VAULT_DIR\" && cd \"$VAULT_DIR\" && export CTX_IDENTITY=\"$VAULT_DIR/.context/id_ed25519\" && { [ -f .context/config ] || ctx init --name \"$CTX_VAULT_NAME\"; } && { [ -f \"$CTX_IDENTITY\" ] || ctx key >/dev/null; } && exec ctx watch --listen 0.0.0.0:${PORT:-9000}"]
+CMD ["/bin/sh", "-c", "VAULT_DIR=\"${CTX_DIR:-${CTX_CWD:-/data/vault}}\" && export CTX_DIR=\"$VAULT_DIR\" && mkdir -p \"$VAULT_DIR\" && cd \"$VAULT_DIR\" && export CTX_IDENTITY=\"$VAULT_DIR/.context/id_ed25519\" && { [ -f .context/config ] || ctx init --name \"$CTX_VAULT_NAME\"; } && { [ -f \"$CTX_IDENTITY\" ] || ctx key >/dev/null; } && exec ctx watch --listen 0.0.0.0:${PORT:-9000}"]
