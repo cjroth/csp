@@ -88,9 +88,47 @@ for (const [target, out] of [
   if (hasWasmOpt) {
     const before = mb(wasm);
     const tmp = `${wasm}.opt`;
-    const o = spawnSync('wasm-opt', ['-Oz', '--all-features', '-o', tmp, wasm], {
-      stdio: 'inherit',
-    });
+    // Explicit feature allowlist, NOT `--all-features`: binaryen will
+    // otherwise re-introduce reference-types / GC / typed-function-references
+    // tags during optimization (e.g. value type `0x64`, type-section non-Func
+    // tags) even when the source wasm was emitted MVP-only via the RUSTFLAGS
+    // above. Older iOS WebKit can't parse those tags, so the optimized output
+    // silently breaks on every iPhone/iPad — exactly the
+    // `Type is non-Func, non-Struct, and non-Array` symptom we hit. We
+    // allowlist only the features the engine actually needs (bulk-memory for
+    // `memory.fill`, sign-ext + multi-value + mutable-globals + nontrapping-
+    // fptoint for Rust's default codegen) and explicitly disable everything
+    // post-iOS-15-or-so so the output stays installable on the broadest
+    // possible WebView fleet.
+    const o = spawnSync(
+      'wasm-opt',
+      [
+        '-Oz',
+        '--enable-bulk-memory',
+        '--enable-bulk-memory-opt',
+        '--enable-sign-ext',
+        '--enable-multivalue',
+        '--enable-mutable-globals',
+        '--enable-nontrapping-float-to-int',
+        '--disable-reference-types',
+        '--disable-gc',
+        '--disable-exception-handling',
+        '--disable-tail-call',
+        '--disable-simd',
+        '--disable-relaxed-simd',
+        '--disable-threads',
+        '--disable-memory64',
+        '--disable-extended-const',
+        '--disable-strings',
+        '--disable-multimemory',
+        '--disable-stack-switching',
+        '--disable-shared-everything',
+        '-o',
+        tmp,
+        wasm,
+      ],
+      { stdio: 'inherit' },
+    );
     if (o.status !== 0) {
       console.error('[build-wasm] wasm-opt failed');
       process.exit(o.status ?? 1);
