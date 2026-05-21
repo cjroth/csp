@@ -222,7 +222,13 @@ impl Node {
                                 None => accept_ws(node, stream, Vec::new(), keys).await,
                             };
                             if let Err(e) = r {
-                                tracing::debug!("session ended: {e}");
+                                // Visible by default — a session that ended
+                                // with an error is exactly the moment an
+                                // operator needs (peer admission rejected,
+                                // bad signature, vault-id mismatch). A
+                                // graceful peer-close is `Ok(())`, not Err,
+                                // so we never spam this on normal hangups.
+                                tracing::warn!("session ended: {e}");
                             }
                         });
                     }
