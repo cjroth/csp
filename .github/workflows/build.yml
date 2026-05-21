@@ -320,19 +320,17 @@ jobs:
 
   release:
     name: GitHub Release
-    # BRAT installs the Obsidian plugin from this release, so we cut a Release
-    # whenever the Obsidian build succeeds — even if an unrelated job (a
-    # flaky Windows cargo build, a transient SDK test, a Tauri artifact
-    # upload glitch) failed. The CLI / SDK / desktop bundles are attached
-    # best-effort: present when their job succeeded, simply omitted when it
-    # didn't. Without this the whole release tag silently produced no
-    # downloadable plugin, which is exactly what BRAT can't recover from.
-    if: |
-      always() &&
-      github.ref_type == 'tag' &&
-      needs.version.result == 'success' &&
-      needs.obsidian.result == 'success'
-    needs: [version, cli, wasm-sdk, desktop, obsidian]
+    # BRAT installs the Obsidian plugin from this release, so the release job
+    # is gated *only* on the Obsidian artifact — it must never wait on the
+    # CLI / SDK / desktop matrices. Those run in parallel on GitHub-hosted
+    # runners and, in practice, the macos-13 (Intel Mac) pool can back up
+    # for >24h; we used to block on them and watched the whole tag silently
+    # produce no Release. With this gating the release fires the moment the
+    # plugin is ready; CLI / SDK / desktop bundles get attached opportunistically
+    # via a follow-up job that uploads to the *same* Release once they finish
+    # (see `release-extras` below).
+    if: github.ref_type == 'tag'
+    needs: [version, obsidian]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -340,23 +338,11 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           path: artifacts
+          pattern: obsidian-plugin
 
       - name: Stage release files
         run: |
           mkdir -p release
-          # CLI archives (one tar.gz/zip per OS) — best effort. `find` is
-          # already missing-dir-tolerant; the trailing `|| true` covers the
-          # case where no `ctx-*` artifacts exist at all.
-          find artifacts -maxdepth 1 -type d -name 'ctx-*' \
-            -exec find {} -type f -exec cp {} release/ \; \; || true
-          # SDK tarball — best effort.
-          if [ -d artifacts/csp-sdk ]; then
-            find artifacts/csp-sdk -type f -exec cp {} release/ \; || true
-          fi
-          # Desktop bundles — best effort, by extension, flat.
-          find artifacts -maxdepth 2 -type f \
-            \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \
-            -o -name '*.msi' -o -name '*.exe' \) -exec cp {} release/ \; || true
           # Obsidian plugin — REQUIRED. main.js + manifest.json (BRAT reads
           # these by exact name, do NOT rename).
           cp artifacts/obsidian-plugin/main.js release/main.js
@@ -369,7 +355,56 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           generate_release_notes: true
-          # The two Obsidian files are always staged (the step above fails
-          # otherwise); the rest are attached when their job succeeded.
           fail_on_unmatched_files: true
           files: release/*
+
+  release-extras:
+    name: Attach CLI / SDK / desktop to the Release
+    # Best-effort attachment of the heavy artifacts. Runs after the Release
+    # already exists (so BRAT is unblocked) and only uploads what actually
+    # finished successfully — `softprops/action-gh-release` is idempotent on
+    # an existing tag and merges the new files in.
+    if: |
+      always() &&
+      github.ref_type == 'tag' &&
+      needs.release.result == 'success'
+    needs: [version, release, cli, wasm-sdk, desktop]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          path: artifacts
+
+      - name: Stage extras
+        id: stage
+        run: |
+          mkdir -p extras
+          # CLI archives (one tar.gz/zip per OS) — best effort.
+          find artifacts -maxdepth 1 -type d -name 'ctx-*' \
+            -exec find {} -type f -exec cp {} extras/ \; \; 2>/dev/null || true
+          # SDK tarball — best effort.
+          if [ -d artifacts/csp-sdk ]; then
+            find artifacts/csp-sdk -type f -exec cp {} extras/ \; 2>/dev/null || true
+          fi
+          # Desktop bundles — best effort, by extension, flat.
+          find artifacts -maxdepth 3 -type f \
+            \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \
+            -o -name '*.msi' -o -name '*.exe' \) -exec cp {} extras/ \; 2>/dev/null || true
+          ls -la extras/
+          if [ -z "$(ls -A extras 2>/dev/null)" ]; then
+            echo "have_extras=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_extras=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attach extras to the Release
+        if: steps.stage.outputs.have_extras == 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          # Don't recreate the Release or overwrite the notes — just merge
+          # the extra assets in.
+          fail_on_unmatched_files: false
+          files: extras/*
