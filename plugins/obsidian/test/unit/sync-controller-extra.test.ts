@@ -154,6 +154,43 @@ describe('onVaultEvent branches', () => {
     await b.controller.stop();
   });
 
+  test('tree-changed with a changeset uses the fast path (no debounce, no scan)', async () => {
+    // Issue 0010: when the engine carries the materialize changeset, the
+    // controller routes it to `bridge.applyTreeChanges` so the host avoids
+    // an O(vault) postMessage burst per sync. The empty-changes form still
+    // falls back to the debounced full scan.
+    const b = buildWithFakeSdk();
+    await b.controller.start({ connect: true });
+    b.sdk.emit({ kind: 'connected', peer_pubkey: new Uint8Array() });
+
+    let readsBefore = 0;
+    const origRead = b.sdk.readTextFile.bind(b.sdk);
+    b.sdk.readTextFile = (p: string) => {
+      readsBefore += 1;
+      return origRead(p);
+    };
+    b.sdk.emit({
+      kind: 'tree-changed',
+      changes: [{ path: 'fast-path.md', content: 'inline' }],
+    });
+    await tick(30); // fast path is NOT debounced; only the opQueue's microtasks
+    expect(b.vault.getAbstractFileByPath('fast-path.md')).not.toBeNull();
+    expect(readsBefore).toBe(0); // content came in the event — no sdk.readTextFile
+
+    await b.controller.stop();
+  });
+
+  test('tree-changed without changes still falls back to the debounced scan', async () => {
+    const b = buildWithFakeSdk();
+    await b.controller.start({ connect: true });
+    b.sdk.emit({ kind: 'connected', peer_pubkey: new Uint8Array() });
+    b.sdk.files.set('legacy.md', 'fallback');
+    b.sdk.emit({ kind: 'tree-changed' }); // no changes field
+    await tick(260);
+    expect(b.vault.getAbstractFileByPath('legacy.md')).not.toBeNull();
+    await b.controller.stop();
+  });
+
   test('disconnected while idle does NOT flip to reconnecting', async () => {
     const b = buildWithFakeSdk();
     await b.controller.prepare(); // connect:false → state stays idle

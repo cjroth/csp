@@ -207,16 +207,14 @@ describe('ContextSyncPlugin "connect to existing vault" flow ⇄ real ctx', () =
     const adapter = new FakeDataAdapter();
     const vault = new FakeVault(adapter);
     const app = new App(vault);
+    const manifest = {
+      id: 'context-sync',
+      name: 'Context',
+      version: '0.1.0',
+      // biome-ignore lint/suspicious/noExplicitAny: shim manifest cast
+    } as any;
     // biome-ignore lint/suspicious/noExplicitAny: shim App vs real obsidian type
-    const plugin = new ContextSyncPlugin(
-      app as any,
-      {
-        id: 'context-sync',
-        name: 'Context',
-        version: '0.1.0',
-        // biome-ignore lint/suspicious/noExplicitAny: shim manifest cast
-      } as any,
-    );
+    const plugin = new ContextSyncPlugin(app as any, manifest);
 
     // Keep the device key out of the real ~/.context (the connect flow
     // generates + persists it through this seam).

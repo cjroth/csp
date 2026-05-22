@@ -42,7 +42,14 @@ export type VaultEvent =
   | { kind: 'connected'; peer_pubkey: Uint8Array }
   | { kind: 'disconnected'; reason: string }
   | { kind: 'catchup-progress'; outbound: boolean }
-  | { kind: 'tree-changed' }
+  /** A merged tree arrived (CSP §6.5). `changes`, when present, names the
+   * exact paths the materialize pass touched (and carries the new content
+   * for writes, or `null` for removes). The host applies just those; the
+   * absent-changes form still works as the full-scan fallback. */
+  | {
+      kind: 'tree-changed';
+      changes?: Array<{ path: string; content: string | null }>;
+    }
   | { kind: 'error'; message: string };
 
 /**

@@ -388,8 +388,18 @@ export class SyncController {
         // Intentionally silent — too noisy for a status-bar transition.
         break;
       case 'tree-changed':
-        // Coalesce bursts — initial catch-up can fire many in a row.
-        this.bridge?.scheduleApplyRemoteState();
+        // When the engine carries its changeset along (the fast path),
+        // apply only those paths — no whole-vault scan, no per-file
+        // cross-thread `readTextFile` (issue 0010 made those O(vault)
+        // postMessage round-trips per sync, the source of the live-sync
+        // latency complaint). The empty-changes form still falls back to
+        // the full debounced scan.
+        if (e.changes && e.changes.length > 0) {
+          void this.bridge?.applyTreeChanges(e.changes);
+        } else {
+          // Coalesce bursts — initial catch-up can fire many in a row.
+          this.bridge?.scheduleApplyRemoteState();
+        }
         break;
       case 'error':
         this.setState('error');

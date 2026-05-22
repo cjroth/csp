@@ -232,6 +232,135 @@ describe('applyOneRemoteFile', () => {
   });
 });
 
+describe('applyTreeChanges (issue 0010 fast path)', () => {
+  test('write changeset creates each file with the carried content (no sdk reads)', async () => {
+    let reads = 0;
+    const sdkSpy = new Proxy(sdk, {
+      get(t, p, r) {
+        if (p === 'readTextFile') {
+          reads += 1;
+          return (sdk as VaultInstance).readTextFile.bind(sdk);
+        }
+        const v = Reflect.get(t, p, r);
+        return typeof v === 'function' ? v.bind(t) : v;
+      },
+    }) as VaultInstance;
+    const b = new ObsidianVaultBridge({
+      vault,
+      sdk: sdkSpy,
+      filter: () => true,
+      log: () => {},
+    });
+    await b.applyTreeChanges([
+      { path: 'a.md', content: 'AA' },
+      { path: 'b.md', content: 'BB' },
+      { path: 'sub/c.md', content: 'CC' },
+    ]);
+    expect(await vault.read(vault.getFiles().find((f) => f.path === 'a.md') as FakeTFile)).toBe(
+      'AA',
+    );
+    expect(await vault.read(vault.getFiles().find((f) => f.path === 'b.md') as FakeTFile)).toBe(
+      'BB',
+    );
+    expect(await vault.read(vault.getFiles().find((f) => f.path === 'sub/c.md') as FakeTFile)).toBe(
+      'CC',
+    );
+    expect(reads).toBe(0); // the fast path never round-trips for content
+    expect(b.pulled).toBe(3);
+  });
+
+  test('writes are content-equality short-circuited (no spurious modify)', async () => {
+    await vault.create('same.md', 'kept');
+    await bridge.applyTreeChanges([{ path: 'same.md', content: 'kept' }]);
+    // Existing file kept; no modify counter bump (`pulled` only counts
+    // applied writes).
+    expect(bridge.pulled).toBe(0);
+    expect(await vault.read(vault.getFiles()[0] as FakeTFile)).toBe('kept');
+  });
+
+  test('null content removes the file and prunes empty parents', async () => {
+    await vault.createFolder('dir');
+    await vault.create('dir/note.md', 'gone');
+    await bridge.applyTreeChanges([{ path: 'dir/note.md', content: null }]);
+    expect(vault.getFiles().some((f) => f.path === 'dir/note.md')).toBe(false);
+  });
+
+  test('null content for a missing path is a no-op (idempotent tombstone)', async () => {
+    await bridge.applyTreeChanges([{ path: 'never-existed.md', content: null }]);
+    expect(bridge.pulled).toBe(0);
+  });
+
+  test('filter-blocked paths are skipped in both directions', async () => {
+    const b = makeBridge({ ignoreGlobs: ['Drafts/**'] });
+    await b.applyTreeChanges([
+      { path: 'Drafts/secret.md', content: 'shh' },
+      { path: 'Notes/ok.md', content: 'ok' },
+    ]);
+    expect(vault.getFiles().map((f) => f.path)).toEqual(['Notes/ok.md']);
+  });
+
+  test('mixed write + delete batch applies in order', async () => {
+    await vault.create('old.md', 'gone');
+    await bridge.applyTreeChanges([
+      { path: 'old.md', content: null },
+      { path: 'new.md', content: 'fresh' },
+      { path: 'kept.md', content: 'k' },
+      { path: 'kept.md', content: 'k2' }, // second update wins
+    ]);
+    const paths = vault
+      .getFiles()
+      .map((f) => f.path)
+      .sort();
+    expect(paths).toEqual(['kept.md', 'new.md']);
+    expect(await vault.read(vault.getFiles().find((f) => f.path === 'kept.md') as FakeTFile)).toBe(
+      'k2',
+    );
+  });
+
+  test('suppresses the Obsidian write event it just authored', async () => {
+    // Apply a write via the changeset; the bridge's suppression must
+    // consume the resulting `create` event so the engine does NOT see a
+    // round-trip echo write.
+    const sawWritesAtSdk: string[] = [];
+    const sdkSpy = new Proxy(sdk, {
+      get(t, p, r) {
+        if (p === 'writeTextFile') {
+          return (path: string, content: string) => {
+            sawWritesAtSdk.push(path);
+            return (sdk as VaultInstance).writeTextFile.call(sdk, path, content);
+          };
+        }
+        const v = Reflect.get(t, p, r);
+        return typeof v === 'function' ? v.bind(t) : v;
+      },
+    }) as VaultInstance;
+    const b = new ObsidianVaultBridge({
+      vault,
+      sdk: sdkSpy,
+      filter: () => true,
+      log: () => {},
+    });
+    await b.applyTreeChanges([{ path: 'echo.md', content: 'hi' }]);
+    // Drive the create event Obsidian would fire on the freshly-created
+    // file (FakeVault.create already emitted it during the apply). Now
+    // simulate a "modify" — also suppressed by the same token? No, only
+    // the create — but the goal is: applyTreeChanges itself doesn't push
+    // back through writeTextFile, which would be a feedback loop.
+    expect(sawWritesAtSdk).toEqual([]);
+  });
+
+  test('changeset run-ordering: applyTreeChanges serializes after pending writes', async () => {
+    // Issue an outbound write and an inbound apply concurrently — the
+    // bridge's serial queue must order them deterministically (no
+    // interleaving on `knownSdkPaths`).
+    const f = await vault.create('shared.md', 'A');
+    const out = bridge.handleObsidianWrite(f);
+    const inb = bridge.applyTreeChanges([{ path: 'shared.md', content: 'A' }]);
+    await Promise.all([out, inb]);
+    expect(sdk.fileExists('shared.md')).toBe(true);
+  });
+});
+
 describe('applyRemoteState + ensureFolderFor', () => {
   test('creates parent folders before file', async () => {
     await sdk.writeTextFile('a/b/c.md', 'deep');

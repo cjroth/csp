@@ -463,17 +463,21 @@ export class RealVault implements Vault {
     // `materialize_staged` plans against the engine's staged working set and
     // keeps it in step with the ops it returns (issue 0009).
     const ops = JSON.parse(this.engine.materialize_staged()) as MatOp[];
-    let changed = false;
+    const changes: Array<{ path: string; content: string | null }> = [];
     for (const o of ops) {
       if (o.op === 'write' && o.content) {
-        this.files.set(o.path, dec.decode(Uint8Array.from(o.content)));
-        changed = true;
+        const content = dec.decode(Uint8Array.from(o.content));
+        this.files.set(o.path, content);
+        changes.push({ path: o.path, content });
       } else if (o.op === 'remove') {
         this.files.delete(o.path);
-        changed = true;
+        changes.push({ path: o.path, content: null });
       } // 'defer' → leave the user's bytes (§5.6)
     }
-    if (changed) this.emit({ kind: 'tree-changed' });
+    // Carry the exact change set with the event so a host doesn't have to
+    // re-scan + re-read every file on every materialize (it was an O(vault)
+    // postMessage burst across the engine-worker boundary on every sync).
+    if (changes.length) this.emit({ kind: 'tree-changed', changes });
   }
 
   private async persist(): Promise<void> {

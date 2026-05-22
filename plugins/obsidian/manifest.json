@@ -1,7 +1,7 @@
 {
   "id": "context-sync",
   "name": "Context",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "minAppVersion": "1.4.0",
   "description": "Sync your Obsidian vault as agent-readable context via the Context Sync Protocol. Cross-device, end-to-end authenticated, git-compatible history.",
   "author": "CSP contributors",

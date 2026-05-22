@@ -291,6 +291,77 @@ export class ObsidianVaultBridge {
   // ---- engine → Obsidian ----
 
   /**
+   * Apply a known set of remote changes — the fast path the controller uses
+   * whenever the engine emits a `tree-changed` event with its changeset
+   * attached. No `sdk.listFiles` scan, no per-file `sdk.readTextFile` (which
+   * is a cross-thread round-trip under the engine Worker, issue 0010); the
+   * content rides in the event payload itself. `null` content means the
+   * path was tombstoned by the merge.
+   */
+  applyTreeChanges(
+    changes: ReadonlyArray<{ path: string; content: string | null }>,
+  ): Promise<void> {
+    return this.enqueue(() => this.runApplyTreeChanges(changes));
+  }
+
+  private async runApplyTreeChanges(
+    changes: ReadonlyArray<{ path: string; content: string | null }>,
+  ): Promise<void> {
+    if (this.disposed) return;
+    let i = 0;
+    for (const { path, content } of changes) {
+      if (!this.deps.filter(path)) continue;
+      if (content === null) {
+        this.knownSdkPaths.delete(path);
+        const existing = this.resolveVaultFile(path);
+        if (existing) {
+          this.suppress(path);
+          try {
+            await this.deps.vault.delete(existing);
+            this.pulled += 1;
+            this.log(`pull-delete (changeset): ${path}`);
+            await this.pruneEmptyFolders(path);
+          } catch (e) {
+            const msg = String((e as Error)?.message ?? e);
+            if (!/not found|no such|enoent/i.test(msg)) {
+              this.log(`pull-delete failed for ${path}: ${msg}`);
+            }
+          }
+        }
+      } else {
+        this.knownSdkPaths.add(path);
+        const existing = this.deps.vault.getAbstractFileByPath(path);
+        if (existing && this.isFile(existing)) {
+          const cur = await this.deps.vault.read(existing);
+          if (cur === content) continue; // no-op short-circuit
+          this.suppress(path);
+          await this.deps.vault.modify(existing, content);
+          this.pulled += 1;
+          this.log(`pull-modify (changeset): ${path}`);
+        } else {
+          await this.ensureFolderFor(path);
+          this.suppress(path);
+          try {
+            await this.deps.vault.create(path, content);
+            this.pulled += 1;
+            this.log(`pull-create (changeset): ${path}`);
+          } catch (e) {
+            // Cold metadata cache: file physically exists but the metadata
+            // lookup missed; recover with a modify. Real failures propagate.
+            if (!/already exists/i.test(String((e as Error)?.message ?? e))) throw e;
+            const f = this.deps.vault.getAbstractFileByPath(path);
+            if (f && this.isFile(f)) {
+              await this.deps.vault.modify(f, content);
+              this.pulled += 1;
+            }
+          }
+        }
+      }
+      if (++i % ObsidianVaultBridge.YIELD_EVERY === 0) await yieldToEventLoop();
+    }
+  }
+
+  /**
    * Schedule an `applyRemoteState` pass with leading-edge debounce. The
    * engine can emit many `tree-changed` events in a burst during initial
    * catch-up; this collapses them.
