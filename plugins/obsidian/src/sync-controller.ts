@@ -357,6 +357,11 @@ export class SyncController {
   }
 
   private onVaultEvent(e: VaultEvent): void {
+    // Lifecycle visibility — without these, a silent disconnect/reconnect
+    // cycle in production is invisible (status bar transitions vanish
+    // quickly and there's no console trail). The summary keeps each event
+    // to one line so the log stays readable during initial catch-up.
+    this.deps.log?.(`event ${e.kind}${eventSummary(e)}`);
     switch (e.kind) {
       case 'connecting':
         this.setState('connecting');
@@ -406,6 +411,27 @@ export class SyncController {
         this.deps.notice?.(`Context: ${e.message}`);
         break;
     }
+  }
+}
+
+/** One-line, console-friendly summary of a VaultEvent. Lets the lifecycle
+ * log show *why* a state changed without dumping the full payload. */
+function eventSummary(e: VaultEvent): string {
+  switch (e.kind) {
+    case 'connecting':
+      return ` → ${e.url}`;
+    case 'connected':
+      return e.peer_pubkey.length > 0 ? ' (peer key pinned)' : '';
+    case 'disconnected':
+      return ` (${e.reason})`;
+    case 'catchup-progress':
+      return e.outbound ? ' (outbound)' : ' (inbound)';
+    case 'tree-changed': {
+      const n = e.changes?.length ?? 0;
+      return n > 0 ? ` (${n} path${n === 1 ? '' : 's'} via fast path)` : ' (no changeset)';
+    }
+    case 'error':
+      return `: ${e.message}`;
   }
 }
 
