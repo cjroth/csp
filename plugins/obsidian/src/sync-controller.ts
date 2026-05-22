@@ -34,6 +34,18 @@ import type { MinimalDataAdapter } from './storage-adapter.js';
 
 export type ControllerState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
 
+/** How `openOrCreate` wants the engine-side vault built. The controller
+ * decides the mode (existing local state → open, peer set → clone, else
+ * create) and hands this to `makeVault`; the in-process default and the
+ * plugin's Web Worker factory (issue 0010) both consume it. */
+export interface VaultSpec {
+  mode: 'create' | 'open' | 'clone';
+  peerUrl?: string;
+  /** Raw pinned-peer-key bytes (already decoded from the SSH form). */
+  peerPubkey?: Uint8Array;
+  authKey?: string;
+}
+
 export interface ControllerDeps {
   storage: StorageAdapter;
   vault: MinimalVault;
@@ -55,6 +67,11 @@ export interface ControllerDeps {
   sdkOverride?: VaultInstance;
   /** Optional WebSocket transport. Defaults to the engine's auto-detection. */
   transport?: TransportAdapter;
+  /** Builds the engine-side vault from a [`VaultSpec`]. When absent the
+   * controller builds an in-process `RealVault` (the SDK default, used by
+   * tests). The plugin injects a Web Worker-backed factory (issue 0010) so
+   * the wasm engine runs off the renderer thread and never freezes the UI. */
+  makeVault?: (spec: VaultSpec) => Promise<VaultInstance>;
   /** Test seam — emitter for status notices. */
   notice?: (msg: string) => void;
   log?: (msg: string) => void;
@@ -251,28 +268,34 @@ export class SyncController {
    */
   private async openOrCreate(): Promise<VaultInstance> {
     const { peerUrl, peerPubkey, authKey } = this.deps.settings;
-    const transport = this.deps.transport;
+    // Existing local state → open; a peer set → clone (catch up from it,
+    // CSP §17); else a fresh offline-local vault (CSP §7 — won't converge
+    // until a full node joins).
+    const existing = await this.deps.storage.loadState();
+    const mode = existing && existing.length > 0 ? 'open' : peerUrl ? 'clone' : 'create';
+    const spec: VaultSpec = {
+      mode,
+      ...(peerUrl ? { peerUrl } : {}),
+      ...(peerPubkey ? { peerPubkey: sshPubkeyBytes(peerPubkey) } : {}),
+      ...(authKey ? { authKey } : {}),
+    };
+    if (this.deps.makeVault) return this.deps.makeVault(spec);
+    return this.defaultMakeVault(spec);
+  }
+
+  /** In-process `RealVault` — the SDK default. The plugin overrides this
+   * with a Web Worker factory via `deps.makeVault` (issue 0010). */
+  private defaultMakeVault(spec: VaultSpec): Promise<VaultInstance> {
     const base = {
       storage: this.deps.storage,
       identity: this.deps.identity,
-      ...(peerUrl ? { peerUrl } : {}),
-      ...(peerPubkey ? { peerPubkey: sshPubkeyBytes(peerPubkey) } : {}),
-      ...(transport ? { transport } : {}),
-      ...(authKey ? { authKey } : {}),
+      ...(spec.peerUrl ? { peerUrl: spec.peerUrl } : {}),
+      ...(spec.peerPubkey ? { peerPubkey: spec.peerPubkey } : {}),
+      ...(this.deps.transport ? { transport: this.deps.transport } : {}),
+      ...(spec.authKey ? { authKey: spec.authKey } : {}),
     };
-
-    const existing = await this.deps.storage.loadState();
-    if (existing && existing.length > 0) {
-      return Vault.open(base);
-    }
-    if (peerUrl) {
-      // CSP §17 `ctx clone <url>` — catch up + materialize from the peer.
-      // §10: `authKey`, if set, is sent on the WS upgrade so a listener
-      // requiring enrollment lets this device in.
-      return Vault.clone({ ...base, peerUrl });
-    }
-    // Offline local create. Per CSP §7 this will NOT converge across
-    // devices until a full node joins this vault — the wizard says so.
+    if (spec.mode === 'open') return Vault.open(base);
+    if (spec.mode === 'clone') return Vault.clone({ ...base, peerUrl: spec.peerUrl ?? '' });
     return Vault.create(base);
   }
 

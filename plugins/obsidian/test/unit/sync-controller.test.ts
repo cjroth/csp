@@ -204,3 +204,73 @@ describe('identity pubkey', () => {
     expect(ssh?.startsWith('ssh-ed25519 ')).toBe(true);
   });
 });
+
+// Issue 0010: the controller decides the vault mode and hands a VaultSpec
+// to `makeVault`; the plugin injects a Web Worker factory there. These
+// verify the controller-side wiring — the mode decision and spec contents —
+// with a spy factory (the worker itself is covered by the SDK's
+// worker.test.ts).
+describe('makeVault injection (issue 0010)', () => {
+  function spyHarness(over: Partial<CspSettings>, adapter = new FakeDataAdapter()) {
+    const vault = new FakeVault(adapter);
+    const storage = new ObsidianStorageAdapter(adapter);
+    const settings: CspSettings = { ...DEFAULT_SETTINGS, syncEnabled: true, ...over };
+    const specs: import('../../src/sync-controller.js').VaultSpec[] = [];
+    const controller = new SyncController({
+      storage,
+      vault,
+      settings,
+      identity: Identity.generate(),
+      saveSettings: async () => {},
+      makeVault: async (spec) => {
+        specs.push(spec);
+        // A throwaway in-memory MockVault stands in for the worker vault —
+        // the controller only needs *a* VaultInstance back.
+        return MockVault.create({ storage: memoryStorage(), identity: MockIdentity.generate() });
+      },
+    });
+    return { controller, specs, adapter };
+  }
+
+  test('fresh vault, no peer → makeVault called with mode "create"', async () => {
+    const h = spyHarness({});
+    await h.controller.prepare();
+    expect(h.specs).toHaveLength(1);
+    expect(h.specs[0]?.mode).toBe('create');
+    expect(h.specs[0]?.peerUrl).toBeUndefined();
+    await h.controller.stop();
+  });
+
+  test('peer set, no local state → mode "clone" with the peer URL + auth key', async () => {
+    const h = spyHarness({ peerUrl: 'wss://peer:7777', authKey: 'secret-token' });
+    await h.controller.prepare();
+    expect(h.specs[0]?.mode).toBe('clone');
+    expect(h.specs[0]?.peerUrl).toBe('wss://peer:7777');
+    expect(h.specs[0]?.authKey).toBe('secret-token');
+    await h.controller.stop();
+  });
+
+  test('existing local state → mode "open"', async () => {
+    // Seed `.context/state` so the controller sees prior state.
+    const adapter = new FakeDataAdapter();
+    const seed = makeHarness({}, adapter);
+    await seed.controller.prepare();
+    await seed.controller.stop();
+    // A fresh controller on the same adapter must choose "open".
+    const h = spyHarness({}, adapter);
+    await h.controller.prepare();
+    expect(h.specs[0]?.mode).toBe('open');
+    await h.controller.stop();
+  });
+
+  test('a pinned peer key is decoded to raw bytes in the spec', async () => {
+    const pk = Identity.generate().pubkey();
+    const ssh = pk.toSshString();
+    pk.free();
+    const h = spyHarness({ peerUrl: 'wss://peer:7777', peerPubkey: ssh });
+    await h.controller.prepare();
+    expect(h.specs[0]?.peerPubkey).toBeInstanceOf(Uint8Array);
+    expect(h.specs[0]?.peerPubkey?.length).toBe(32);
+    await h.controller.stop();
+  });
+});

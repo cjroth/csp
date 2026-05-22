@@ -81,6 +81,16 @@ export { defaultConfig, parseConfig, serializeConfig } from './config.js';
 
 export { formatCspIdentity, formatPubkeySidecar, parseCspIdentity } from './identity-file.js';
 
+// ---- Engine Web Worker (issue 0010) — run the wasm engine off the host's
+// renderer thread. `EngineWorkerHost` runs inside the Worker; `WorkerVault`
+// is the main-thread `Vault` proxy; the `Port` helpers wire the channel. ----
+export { EngineWorkerHost } from './worker/engine-host.js';
+export { WorkerVault } from './worker/worker-vault.js';
+export { workerPort, selfPort, linkedPorts } from './worker/channel.js';
+export type { Port } from './worker/channel.js';
+export type { EngineWorkerHostOptions } from './worker/engine-host.js';
+export type { InitPayload, InitMode, ToWorker, FromWorker } from './worker/protocol.js';
+
 // ---- Test-only: the in-memory mock (used by the SDK's own unit tests and
 // available to host plugins for offline UI tests). NOT the production path. ----
 export { MockVault } from './mock/vault.js';

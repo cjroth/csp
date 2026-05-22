@@ -23,7 +23,15 @@
 // Rust engine `ctx` runs (one engine everywhere — CSP spec.md §16); the
 // plugin then computes its own byte-identical `main`.
 
-import { type IdentityInstance, initCsp, isInitialized } from '@csp/sdk/web-init';
+import {
+  type FromWorker,
+  type IdentityInstance,
+  type ToWorker,
+  WorkerVault,
+  initCsp,
+  isInitialized,
+  workerPort,
+} from '@csp/sdk/web-init';
 import { Notice, Platform, Plugin, type TAbstractFile, type TFile } from 'obsidian';
 import {
   type IdentityIO,
@@ -37,9 +45,12 @@ import { ContextSyncSettingTab } from './settings-tab.js';
 import { ConfigStore, type CspSettings, DEFAULT_SETTINGS, normalizePeerUrl } from './settings.js';
 import { StatusBar } from './status-bar.js';
 import { ObsidianStorageAdapter } from './storage-adapter.js';
-import { SyncController } from './sync-controller.js';
+import { SyncController, type VaultSpec } from './sync-controller.js';
 
 declare const __CSP_WASM_B64__: string;
+/** Build-time inlined source of the engine Web Worker (issue 0010). esbuild
+ * replaces this with the phase-1 bundle string; absent under unit tests. */
+declare const __ENGINE_WORKER_SRC__: string;
 
 /** The build-time inlined wasm token. esbuild's `define` replaces this with
  * a string literal in the bundle; under unit tests (no esbuild) the
@@ -47,6 +58,11 @@ declare const __CSP_WASM_B64__: string;
  * nodejs glue (loaded by `test/setup.ts`) provides the engine instead. */
 export function inlinedWasmB64(): string {
   return typeof __CSP_WASM_B64__ === 'string' ? __CSP_WASM_B64__ : '';
+}
+
+/** The inlined engine-worker bundle, or '' under unit tests. */
+function inlinedWorkerSrc(): string {
+  return typeof __ENGINE_WORKER_SRC__ === 'string' ? __ENGINE_WORKER_SRC__ : '';
 }
 
 /** Decode the build-time inlined csp-core wasm (base64) into a Uint8Array
@@ -329,6 +345,13 @@ export default class ContextSyncPlugin extends Plugin {
         await this.configStore?.save(s);
       },
       wasmBytes: this.wasmBytes,
+      // Run the wasm engine in a Web Worker (issue 0010) so the heavy
+      // synchronous engine work never freezes the Obsidian UI. Skipped
+      // under unit tests (no `__ENGINE_WORKER_SRC__`, no `Worker`) — those
+      // use `sdkOverride` or the in-process default.
+      ...(inlinedWorkerSrc() && typeof Worker !== 'undefined'
+        ? { makeVault: (spec: VaultSpec) => this.makeWorkerVault(spec) }
+        : {}),
       notice: (m) => {
         this.lastNotice = m;
         new Notice(m);
@@ -336,6 +359,36 @@ export default class ContextSyncPlugin extends Plugin {
       log: (m) => console.log('[context]', m),
     });
     this.controller.on((st) => this.statusBar?.set(st));
+  }
+
+  /** Spin up an engine Web Worker and wrap it in a `WorkerVault` (issue
+   * 0010). The worker runs the wasm engine + transport off the renderer
+   * thread; storage is proxied back here (`app.vault.adapter` is
+   * main-thread-only). The worker is started from an inlined Blob so the
+   * plugin still ships one `main.js`. */
+  private async makeWorkerVault(spec: VaultSpec): Promise<WorkerVault> {
+    if (!this.storage || !this.identity || !this.wasmBytes) {
+      throw new Error('Context: engine worker prerequisites missing');
+    }
+    const blob = new Blob([inlinedWorkerSrc()], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    let worker: Worker;
+    try {
+      worker = new Worker(url);
+    } finally {
+      // The Worker keeps its own reference to the script; the object URL
+      // can be released immediately once construction is under way.
+      URL.revokeObjectURL(url);
+    }
+    const port = workerPort<ToWorker, FromWorker>(worker);
+    return WorkerVault.start(port, this.storage, {
+      mode: spec.mode,
+      seed: this.identity.seed(),
+      wasmBytes: this.wasmBytes,
+      ...(spec.peerUrl ? { peerUrl: spec.peerUrl } : {}),
+      ...(spec.peerPubkey ? { peerPubkey: spec.peerPubkey } : {}),
+      ...(spec.authKey ? { authKey: spec.authKey } : {}),
+    });
   }
 
   private registerCommands(): void {

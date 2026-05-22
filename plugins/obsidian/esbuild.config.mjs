@@ -40,6 +40,33 @@ const banner = `/*
   Context Sync Protocol (see spec.md). plugins/obsidian/
 */`;
 
+// ---- Phase 1: the engine Web Worker (issue 0010) -------------------------
+// The worker entry is bundled on its own into a standalone IIFE string; the
+// main bundle inlines it (`__ENGINE_WORKER_SRC__`) and starts it as a Blob
+// Worker, so the plugin still ships a single main.js. The worker gets the
+// wasm bytes via its init message — no `__CSP_WASM_B64__` here.
+const workerResult = await esbuild.build({
+  entryPoints: ['src/engine-worker-entry.ts'],
+  bundle: true,
+  format: 'iife',
+  target: 'ES2020',
+  platform: 'browser',
+  conditions: ['browser'],
+  loader: { '.wasm': 'binary' },
+  define: {
+    'process.env.NODE_ENV': JSON.stringify(prod ? 'production' : 'development'),
+    // The wasm-pack `web` glue's no-arg init branch touches
+    // `import.meta.url`; the worker always receives bytes explicitly.
+    'import.meta.url': JSON.stringify('context-plugin://engine-worker'),
+  },
+  write: false,
+  sourcemap: false,
+  treeShaking: true,
+  minify: prod,
+  logLevel: 'warning',
+});
+const engineWorkerSrc = workerResult.outputFiles[0].text;
+
 const buildOpts = {
   banner: { js: banner },
   entryPoints: ['src/main.ts'],
@@ -74,6 +101,9 @@ const buildOpts = {
   loader: { '.wasm': 'binary' },
   define: {
     __CSP_WASM_B64__: JSON.stringify(wasmB64),
+    // The engine Web Worker, bundled in phase 1 — inlined so the plugin
+    // still ships one main.js (issue 0010).
+    __ENGINE_WORKER_SRC__: JSON.stringify(engineWorkerSrc),
     'process.env.NODE_ENV': JSON.stringify(prod ? 'production' : 'development'),
     // The wasm-pack `web` glue's no-arg init branch touches
     // `import.meta.url`; we always pass bytes explicitly, so neutralize it
