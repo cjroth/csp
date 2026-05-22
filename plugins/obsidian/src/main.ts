@@ -370,6 +370,7 @@ export default class ContextSyncPlugin extends Plugin {
     if (!this.storage || !this.identity || !this.wasmBytes) {
       throw new Error('Context: engine worker prerequisites missing');
     }
+    console.log('[context] spawning engine worker', { mode: spec.mode, peerUrl: spec.peerUrl });
     const blob = new Blob([inlinedWorkerSrc()], { type: 'application/javascript' });
     const url = URL.createObjectURL(blob);
     let worker: Worker;
@@ -380,8 +381,22 @@ export default class ContextSyncPlugin extends Plugin {
       // can be released immediately once construction is under way.
       URL.revokeObjectURL(url);
     }
+    // Surface worker-side failures — without these, an uncaught error inside
+    // the worker (wasm init, identity, transport, anything) is invisible to
+    // the host and the only symptom is a vault that never seems to sync.
+    worker.onerror = (e) => {
+      const msg = `engine worker error: ${e.message || '(no message)'}${
+        e.filename ? ` @ ${e.filename}:${e.lineno}:${e.colno}` : ''
+      }`;
+      console.error('[context]', msg, e);
+      this.lastNotice = msg;
+      new Notice(`Context: ${msg}`);
+    };
+    worker.onmessageerror = (e) => {
+      console.error('[context] engine worker message decoding error', e);
+    };
     const port = workerPort<ToWorker, FromWorker>(worker);
-    return WorkerVault.start(port, this.storage, {
+    const v = await WorkerVault.start(port, this.storage, {
       mode: spec.mode,
       seed: this.identity.seed(),
       wasmBytes: this.wasmBytes,
@@ -389,6 +404,11 @@ export default class ContextSyncPlugin extends Plugin {
       ...(spec.peerPubkey ? { peerPubkey: spec.peerPubkey } : {}),
       ...(spec.authKey ? { authKey: spec.authKey } : {}),
     });
+    console.log('[context] engine worker ready', {
+      filesAtBoot: v.listFiles().length,
+      identity: `${v.identityPubkeySsh().slice(0, 24)}…`,
+    });
+    return v;
   }
 
   private registerCommands(): void {

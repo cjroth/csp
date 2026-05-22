@@ -18,6 +18,20 @@ import { EngineWorkerHost, type FromWorker, type ToWorker, selfPort } from '@csp
 const scope = self as unknown as {
   postMessage(m: unknown): void;
   onmessage: ((ev: MessageEvent) => void) | null;
+  addEventListener: (name: string, h: (e: { reason?: unknown; message?: string }) => void) => void;
 };
+
+// Unhandled promise rejections do NOT auto-propagate to the host's
+// `worker.onerror`; they vanish into the worker void otherwise. Throwing
+// re-raises them as script errors, which DO reach `worker.onerror` on the
+// main thread — so an operator sees them in the Obsidian console instead
+// of staring at a worker that silently did nothing.
+scope.addEventListener('unhandledrejection', (e) => {
+  const reason = e.reason instanceof Error ? e.reason : new Error(String(e.reason));
+  // Defer one tick so the rejection-handling completes first.
+  queueMicrotask(() => {
+    throw reason;
+  });
+});
 
 new EngineWorkerHost(selfPort<FromWorker, ToWorker>(scope));
