@@ -45,18 +45,33 @@ pub enum MaterializeOp {
 }
 
 /// Host-persisted engine snapshot (the SDK stores these opaque bytes via its
-/// StorageAdapter; `.context/`-equivalent, never synced, §11). Byte-portable
-/// so a vault dir stays interchangeable with `ctx`.
+/// StorageAdapter; `.context/`-equivalent, never synced, §11).
+///
+/// Serialized with MessagePack (`rmp-serde`), NOT `serde_json`: the object
+/// store is `Vec<Vec<u8>>`, and `serde_json` has no binary type — it emits
+/// every byte as a decimal integer in a JSON array (`[35,32,104,…]`), a ~4×
+/// blow-up that `to_bytes` paid on *every* commit. MessagePack with
+/// `serde_bytes` keeps the bytes as bytes (~1×) and the codec itself is far
+/// faster, so the per-edit persist stall drops accordingly (issue 0011, the
+/// cheap half). `from_bytes` still accepts the legacy JSON form so an
+/// existing `.context/state` keeps loading.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Persisted {
     config_toml: String,
+    #[serde(with = "serde_bytes")]
     state_json: Vec<u8>,
     authorized: String,
     /// Every loose object, raw (zlib(framed)) — the same wire form `ctx`
     /// stores on disk (§6.3). Content-addressed, so order is irrelevant.
-    objects: Vec<Vec<u8>>,
+    objects: Vec<serde_bytes::ByteBuf>,
     main: Option<String>,
 }
+
+/// Magic prefix on the MessagePack-encoded engine blob — lets `from_bytes`
+/// tell the new form from a legacy `serde_json` blob (which starts with
+/// `{`). Four bytes, not valid JSON, vanishingly unlikely as a MessagePack
+/// false-positive because we only ever *write* blobs that carry it.
+const PERSIST_MAGIC: &[u8] = b"CSP1";
 
 /// The wasm/host-driven full engine. Holds the object store in memory; the
 /// host persists [`Self::to_bytes`] and restores via [`Self::from_bytes`].
@@ -125,10 +140,18 @@ impl MemEngine {
         })
     }
 
-    /// Restore from host-persisted bytes ([`Self::to_bytes`]).
+    /// Restore from host-persisted bytes ([`Self::to_bytes`]). Accepts both
+    /// the current MessagePack form (`CSP1`-prefixed) and the legacy
+    /// `serde_json` form, so an on-disk `.context/state` written by an older
+    /// build still loads (issue 0011).
     pub fn from_bytes(identity: Identity, bytes: &[u8], ignore: Vec<String>) -> CspResult<MemEngine> {
-        let p: Persisted = serde_json::from_slice(bytes)
-            .map_err(|e| CspError::Config(format!("engine state parse: {e}")))?;
+        let p: Persisted = if let Some(body) = bytes.strip_prefix(PERSIST_MAGIC) {
+            rmp_serde::from_slice(body)
+                .map_err(|e| CspError::Config(format!("engine state parse (msgpack): {e}")))?
+        } else {
+            serde_json::from_slice(bytes)
+                .map_err(|e| CspError::Config(format!("engine state parse (json): {e}")))?
+        };
         let mut store = MemStore::new();
         for raw in &p.objects {
             store.put_raw(raw)?;
@@ -164,7 +187,7 @@ impl MemEngine {
             .copied()
             .collect::<Vec<_>>()
             .into_iter()
-            .map(|o| self.store.get_raw(o))
+            .map(|o| self.store.get_raw(o).map(serde_bytes::ByteBuf::from))
             .collect::<CspResult<Vec<_>>>()?;
         let p = Persisted {
             config_toml: self.config.to_toml_string()?,
@@ -173,7 +196,15 @@ impl MemEngine {
             objects,
             main: self.main.map(|o| o.to_hex()),
         };
-        serde_json::to_vec(&p).map_err(|e| CspError::Config(e.to_string()))
+        // `CSP1` + MessagePack — see `Persisted`. The magic lets `from_bytes`
+        // distinguish this from a legacy `serde_json` blob.
+        let mut out = PERSIST_MAGIC.to_vec();
+        rmp_serde::to_vec_named(&p)
+            .map_err(|e| CspError::Config(e.to_string()))
+            .map(|body| {
+                out.extend_from_slice(&body);
+                out
+            })
     }
 
     /// Replace the `.contextignore`/exclude globs (the host reads the synced
@@ -694,6 +725,85 @@ mod tests {
             .iter()
             .map(|(p, c)| (p.to_string(), c.as_bytes().to_vec()))
             .collect()
+    }
+
+    // ---- Persisted-blob format (issue 0011, cheap half) ----
+
+    #[test]
+    fn to_bytes_is_messagepack_and_round_trips() {
+        let mut e = MemEngine::create(id(1), "v", "").unwrap();
+        e.commit_from_files(&files(&[("a.md", "hello"), ("b.md", "world")]))
+            .unwrap();
+        let blob = e.to_bytes().unwrap();
+        assert!(blob.starts_with(PERSIST_MAGIC), "blob carries the CSP1 magic");
+        let restored = MemEngine::from_bytes(id(1), &blob, Vec::new()).unwrap();
+        assert_eq!(restored.main(), e.main(), "main survives the round-trip");
+        assert_eq!(restored.working_files().len(), 2);
+        assert_eq!(restored.working_files().get("a.md"), Some(&b"hello".to_vec()));
+    }
+
+    #[test]
+    fn from_bytes_still_loads_a_legacy_json_blob() {
+        // Build a faithful legacy blob: the pre-0011 form was a bare
+        // `serde_json` encoding of the same struct (no magic prefix). An
+        // existing on-disk `.context/state` must keep loading.
+        let mut e = MemEngine::create(id(2), "v", "").unwrap();
+        e.commit_from_files(&files(&[("legacy.md", "kept")])).unwrap();
+        let objects = e
+            .store
+            .oids()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|o| e.store.get_raw(o).map(serde_bytes::ByteBuf::from))
+            .collect::<CspResult<Vec<_>>>()
+            .unwrap();
+        let legacy = Persisted {
+            config_toml: e.config.to_toml_string().unwrap(),
+            state_json: e.state.to_bytes().unwrap(),
+            authorized: e.authorized.clone(),
+            objects,
+            main: e.main().map(|o| o.to_hex()),
+        };
+        let json_blob = serde_json::to_vec(&legacy).unwrap();
+        assert!(!json_blob.starts_with(PERSIST_MAGIC));
+        let restored = MemEngine::from_bytes(id(2), &json_blob, Vec::new()).unwrap();
+        assert_eq!(restored.main(), e.main());
+        assert_eq!(restored.working_files().get("legacy.md"), Some(&b"kept".to_vec()));
+    }
+
+    #[test]
+    fn messagepack_blob_is_far_smaller_than_the_json_equivalent() {
+        // The whole point of issue 0011's cheap half: object bytes stop
+        // being JSON integer arrays. With real (compressible-but-binary)
+        // object payloads the MessagePack blob must be dramatically smaller.
+        let mut e = MemEngine::create(id(3), "v", "").unwrap();
+        let body: String = (0..2000).map(|i| ((i % 64) as u8 + 32) as char).collect();
+        e.commit_from_files(&files(&[("big.md", &body)])).unwrap();
+        let mp = e.to_bytes().unwrap();
+        let objects = e
+            .store
+            .oids()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|o| e.store.get_raw(o).map(serde_bytes::ByteBuf::from))
+            .collect::<CspResult<Vec<_>>>()
+            .unwrap();
+        let json = serde_json::to_vec(&Persisted {
+            config_toml: e.config.to_toml_string().unwrap(),
+            state_json: e.state.to_bytes().unwrap(),
+            authorized: e.authorized.clone(),
+            objects,
+            main: e.main().map(|o| o.to_hex()),
+        })
+        .unwrap();
+        assert!(
+            mp.len() * 2 < json.len(),
+            "messagepack ({} B) must be <½ the json ({} B)",
+            mp.len(),
+            json.len()
+        );
     }
 
     #[test]
