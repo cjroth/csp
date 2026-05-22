@@ -68,6 +68,16 @@ pub struct MemEngine {
     authorized: String,
     main: Option<Oid>,
     pub config: VaultConfig,
+    /// The host's current working file set (`path -> raw bytes`). The host
+    /// mutates this incrementally via [`Self::stage_write`] /
+    /// [`Self::stage_remove`] so a single edit no longer re-ships the whole
+    /// vault on every commit (issue 0009). [`Self::commit_staged`] authors
+    /// from it; [`Self::materialize_staged`] keeps it in step with `main`.
+    /// Not persisted — reconstructed from `main`'s committed tree on
+    /// [`Self::from_bytes`]; deferred uncommitted host edits are re-staged
+    /// by the host's reconcile pass (the host vault is their source of
+    /// truth), so the working set never needs to outlive a process.
+    working: BTreeMap<String, Vec<u8>>,
 }
 
 impl MemEngine {
@@ -111,6 +121,7 @@ impl MemEngine {
             authorized: String::new(),
             main: Some(m0),
             config,
+            working: BTreeMap::new(),
         })
     }
 
@@ -129,7 +140,7 @@ impl MemEngine {
             None => None,
         };
         let scope = Self::rebuild_scope(&config, ignore);
-        Ok(MemEngine {
+        let mut engine = MemEngine {
             store,
             state,
             scope,
@@ -137,7 +148,13 @@ impl MemEngine {
             authorized: p.authorized,
             main,
             config,
-        })
+            working: BTreeMap::new(),
+        };
+        // Seed the incremental working set from the committed tree so the
+        // first `commit_staged` after a restart has the right baseline (an
+        // empty working set would read as "every file deleted").
+        engine.working = engine.files_at_main()?;
+        Ok(engine)
     }
 
     pub fn to_bytes(&self) -> CspResult<Vec<u8>> {
@@ -184,6 +201,48 @@ impl MemEngine {
         Ok(root)
     }
 
+    /// The scope-eligible working file set of `main`'s committed tree.
+    /// Used to seed `working` on restore (issue 0009).
+    fn files_at_main(&mut self) -> CspResult<BTreeMap<String, Vec<u8>>> {
+        let main = match self.main {
+            Some(m) => m,
+            None => return Ok(BTreeMap::new()),
+        };
+        let tree = match self.store.get(main)? {
+            GitObject::Commit(c) => c.tree,
+            _ => return Err(CspError::Malformed("main is not a commit".into())),
+        };
+        read_tree_to_files(tree, &|o| self.store.get(o))
+    }
+
+    /// Incremental working-set update — record one host write. The bytes are
+    /// not committed until [`Self::commit_staged`] (issue 0009).
+    pub fn stage_write(&mut self, path: &str, content: Vec<u8>) {
+        self.working.insert(path.to_string(), content);
+    }
+
+    /// Incremental working-set update — record one host deletion.
+    pub fn stage_remove(&mut self, path: &str) {
+        self.working.remove(path);
+    }
+
+    /// Read-only view of the staged working set (host-side read cache /
+    /// tests).
+    pub fn working_files(&self) -> &BTreeMap<String, Vec<u8>> {
+        &self.working
+    }
+
+    /// §5.6 reconcile-by-content over the *staged* working set
+    /// ([`Self::stage_write`] / [`Self::stage_remove`]). Semantics are
+    /// identical to [`Self::commit_from_files`]; it just reads the
+    /// engine-held working set instead of a freshly-shipped one.
+    pub fn commit_staged(&mut self) -> CspResult<Option<Oid>> {
+        // Spec §11: scope-filter real files + canonicalize directory-
+        // preservation sentinels (engine-owned, deterministic → §12).
+        let scoped = canonicalize_keeps(&self.working, &self.scope);
+        self.commit_scoped(scoped)
+    }
+
     /// §5.6 reconcile-by-content over the host-supplied scoped working set.
     /// `files` = the host's current scope-eligible `path -> bytes` (the host
     /// does the dir walk; scope filtering still applies here as defense).
@@ -191,13 +250,23 @@ impl MemEngine {
     /// one signed primitive parented on the held fold commit and recompute
     /// `main`. Returns the new primitive oid, or `None` (no change → no-op,
     /// self-writes are non-events by construction).
+    ///
+    /// Equivalent to replacing the whole staged working set then
+    /// [`Self::commit_staged`] — kept for callers (and tests) that prefer
+    /// the stateless whole-set form.
     pub fn commit_from_files(
         &mut self,
         files: &BTreeMap<String, Vec<u8>>,
     ) -> CspResult<Option<Oid>> {
-        // Spec §11: scope-filter real files + canonicalize directory-
-        // preservation sentinels (engine-owned, deterministic → §12).
-        let scoped = canonicalize_keeps(files, &self.scope);
+        self.working = files.clone();
+        self.commit_staged()
+    }
+
+    /// Shared commit body — `scoped` is the already-scope-filtered set.
+    fn commit_scoped(
+        &mut self,
+        scoped: BTreeMap<String, Vec<u8>>,
+    ) -> CspResult<Option<Oid>> {
         let mut changed = false;
         for (p, c) in &scoped {
             if self.state.materialized.get(p) != Some(&blob_hash(c)) {
@@ -352,6 +421,32 @@ impl MemEngine {
                 content: content.clone(),
             });
             self.state.materialized.insert(p.clone(), blob_hash(content));
+        }
+        Ok(ops)
+    }
+
+    /// [`Self::materialize_plan`] against the *staged* working set, then keep
+    /// `working` in step with the ops the host is about to apply: a `Write`
+    /// updates the staged bytes, a `Remove` drops the entry, a `Defer` leaves
+    /// the host's bytes untouched (they are already in `working`). After this
+    /// the staged set mirrors what the host has on disk, so the next
+    /// [`Self::commit_staged`] sees the merged tree as a non-event rather
+    /// than re-authoring it (issue 0009).
+    pub fn materialize_staged(&mut self) -> CspResult<Vec<MaterializeOp>> {
+        let on_disk = std::mem::take(&mut self.working);
+        let ops = self.materialize_plan(&on_disk);
+        self.working = on_disk;
+        let ops = ops?;
+        for op in &ops {
+            match op {
+                MaterializeOp::Write { path, content } => {
+                    self.working.insert(path.clone(), content.clone());
+                }
+                MaterializeOp::Remove { path } => {
+                    self.working.remove(path);
+                }
+                MaterializeOp::Defer { .. } => {}
+            }
         }
         Ok(ops)
     }
@@ -613,6 +708,171 @@ mod tests {
         }));
         // §5.6: re-commit with the same on-disk content → non-event.
         assert!(e.commit_from_files(&f).unwrap().is_none());
+    }
+
+    // ---- Incremental staging API (issue 0009) ----
+
+    #[test]
+    fn staged_write_then_commit_authors_a_primitive() {
+        let mut e = MemEngine::create(id(1), "v", "").unwrap();
+        e.stage_write("a.md", b"hello".to_vec());
+        let oid = e.commit_staged().unwrap();
+        assert!(oid.is_some(), "a staged write must produce a primitive");
+        // The staged set is the engine's working view.
+        assert_eq!(e.working_files().get("a.md").map(|v| v.as_slice()), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn staged_commit_is_byte_identical_to_commit_from_files() {
+        // The staging path must author the *same* primitive as the
+        // whole-set path — same tree, same parent, same counter, same
+        // signature → same oid. (Determinism §12; this is what keeps the
+        // `ctx`-parity guarantee intact across the 0009 refactor.)
+        let mut a = MemEngine::create(id(7), "v", "").unwrap();
+        let mut b = MemEngine::create(id(7), "v", "").unwrap();
+        let oid_whole = a
+            .commit_from_files(&files(&[("x.md", "X"), ("y.md", "Y")]))
+            .unwrap();
+        b.stage_write("x.md", b"X".to_vec());
+        b.stage_write("y.md", b"Y".to_vec());
+        let oid_staged = b.commit_staged().unwrap();
+        assert_eq!(oid_whole, oid_staged);
+        assert_eq!(a.main(), b.main());
+    }
+
+    #[test]
+    fn staged_no_change_is_a_non_event() {
+        let mut e = MemEngine::create(id(1), "v", "").unwrap();
+        e.stage_write("a.md", b"hello".to_vec());
+        assert!(e.commit_staged().unwrap().is_some());
+        // Re-staging identical bytes → §5.6 non-event.
+        e.stage_write("a.md", b"hello".to_vec());
+        assert!(e.commit_staged().unwrap().is_none());
+        // commit_staged with nothing staged since → still a non-event.
+        assert!(e.commit_staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn staged_remove_authors_a_deletion() {
+        let mut e = MemEngine::create(id(1), "v", "").unwrap();
+        e.stage_write("a.md", b"A".to_vec());
+        e.stage_write("b.md", b"B".to_vec());
+        e.commit_staged().unwrap();
+        e.stage_remove("a.md");
+        assert!(e.commit_staged().unwrap().is_some(), "a removal is a change");
+        let ops = e.materialize_plan(&BTreeMap::new()).unwrap();
+        assert!(ops.contains(&MaterializeOp::Write { path: "b.md".into(), content: b"B".to_vec() }));
+        assert!(!ops.iter().any(|o| matches!(o, MaterializeOp::Write { path, .. } if path == "a.md")));
+    }
+
+    #[test]
+    fn staged_remove_last_file_empties_the_tree() {
+        let mut e = MemEngine::create(id(1), "v", "").unwrap();
+        e.stage_write("only.md", b"x".to_vec());
+        e.commit_staged().unwrap();
+        e.stage_remove("only.md");
+        assert!(e.commit_staged().unwrap().is_some(), "emptying the vault is a change");
+        assert!(e.working_files().is_empty());
+    }
+
+    #[test]
+    fn stage_write_then_remove_before_commit_collapses() {
+        // Editing then deleting a brand-new path before any commit is a
+        // no-op — the working set ends empty, nothing to author.
+        let mut e = MemEngine::create(id(1), "v", "").unwrap();
+        e.stage_write("scratch.md", b"tmp".to_vec());
+        e.stage_remove("scratch.md");
+        assert!(e.commit_staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn staged_write_accepts_non_utf8_bytes() {
+        // `stage_write` takes raw bytes — a non-UTF8 payload must round-trip
+        // (the scope's text-allowlist is the host's concern, not the
+        // staging buffer's).
+        let mut e = MemEngine::create(id(1), "v", "").unwrap();
+        let raw = vec![0xff, 0x00, 0xfe, 0x80];
+        e.stage_write("blob.bin", raw.clone());
+        assert_eq!(e.working_files().get("blob.bin"), Some(&raw));
+    }
+
+    #[test]
+    fn working_set_survives_restart_via_from_bytes() {
+        // After a persist+restore the staged baseline is the committed tree,
+        // so re-staging identical content is a non-event (no spurious commit
+        // on every reload).
+        let mut e = MemEngine::create(id(3), "v", "").unwrap();
+        e.stage_write("keep.md", b"data".to_vec());
+        e.stage_write("dir/nested.md", b"deep".to_vec());
+        e.commit_staged().unwrap();
+        let bytes = e.to_bytes().unwrap();
+
+        let mut restored = MemEngine::from_bytes(id(3), &bytes, Vec::new()).unwrap();
+        assert_eq!(restored.working_files().len(), 2, "working seeded from main");
+        assert_eq!(restored.working_files().get("keep.md"), Some(&b"data".to_vec()));
+        // No host edits since restore → commit_staged is a non-event.
+        assert!(restored.commit_staged().unwrap().is_none());
+        // A real edit after restore still authors.
+        restored.stage_write("keep.md", b"edited".to_vec());
+        assert!(restored.commit_staged().unwrap().is_some());
+    }
+
+    #[test]
+    fn materialize_staged_pulls_remote_and_syncs_working() {
+        // A receives B's primitive via integrate, then materialize_staged
+        // must (a) emit the Write op and (b) leave `working` mirroring main
+        // so the *next* commit_staged is a non-event (no echo).
+        let mut a = MemEngine::create(id(1), "v", "").unwrap();
+        let mut b = MemEngine::create(id(2), "v", "").unwrap();
+        b.stage_write("remote.md", b"from-b".to_vec());
+        b.commit_staged().unwrap();
+        let bx = b.export_closure(&b.known().unwrap()).unwrap();
+        a.integrate(&bx).unwrap();
+
+        let ops = a.materialize_staged().unwrap();
+        assert!(ops.contains(&MaterializeOp::Write {
+            path: "remote.md".into(),
+            content: b"from-b".to_vec(),
+        }));
+        assert_eq!(a.working_files().get("remote.md"), Some(&b"from-b".to_vec()));
+        // The merged tree is now the staged baseline — committing echoes nothing.
+        assert!(a.commit_staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn materialize_staged_defers_a_contended_path() {
+        // A has an uncommitted local edit to the same path B committed.
+        // materialize_staged must Defer (keep A's bytes), and `working`
+        // must retain A's bytes so the next commit authors *them*.
+        let mut a = MemEngine::create(id(1), "v", "").unwrap();
+        let mut b = MemEngine::create(id(2), "v", "").unwrap();
+        // Shared genesis history: both commit the same base first.
+        a.commit_from_files(&files(&[("shared.md", "base")])).unwrap();
+        b.commit_from_files(&files(&[("shared.md", "base")])).unwrap();
+        // A edits locally but does NOT commit; B commits a divergent edit.
+        a.stage_write("shared.md", b"a-edit".to_vec());
+        b.commit_from_files(&files(&[("shared.md", "b-edit")])).unwrap();
+        let bx = b.export_closure(&b.known().unwrap()).unwrap();
+        a.integrate(&bx).unwrap();
+
+        let ops = a.materialize_staged().unwrap();
+        assert!(
+            ops.iter().any(|o| matches!(o, MaterializeOp::Defer { path } if path == "shared.md")),
+            "a contended path must Defer, not clobber the host edit"
+        );
+        // `working` still holds A's uncommitted bytes.
+        assert_eq!(a.working_files().get("shared.md"), Some(&b"a-edit".to_vec()));
+    }
+
+    #[test]
+    fn commit_from_files_replaces_the_staged_set_wholesale() {
+        // The whole-set form must drop staged paths not in the new set —
+        // its documented "the working set is exactly these files" contract.
+        let mut e = MemEngine::create(id(1), "v", "").unwrap();
+        e.stage_write("old.md", b"old".to_vec());
+        e.commit_from_files(&files(&[("new.md", "new")])).unwrap();
+        assert!(e.working_files().get("old.md").is_none());
+        assert_eq!(e.working_files().get("new.md"), Some(&b"new".to_vec()));
     }
 
     #[test]

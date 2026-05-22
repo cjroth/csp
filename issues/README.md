@@ -13,3 +13,6 @@ on macOS (2026-05-19). One file per issue.
 | [0006](0006-vault-level-lock-for-concurrent-sync.md) | Vault-level lock to prevent concurrent sync by multiple processes | Medium | Open |
 | [0007](0007-per-session-instance-id-for-concurrent-same-nodeid-syncs.md) | Concurrent same-NodeId sync sessions conflate at the relay; need an in-memory per-session instance ID | Medium | Open |
 | [0008](0008-auth-key-enrollment-and-expiry.md) | Auth-key enrollment (`CTX_AUTH_KEY`) + per-key expiry (`expires=YYYY-MM-DD`, default 90d) | Feature | Implementing |
+| [0009](0009-incremental-commits-for-obsidian-sync.md) | Obsidian sync is O(whole-vault) per edit; make commits incremental | High | Open |
+| [0010](0010-move-engine-to-web-worker.md) | Obsidian sync freezes the UI; move the engine to a Web Worker | High | Open |
+| [0011](0011-incremental-persistence-replace-to-bytes.md) | `engine.to_bytes()` re-serializes the whole vault on every commit | Medium | Open |

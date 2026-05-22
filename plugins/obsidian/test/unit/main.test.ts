@@ -87,7 +87,7 @@ describe('missing WebAssembly (iOS Lockdown Mode, ancient Android WebView)', () 
     // Simulate a WebView without WebAssembly. The plugin can't init the
     // engine without it — we want a clear error pointing at the cause.
     const saved = (globalThis as { WebAssembly?: unknown }).WebAssembly;
-    delete (globalThis as { WebAssembly?: unknown }).WebAssembly;
+    Reflect.deleteProperty(globalThis, 'WebAssembly');
     try {
       await expect(plugin.runSetup({ mode: 'create' })).rejects.toThrow(
         /WebAssembly.*Lockdown Mode|Android System WebView/,

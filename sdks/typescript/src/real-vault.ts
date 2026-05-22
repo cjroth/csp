@@ -1,8 +1,9 @@
 // The real CSP thin-node `Vault` — a thin shim over the **one Rust engine**
 // (`WasmEngine` = `csp_core::MemEngine` + the shared sans-IO `Session`,
 // §16). No protocol/merge logic here: it owns a file-level working map (the
-// host plugin's view), drives `engine.commit_from_files` /
-// `materialize_plan` (§5.6) and the `session_start`/`session_feed` loop over
+// host plugin's view), drives the engine's incremental staging API
+// (`stage_write`/`stage_remove`/`commit_staged`, §5.6) and the
+// `session_start`/`session_feed` loop over
 // an injected WebSocket transport, and persists `engine.to_bytes()` via the
 // host StorageAdapter. The plugin computes its own byte-identical `main`
 // (same code as `ctx`).
@@ -14,12 +15,6 @@ import type { CloneOptions, CreateOptions, Identity, OpenOptions, Vault } from '
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-
-function filesToJson(files: Map<string, string>): string {
-  const obj: Record<string, number[]> = {};
-  for (const [p, c] of files) obj[p] = Array.from(enc.encode(c));
-  return JSON.stringify(obj);
-}
 
 /** Append `?auth_key=<urlencoded>` to a peer URL when an auth key is set
  * (CSP §10 enrollment, browser-compatible fallback path). The standard
@@ -109,7 +104,10 @@ export class RealVault implements Vault {
     const seed = await seedOf(opts);
     const engine = EngineCtor.open(seed, st, '');
     const v = new RealVault(engine, seed, opts.storage, opts);
-    await v.materializeFromMain(); // pull the merged tree into the working map
+    // The engine's `from_bytes` already seeded its staged working set from
+    // the committed tree (issue 0009); mirror it into the host-side cache
+    // so reads work and incremental staging has a matching baseline.
+    v.seedFilesFromEngine();
     return v;
   }
 
@@ -157,6 +155,10 @@ export class RealVault implements Vault {
 
   async writeTextFile(path: string, content: string): Promise<string> {
     this.files.set(path, content);
+    // Stage the single changed file into the engine (issue 0009) — no
+    // whole-vault re-ship. Raw bytes cross the wasm boundary, not a JSON
+    // integer array.
+    this.engine.stage_write(path, enc.encode(content));
     this.scheduleCommit();
     return path;
   }
@@ -169,13 +171,18 @@ export class RealVault implements Vault {
     return this.files.has(path);
   }
   async deleteFile(path: string): Promise<void> {
-    if (this.files.delete(path)) this.scheduleCommit();
+    if (this.files.delete(path)) {
+      this.engine.stage_remove(path);
+      this.scheduleCommit();
+    }
   }
   async renameFile(from: string, to: string): Promise<void> {
     const c = this.files.get(from);
     if (c === undefined) return;
     this.files.set(to, c);
     this.files.delete(from);
+    this.engine.stage_write(to, enc.encode(c));
+    this.engine.stage_remove(from);
     this.scheduleCommit();
   }
   listFiles(): FileMeta[] {
@@ -228,12 +235,30 @@ export class RealVault implements Vault {
 
   private async applyRestoredTree(tree: Record<string, number[]>): Promise<void> {
     await this.flushCommit(); // author any pending edits before re-authoring
-    this.files.clear();
+    const next = new Map<string, string>();
     for (const [p, bytes] of Object.entries(tree)) {
-      this.files.set(p, dec.decode(Uint8Array.from(bytes)));
+      next.set(p, dec.decode(Uint8Array.from(bytes)));
     }
+    // Stage the old→new delta into the engine so the staged working set
+    // matches the restored tree before `commit_staged` (issue 0009).
+    for (const p of this.files.keys()) {
+      if (!next.has(p)) this.engine.stage_remove(p);
+    }
+    for (const [p, c] of next) this.engine.stage_write(p, enc.encode(c));
+    this.files = next;
     await this.commitNow(); // restore-as-edit (§8)
     this.emit({ kind: 'tree-changed' });
+  }
+
+  /** Seed the host-side file cache from the engine's staged working set —
+   * used once on `open()`, where `from_bytes` already restored the engine's
+   * working set from the committed tree (issue 0009). */
+  private seedFilesFromEngine(): void {
+    const dump = JSON.parse(this.engine.working_files_json()) as Record<string, number[]>;
+    this.files.clear();
+    for (const [p, bytes] of Object.entries(dump)) {
+      this.files.set(p, dec.decode(Uint8Array.from(bytes)));
+    }
   }
 
   // ---- Connection: drive the one shared Session over the transport ----
@@ -414,10 +439,13 @@ export class RealVault implements Vault {
     });
   }
 
-  /** Author a primitive from the working map (§5.6 reconcile-by-content is
-   * inside the engine); on a new primitive, persist and live-push it (§6.5). */
+  /** Author a primitive from the engine's staged working set (§5.6
+   * reconcile-by-content is inside the engine); on a new primitive, persist
+   * and live-push it (§6.5). The host-side `this.files` cache and the
+   * engine's staged set are kept in lockstep by every mutating op, so this
+   * no longer re-ships the whole vault per commit (issue 0009). */
   private async commitNow(): Promise<void> {
-    const prim = this.engine.commit_from_files(filesToJson(this.files));
+    const prim = this.engine.commit_staged();
     if (!prim) return;
     await this.persist();
     if (this.connected && this.conn) {
@@ -432,7 +460,9 @@ export class RealVault implements Vault {
     // Author pending host edits first so the §5.6 plan sees them as
     // primitives (not just uncommitted working bytes) before a merge.
     await this.flushCommit();
-    const ops = JSON.parse(this.engine.materialize_plan(filesToJson(this.files))) as MatOp[];
+    // `materialize_staged` plans against the engine's staged working set and
+    // keeps it in step with the ops it returns (issue 0009).
+    const ops = JSON.parse(this.engine.materialize_staged()) as MatOp[];
     let changed = false;
     for (const o of ops) {
       if (o.op === 'write' && o.content) {

@@ -213,6 +213,12 @@ impl WasmEngine {
     /// Author a primitive from the host's scoped working set (§5.6).
     /// `files_json` = `{ "path": [byte,…], … }`. Returns the new primitive
     /// oid hex, or `null` if nothing genuinely changed.
+    ///
+    /// Whole-set form: replaces the staged working set entirely. The
+    /// incremental `stage_write` / `stage_remove` / `commit_staged` trio
+    /// (issue 0009) is what the SDK actually drives on every edit; this is
+    /// kept for the initial seed and for callers that prefer the stateless
+    /// shape.
     pub fn commit_from_files(&mut self, files_json: &str) -> Result<Option<String>, JsError> {
         let files: BTreeMap<String, Vec<u8>> = serde_json::from_str(files_json).map_err(je)?;
         Ok(self
@@ -222,16 +228,52 @@ impl WasmEngine {
             .map(|o| o.to_hex()))
     }
 
+    /// Incremental working-set update — record one host write. `content` is
+    /// passed as raw bytes (near-zero-copy through `wasm-bindgen`), avoiding
+    /// the ~4× blow-up of the JSON integer-array encoding `commit_from_files`
+    /// needs. Not committed until `commit_staged` (issue 0009).
+    pub fn stage_write(&mut self, path: &str, content: &[u8]) {
+        self.inner.stage_write(path, content.to_vec());
+    }
+
+    /// Incremental working-set update — record one host deletion.
+    pub fn stage_remove(&mut self, path: &str) {
+        self.inner.stage_remove(path);
+    }
+
+    /// Author a primitive from the *staged* working set. Same §5.6 semantics
+    /// as `commit_from_files`; returns the new primitive oid hex, or `null`
+    /// on a non-event.
+    pub fn commit_staged(&mut self) -> Result<Option<String>, JsError> {
+        Ok(self.inner.commit_staged().map_err(je)?.map(|o| o.to_hex()))
+    }
+
+    /// JSON dump of the staged working set (`{ "path": [byte,…] }`). The SDK
+    /// reads this once after `open()` to seed its host-side file cache from
+    /// the engine's `from_bytes`-restored working set; every edit after that
+    /// is incremental via `stage_write` / `stage_remove` (issue 0009).
+    pub fn working_files_json(&self) -> Result<String, JsError> {
+        serde_json::to_string(self.inner.working_files()).map_err(je)
+    }
+
     /// The §5.6 no-clobber materialize plan for the current `main`.
     /// `on_disk_json` = the host's current bytes per known path. Returns a
     /// JSON array of `{op:"write",path,content}|{op:"remove",path}|
     /// {op:"defer",path}`.
     pub fn materialize_plan(&mut self, on_disk_json: &str) -> Result<String, JsError> {
         let on_disk: BTreeMap<String, Vec<u8>> = serde_json::from_str(on_disk_json).map_err(je)?;
-        let ops: Vec<OpJson> = self
-            .inner
-            .materialize_plan(&on_disk)
-            .map_err(je)?
+        Self::ops_json(self.inner.materialize_plan(&on_disk).map_err(je)?)
+    }
+
+    /// `materialize_plan` against the staged working set, keeping it in step
+    /// with the returned ops (issue 0009). The host applies the same ops to
+    /// its vault; no `on_disk` round-trip needed.
+    pub fn materialize_staged(&mut self) -> Result<String, JsError> {
+        Self::ops_json(self.inner.materialize_staged().map_err(je)?)
+    }
+
+    fn ops_json(ops: Vec<MaterializeOp>) -> Result<String, JsError> {
+        let ops: Vec<OpJson> = ops
             .into_iter()
             .map(|o| match o {
                 MaterializeOp::Write { path, content } => OpJson::Write { path, content },

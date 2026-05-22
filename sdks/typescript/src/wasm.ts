@@ -14,14 +14,28 @@ import { createRequire } from 'node:module';
 export interface WasmEngine {
   free(): void;
   authorize(sshLine: string): void;
-  /** `{ "path": [byte,…] }` → new primitive oid hex, or undefined (no-op). */
+  /** `{ "path": [byte,…] }` → new primitive oid hex, or undefined (no-op).
+   * Whole-set form; replaces the staged working set entirely. */
   commit_from_files(filesJson: string): string | undefined;
+  /** Incremental working-set update — record one host write as raw bytes
+   * (no JSON integer-array blow-up). Not committed until `commit_staged`. */
+  stage_write(path: string, content: Uint8Array): void;
+  /** Incremental working-set update — record one host deletion. */
+  stage_remove(path: string): void;
+  /** Author a primitive from the staged working set → oid hex / undefined. */
+  commit_staged(): string | undefined;
+  /** `{ "path": [byte,…] }` dump of the staged working set — read once on
+   * `open()` to seed the host-side file cache. */
+  working_files_json(): string;
   export_closure(tipsJson: string): string;
   frontier_tips(): string[];
   integrate(rawsJson: string): number;
   known(): string[];
   main(): string;
   materialize_plan(onDiskJson: string): string;
+  /** `materialize_plan` against the staged working set, keeping it in step
+   * with the returned ops. */
+  materialize_staged(): string;
   node_id(): string;
   node_ssh(): string;
   restore_snapshot(name: string): string;
