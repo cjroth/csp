@@ -16,3 +16,5 @@ on macOS (2026-05-19). One file per issue.
 | [0009](0009-incremental-commits-for-obsidian-sync.md) | Obsidian sync is O(whole-vault) per edit; make commits incremental | High | Open |
 | [0010](0010-move-engine-to-web-worker.md) | Obsidian sync freezes the UI; move the engine to a Web Worker | High | Open |
 | [0011](0011-incremental-persistence-replace-to-bytes.md) | `engine.to_bytes()` re-serializes the whole vault on every commit | Medium | Open |
+| [0012](0012-deleted-files-resurrect-when-stale-device-reconnects.md) | Deleted files resurrect when a stale device reconnects (false-add primitive + empty merge base) | High | Open |
+| [0013](0013-git-repo-coupling-and-joint-history.md) | Couple a vault to a sibling git repo (joint clone, fast-forward, rewind) | Feature | Open |
