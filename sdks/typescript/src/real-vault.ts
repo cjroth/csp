@@ -16,6 +16,21 @@ import type { CloneOptions, CreateOptions, Identity, OpenOptions, Vault } from '
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+/** Worker-side wall-clock trace prefix. Lines from `[engine-worker]` show
+ * up in the host's dev console (Workers forward `console.log` to the
+ * parent), so a live-sync latency hunt can read the exact gap between
+ * "frame in" and "tree-changed out". */
+function wkTs(): string {
+  const d = new Date();
+  const pad = (n: number, w = 2) => String(n).padStart(w, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+}
+function wkLog(msg: string): void {
+  // The native Node test runner doesn't have `globalThis.console.log` =
+  // worker-forwarded behaviour, but logging directly is still cheap.
+  console.log(`[engine-worker ${wkTs()}]`, msg);
+}
+
 /** Append `?auth_key=<urlencoded>` to a peer URL when an auth key is set
  * (CSP §10 enrollment, browser-compatible fallback path). The standard
  * `WebSocket` constructor can't set arbitrary headers, so the SDK rides
@@ -324,6 +339,11 @@ export class RealVault implements Vault {
       const cb = conn.channelBinding() ?? new Uint8Array();
       await conn.send(this.engine.session_start(cb));
       for await (const frame of conn.recv()) {
+        // Per-frame trace lets the host see where seconds actually go on
+        // the receive path — useful for the live-sync-latency hunt where
+        // the wall-clock gap between "frame in" and "tree-changed out"
+        // exposed an unexpectedly slow materialize+persist on the worker.
+        const tFrame = wkTs();
         const step = JSON.parse(this.engine.session_feed(frame)) as {
           out: number[][];
           integrated: number;
@@ -341,8 +361,11 @@ export class RealVault implements Vault {
           this.emit({ kind: 'connected', peer_pubkey: peerBytes });
         }
         if (step.integrated > 0) {
+          wkLog(`integrate ${step.integrated} → materialize start (frame@${tFrame})`);
           await this.materializeFromMain();
+          wkLog('materialize done → persist start');
           await this.persist();
+          wkLog('persist done');
         }
       }
     } finally {
@@ -440,19 +463,35 @@ export class RealVault implements Vault {
   }
 
   /** Author a primitive from the engine's staged working set (§5.6
-   * reconcile-by-content is inside the engine); on a new primitive, persist
-   * and live-push it (§6.5). The host-side `this.files` cache and the
-   * engine's staged set are kept in lockstep by every mutating op, so this
-   * no longer re-ships the whole vault per commit (issue 0009). */
+   * reconcile-by-content is inside the engine); on a new primitive,
+   * **live-push first**, then persist. The primitive is in the engine's
+   * in-memory state regardless; persist is for local durability.
+   * Persist-before-live used to hold the live frame for the full engine
+   * to_bytes + storage round-trip + atomic disk write — observed at ~8 s on
+   * a 450-file vault, which was most of the apparent sync latency.
+   *
+   * Crash-safety of the swap: if persist fails after a successful live
+   * send, the peer has the primitive and the next catch-up re-integrates
+   * it locally; the edit is preserved. Live-before-persist is strictly
+   * less lossy in the writer-crash window than the previous order.
+   */
   private async commitNow(): Promise<void> {
+    wkLog('commit start');
     const prim = this.engine.commit_staged();
-    if (!prim) return;
-    await this.persist();
+    if (!prim) {
+      wkLog('commit non-event (no change)');
+      return;
+    }
     if (this.connected && this.conn) {
       const closure = JSON.parse(this.engine.export_closure(JSON.stringify([prim]))) as number[][];
       const live = wireEncode(JSON.stringify({ Live: { raws: closure } }));
+      // Fire the live push immediately; persist runs after so a slow disk /
+      // worker-boundary round-trip never delays a peer seeing the edit.
       await this.conn.send(live).catch(() => {});
+      wkLog(`commit live sent (prim=${prim.slice(0, 12)}…)`);
     }
+    await this.persist();
+    wkLog('commit persist done');
   }
 
   /** Apply the §5.6 no-clobber materialize plan into the working map. */
