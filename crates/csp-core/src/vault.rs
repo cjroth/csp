@@ -123,10 +123,13 @@ impl Vault {
         if !ak.exists() {
             std::fs::write(&ak, b"")?;
         }
-        // NB: `.contextignore` is *synced, user-managed* scope content
-        // (§11). We deliberately do NOT pre-create it: an empty init
-        // artifact would look like a pending user edit on a fresh node and
-        // the §5.6 no-clobber rule would defer the real synced one forever.
+        // NB: `Vault::create` itself does NOT seed `.contextignore`.
+        // Clone also reaches this path (`ctx clone` → `Vault::create`),
+        // and there the peer's synced `.contextignore` is authoritative —
+        // pre-writing locally would trip the §5.6 no-clobber rule and
+        // defer the synced one. The `ctx init` CLI handler seeds a default
+        // (markdown-only, [`crate::scope::DEFAULT_CONTEXTIGNORE`]) only on
+        // genuine init, after this returns.
         let scope = Scope {
             include: config.include.clone(),
             ignore: Vec::new(),

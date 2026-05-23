@@ -19,6 +19,20 @@
 pub const CONTEXT_DIR: &str = ".context";
 pub const CONTEXTIGNORE: &str = ".contextignore";
 
+/// Default `.contextignore` body seeded by `ctx init`. Limits a fresh vault
+/// to markdown files (plus `.contextignore` itself, so the file syncs).
+/// Last-match-wins gitignore semantics: `*` denies everything, the `!`
+/// lines un-deny. Users are expected to edit this — it's the *default*
+/// scope, not a hard rule. NB: clone deliberately does NOT seed this (the
+/// peer's `.contextignore` is the source of truth there; see §5.6).
+pub const DEFAULT_CONTEXTIGNORE: &str = "\
+# CSP scope (synced, last-match-wins gitignore syntax).
+# Default: sync markdown files only. Edit to taste.
+*
+!*.md
+!.contextignore
+";
+
 #[derive(Clone, Debug)]
 pub struct Scope {
     /// Allowlist include globs (scope-relative). Default: everything.
@@ -425,6 +439,34 @@ mod tests {
         assert!(!s.path_in_scope("build/out.txt"));
         assert!(s.path_in_scope("keep.log"));
         assert!(s.path_in_scope("src/main.rs"));
+    }
+
+    #[test]
+    fn default_contextignore_is_markdown_only() {
+        // What `ctx init` seeds: deny-all + un-deny `.md` + un-deny
+        // `.contextignore`. Pins the published default's behaviour so
+        // edits to the template can't silently widen scope.
+        let s = Scope {
+            include: vec!["**".into()],
+            ignore: DEFAULT_CONTEXTIGNORE
+                .lines()
+                .map(|l| l.to_string())
+                .collect(),
+            allow_binary: false,
+        };
+        // In scope: markdown at any depth.
+        assert!(s.path_in_scope("notes.md"));
+        assert!(s.path_in_scope("a/b/c.md"));
+        // In scope: `.contextignore` itself, at root and nested.
+        assert!(s.path_in_scope(".contextignore"));
+        assert!(s.path_in_scope("sub/.contextignore"));
+        // Out of scope: everything else, including the .git footgun
+        // that motivated this default.
+        assert!(!s.path_in_scope("notes.txt"));
+        assert!(!s.path_in_scope("image.png"));
+        assert!(!s.path_in_scope(".git/config"));
+        assert!(!s.path_in_scope(".git/objects/ab/cdef"));
+        assert!(!s.path_in_scope("README"));
     }
 
     #[test]

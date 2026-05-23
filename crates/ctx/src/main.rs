@@ -231,6 +231,17 @@ async fn run(cli: Cli) -> Result<()> {
                 .context("create vault (already a vault here?)")?;
             v.set_name(&nm)?;
             seed_authorized(&v, &cli.authorized_keys)?;
+            // Seed a markdown-only default `.contextignore` on a genuine
+            // init so a fresh vault dropped onto, e.g., a project that
+            // already has `.git/` doesn't sync the world. Skipped if the
+            // user already supplied one (init is idempotent on re-run and
+            // we never clobber). Clone deliberately does not seed — see
+            // `Vault::create`'s comment.
+            let ignore_path = root.join(csp_core::scope::CONTEXTIGNORE);
+            if !ignore_path.exists() {
+                std::fs::write(&ignore_path, csp_core::scope::DEFAULT_CONTEXTIGNORE)
+                    .context("seed default .contextignore")?;
+            }
             drop(v);
             println!(
                 "initialized vault {} ({}) at {}",
