@@ -113,6 +113,19 @@ export interface StorageResponse {
   error?: string;
 }
 
+/** Worker → main: a diagnostic log line. The worker's `console.log` /
+ * `console.error` is mirrored here so the host can mount an in-app log
+ * viewer — on iOS WebView the dev console is unreachable, so this is the
+ * only way to read worker-side trace lines (issue 0013). */
+export interface LogMessage {
+  kind: 'log';
+  level: 'info' | 'error';
+  /** `HH:MM:SS.mmm` worker wall-clock, captured before the channel hop so
+   * the host sees the time the worker actually emitted the line. */
+  ts: string;
+  msg: string;
+}
+
 /** Distributive `Omit` — preserves the discriminated union when stripping
  * the envelope fields, unlike the built-in `Omit` which collapses it. */
 type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K> : never;
@@ -124,4 +137,4 @@ export type CommandBody = DistributiveOmit<Command, 'kind' | 'id'>;
 /** Anything the main thread sends into the worker. */
 export type ToWorker = Command | StorageResponse;
 /** Anything the worker sends back to the main thread. */
-export type FromWorker = Reply | EventMessage | StorageRequest;
+export type FromWorker = Reply | EventMessage | StorageRequest | LogMessage;

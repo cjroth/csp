@@ -1,6 +1,6 @@
 {
   "name": "@csp/obsidian-plugin",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "private": true,
   "description": "Context for Obsidian — sync your vault as agent-readable context via the Context Sync Protocol.",
   "license": "MIT OR Apache-2.0",

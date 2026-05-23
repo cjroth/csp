@@ -369,6 +369,13 @@ function makeStubEl(): HTMLElementLike {
   let text = '';
   const handlers = new Map<string, Set<(e: unknown) => void>>();
   const el: HTMLElementLike = {
+    // `style` / scroll metrics are stubs — the log modal sets a handful
+    // of inline styles and reads `scrollTop` to decide auto-scroll. We
+    // only need the property bag to be writable; tests don't inspect it.
+    style: {} as Record<string, string>,
+    scrollTop: 0,
+    scrollHeight: 0,
+    clientHeight: 0,
     setText(t: string) {
       text = t;
     },
@@ -428,6 +435,15 @@ function makeStubEl(): HTMLElementLike {
 }
 
 export interface HTMLElementLike {
+  /** Writable inline-style bag — production code sets a few rules on the
+   * log modal's pre/body element; tests don't inspect them. */
+  style: Record<string, string>;
+  /** Scroll metrics used by the log modal's auto-scroll decision. The
+   * stub leaves them at zero, which makes `isAtBottom()` true and
+   * appended rows auto-scroll — matching the production default. */
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
   setText(t: string): void;
   getText(): string;
   addClass(c: string): void;

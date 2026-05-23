@@ -21,9 +21,17 @@ import type {
   CommandBody,
   FromWorker,
   InitPayload,
+  LogMessage,
   Observable,
   ToWorker,
 } from './protocol.js';
+
+/** Host-side sink for worker-side log lines (issue 0013). The worker
+ * mirrors its own `console.log` / `console.error` to this so an in-app
+ * log viewer on mobile (where the dev console is unreachable) can show
+ * what the engine is doing. The host typically forwards to its own
+ * console *and* to a ring buffer the UI reads. */
+export type WorkerLogSink = (entry: LogMessage) => void;
 
 export class WorkerVault implements VaultContract {
   // ---- Synchronous shadow of the worker's observable state ----
@@ -45,6 +53,7 @@ export class WorkerVault implements VaultContract {
   private constructor(
     private readonly port: Port<ToWorker, FromWorker>,
     private readonly storage: StorageAdapter,
+    private readonly onLog: WorkerLogSink | null,
   ) {
     this.port.onMessage((msg) => void this.onMessage(msg));
   }
@@ -56,13 +65,18 @@ export class WorkerVault implements VaultContract {
    *
    * `storage` is the real main-thread `StorageAdapter`; the worker's engine
    * drives it through the channel.
+   *
+   * `onLog` (optional) receives every worker-side `console.log` /
+   * `console.error` line — used by the in-app log viewer on mobile, where
+   * the WebView dev console is unreachable (issue 0013).
    */
   static async start(
     port: Port<ToWorker, FromWorker>,
     storage: StorageAdapter,
     payload: InitPayload,
+    onLog?: WorkerLogSink,
   ): Promise<WorkerVault> {
-    const v = new WorkerVault(port, storage);
+    const v = new WorkerVault(port, storage, onLog ?? null);
     const firstObservable = new Promise<void>((resolve) => {
       v.firstObservableResolve = resolve;
     });
@@ -93,6 +107,16 @@ export class WorkerVault implements VaultContract {
     }
     if (msg.kind === 'storage-req') {
       await this.serviceStorage(msg.id, msg.method, msg.args);
+      return;
+    }
+    if (msg.kind === 'log') {
+      // A log sink throwing must not break the channel — the engine cannot
+      // rely on the host having a useful logger.
+      try {
+        this.onLog?.(msg);
+      } catch {
+        // swallow — diagnostic, not load-bearing
+      }
       return;
     }
   }

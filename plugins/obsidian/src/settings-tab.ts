@@ -10,6 +10,7 @@
 //   - Configured → the sync toggle + editable config + snapshots.
 
 import { type App, type ButtonComponent, Notice, PluginSettingTab, Setting } from 'obsidian';
+import { LogModal } from './log-modal.js';
 import type ContextSyncPlugin from './main.js';
 import { normalizePeerUrl, parseIgnoreGlobs } from './settings.js';
 
@@ -244,6 +245,19 @@ export class ContextSyncSettingTab extends PluginSettingTab {
       .setName('Pinned peer key')
       .setDesc("The peer's identity, remembered on first connect.")
       .addText((t) => t.setValue(pinned).setDisabled(true));
+
+    new Setting(containerEl)
+      .setName('View logs')
+      .setDesc(
+        "Engine activity log — the only way to see what's happening on " +
+          "mobile, since the dev console isn't reachable there. Copy it to " +
+          'share if something looks wrong.',
+      )
+      .addButton((b) =>
+        b.setButtonText('Open log').onClick(() => {
+          new LogModal(this.app, this.plugin.logBuffer).open();
+        }),
+      );
 
     new Setting(containerEl)
       .setName('Reset local state')

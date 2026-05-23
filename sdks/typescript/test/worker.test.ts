@@ -35,6 +35,78 @@ async function spawn(
   return { vault, host };
 }
 
+describe('WorkerVault — worker log routing (issue 0013)', () => {
+  test('worker-side log messages reach the host onLog sink with level, ts, msg preserved', async () => {
+    // Use a pair of linked ports directly so we can post a synthetic `log`
+    // message from the worker side without running the entry-script
+    // wrapper (the wrapper is exercised in production; here we only need
+    // to prove WorkerVault dispatches `kind: 'log'` to `onLog`).
+    const [mainPort, workerPort] = linkedPorts<ToWorker, FromWorker>();
+    const host = new EngineWorkerHost(workerPort as Port<FromWorker, ToWorker>);
+    void host; // keep alive for the duration of the test
+    const captured: Array<{ level: 'info' | 'error'; ts: string; msg: string }> = [];
+    const vault = await WorkerVault.start(
+      mainPort as Port<ToWorker, FromWorker>,
+      memoryStorage(),
+      { mode: 'create', seed: seed(1), wasmBytes: new Uint8Array(0) },
+      (e) => captured.push({ level: e.level, ts: e.ts, msg: e.msg }),
+    );
+    // Synthesize what `engine-worker-entry.ts` would post on a
+    // `console.log(...)`. The channel pipes structured-clone-safe values.
+    (workerPort as Port<FromWorker, ToWorker>).post({
+      kind: 'log',
+      level: 'info',
+      ts: '12:34:56.789',
+      msg: 'engine: hello',
+    });
+    (workerPort as Port<FromWorker, ToWorker>).post({
+      kind: 'log',
+      level: 'error',
+      ts: '12:34:56.790',
+      msg: 'engine: boom',
+    });
+    // The link is sync within a microtask — give the channel one tick.
+    await Promise.resolve();
+    expect(captured).toEqual([
+      { level: 'info', ts: '12:34:56.789', msg: 'engine: hello' },
+      { level: 'error', ts: '12:34:56.790', msg: 'engine: boom' },
+    ]);
+    await vault.close();
+  });
+
+  test('a throwing onLog does not break the channel (other messages still flow)', async () => {
+    const [mainPort, workerPort] = linkedPorts<ToWorker, FromWorker>();
+    const host = new EngineWorkerHost(workerPort as Port<FromWorker, ToWorker>);
+    void host;
+    const vault = await WorkerVault.start(
+      mainPort as Port<ToWorker, FromWorker>,
+      memoryStorage(),
+      { mode: 'create', seed: seed(1), wasmBytes: new Uint8Array(0) },
+      () => {
+        throw new Error('sink blew up');
+      },
+    );
+    (workerPort as Port<FromWorker, ToWorker>).post({
+      kind: 'log',
+      level: 'info',
+      ts: 't',
+      msg: 'x',
+    });
+    // After the log line, a normal command must still round-trip.
+    await vault.writeTextFile('a.md', 'hi');
+    expect(vault.fileExists('a.md')).toBe(true);
+    await vault.close();
+  });
+
+  test('WorkerVault.start with no onLog is fine (log messages are silently dropped)', async () => {
+    // No `onLog` arg — emulate the existing call shape unchanged.
+    const { vault } = await spawn(memoryStorage(), { mode: 'create' });
+    // No way to observe the drop directly; the assertion is "no throw".
+    expect(vault.isConnected()).toBe(false);
+    await vault.close();
+  });
+});
+
 describe('WorkerVault — init', () => {
   test('create → identity + empty file list available synchronously', async () => {
     const { vault } = await spawn(memoryStorage(), { mode: 'create' });

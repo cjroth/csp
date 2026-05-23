@@ -41,6 +41,8 @@ import {
   loadIdentity,
   loadOrCreateIdentity,
 } from './identity-store.js';
+import { LogBuffer } from './log-buffer.js';
+import { LogModal } from './log-modal.js';
 import { ContextSyncSettingTab } from './settings-tab.js';
 import { ConfigStore, type CspSettings, DEFAULT_SETTINGS, normalizePeerUrl } from './settings.js';
 import { StatusBar } from './status-bar.js';
@@ -73,11 +75,36 @@ function ctxTs(): string {
   const pad = (n: number, w = 2) => String(n).padStart(w, '0');
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
 }
-function ctxLog(m: string): void {
-  console.log(`[context ${ctxTs()}]`, m);
+
+/** Module-level reference set by `onload` so the top-level `ctxLog` /
+ * `ctxErr` helpers can append into the same ring buffer the log modal
+ * reads from (issue 0013). Module-level rather than method-bound because
+ * the helpers are passed by reference to the controller and several other
+ * places, which makes a `this`-bound version awkward. The buffer itself
+ * is owned by the plugin instance and torn down on `onunload`. */
+let logBufferRef: LogBuffer | null = null;
+function ctxLog(m: string, ...rest: unknown[]): void {
+  console.log(`[context ${ctxTs()}]`, m, ...rest);
+  if (logBufferRef) {
+    const extra = rest.length ? ` ${rest.map(stringifyForLog).join(' ')}` : '';
+    logBufferRef.append({ ts: ctxTs(), source: 'main', level: 'info', msg: m + extra });
+  }
 }
 function ctxErr(m: string, ...rest: unknown[]): void {
   console.error(`[context ${ctxTs()}]`, m, ...rest);
+  if (logBufferRef) {
+    const extra = rest.length ? ` ${rest.map(stringifyForLog).join(' ')}` : '';
+    logBufferRef.append({ ts: ctxTs(), source: 'main', level: 'error', msg: m + extra });
+  }
+}
+function stringifyForLog(v: unknown): string {
+  if (typeof v === 'string') return v;
+  if (v instanceof Error) return `${v.name}: ${v.message}`;
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
 }
 
 /** Decode the build-time inlined csp-core wasm (base64) into a Uint8Array
@@ -120,8 +147,17 @@ export default class ContextSyncPlugin extends Plugin {
   private wasmBytes: Uint8Array | null = null;
   private identity: IdentityInstance | null = null;
   private lastNotice: string | null = null;
+  /** In-memory ring buffer of `[context …]` + `[engine-worker …]` lines
+   * for the in-app log viewer (issue 0013). Owned by the plugin so it
+   * dies with the plugin lifecycle. */
+  readonly logBuffer = new LogBuffer();
 
   override async onload(): Promise<void> {
+    // Point the module-level helpers at this plugin's buffer for the
+    // session. Cleared in `onunload` so a reload doesn't keep writing
+    // into a stale buffer.
+    logBufferRef = this.logBuffer;
+
     this.configStore = new ConfigStore(this.app.vault.adapter);
     this.storage = new ObsidianStorageAdapter(this.app.vault.adapter);
     this.wasmBytes = decodeInlinedWasm(inlinedWasmB64());
@@ -171,6 +207,7 @@ export default class ContextSyncPlugin extends Plugin {
     this.controller = null;
     this.identity?.free();
     this.identity = null;
+    if (logBufferRef === this.logBuffer) logBufferRef = null;
   }
 
   // ---- Setup / lifecycle API (used by the settings tab) ----
@@ -414,14 +451,30 @@ export default class ContextSyncPlugin extends Plugin {
       ctxErr('engine worker message decoding error', e);
     };
     const port = workerPort<ToWorker, FromWorker>(worker);
-    const v = await WorkerVault.start(port, this.storage, {
-      mode: spec.mode,
-      seed: this.identity.seed(),
-      wasmBytes: this.wasmBytes,
-      ...(spec.peerUrl ? { peerUrl: spec.peerUrl } : {}),
-      ...(spec.peerPubkey ? { peerPubkey: spec.peerPubkey } : {}),
-      ...(spec.authKey ? { authKey: spec.authKey } : {}),
-    });
+    const v = await WorkerVault.start(
+      port,
+      this.storage,
+      {
+        mode: spec.mode,
+        seed: this.identity.seed(),
+        wasmBytes: this.wasmBytes,
+        ...(spec.peerUrl ? { peerUrl: spec.peerUrl } : {}),
+        ...(spec.peerPubkey ? { peerPubkey: spec.peerPubkey } : {}),
+        ...(spec.authKey ? { authKey: spec.authKey } : {}),
+      },
+      // Mirror worker-side console output into the plugin's ring buffer
+      // so the in-app log viewer (issue 0013) shows both halves of the
+      // round-trip — `[context …]` lines from main, `[engine-worker …]`
+      // lines from the worker — interleaved by wall clock.
+      (entry) => {
+        this.logBuffer.append({
+          ts: entry.ts,
+          source: 'worker',
+          level: entry.level,
+          msg: entry.msg,
+        });
+      },
+    );
     ctxLog(
       `engine worker ready filesAtBoot=${v.listFiles().length} identity=${v.identityPubkeySsh().slice(0, 24)}…`,
     );
@@ -465,6 +518,15 @@ export default class ContextSyncPlugin extends Plugin {
         }
         await navigator.clipboard.writeText(ssh);
         new Notice('Public key copied to clipboard.');
+      },
+    });
+    this.addCommand({
+      id: 'context-show-logs',
+      // Phrased as a verb the user reads in the palette — on mobile this
+      // is the only path into the logs, so make it findable.
+      name: 'Show logs',
+      callback: () => {
+        new LogModal(this.app, this.logBuffer).open();
       },
     });
     this.addCommand({
