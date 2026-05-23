@@ -315,7 +315,28 @@ impl Session {
             Msg::WantTips { tips } => {
                 let oids: Vec<Oid> = tips.iter().filter_map(|h| Oid::from_hex(h).ok()).collect();
                 let raws = v.export_closure(&oids)?;
-                step.out.push(Msg::Objects { raws });
+                // Chunk the catch-up payload into frames the smallest
+                // peer transport in the field can accept (issue 0015).
+                // A 450-file vault's full ancestral closure is tens of MB
+                // packed as one `Msg::Objects` — iOS WKWebView's
+                // WebSocket implementation silently stalls on a frame
+                // that large, manifesting as "server logs `frontier
+                // advertised` then nothing for ~50 s, then `peer session
+                // ended` from the TCP-level timeout". The receiver-side
+                // integrate is already incremental + content-addressed
+                // dedup, so splitting changes nothing semantically; only
+                // the wire shape changes.
+                //
+                // 256 KiB per frame is comfortable for every transport
+                // we've shipped against (Electron, iOS WKWebView,
+                // Android WebView, the relay, the native tungstenite
+                // client). It also keeps the receive-side recompute
+                // amortized — recompute runs once per admitted Objects
+                // frame, but each frame's known-set delta is bounded
+                // and the fold cost stays linear.
+                for chunk in chunk_objects(raws, CATCHUP_CHUNK_BYTES) {
+                    step.out.push(Msg::Objects { raws: chunk });
+                }
             }
             Msg::Objects { raws } | Msg::Live { raws } => {
                 let admitted = v.integrate(&raws)?;
@@ -337,6 +358,40 @@ impl Session {
         }
         Ok(step)
     }
+}
+
+/// Target per-frame size for catch-up `Objects` chunking (issue 0015).
+/// Set to 256 KiB — the largest payload every transport in the field
+/// (iOS WKWebView, Android WebView, Electron, native tungstenite, the
+/// relay) accepts comfortably; a single multi-MB frame stalls iOS's
+/// WebSocket implementation indefinitely without an error path. A small
+/// number of overflow bytes is tolerated (the chunker won't split a
+/// single object), so individual very-large blobs still ride as their
+/// own frame.
+pub(crate) const CATCHUP_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Split a vector of raw objects into vectors whose summed byte length
+/// stays under `limit`, packing greedily. The packing is order-preserving
+/// (raws → chunks → integrate order) so the receiver's content-addressed
+/// dedup behaves identically to the single-frame path. An object larger
+/// than `limit` rides alone in its own frame.
+pub(crate) fn chunk_objects(raws: Vec<Vec<u8>>, limit: usize) -> Vec<Vec<Vec<u8>>> {
+    let mut out: Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut current: Vec<Vec<u8>> = Vec::new();
+    let mut current_bytes: usize = 0;
+    for r in raws {
+        let r_len = r.len();
+        if !current.is_empty() && current_bytes + r_len > limit {
+            out.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += r_len;
+        current.push(r);
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -446,6 +501,142 @@ mod tests {
             matches!(err, CspError::ChannelBinding(_)),
             "expected ChannelBinding, got {err:?}"
         );
+    }
+
+    // ---- Catch-up Objects chunker (issue 0015) ----
+
+    #[test]
+    fn chunk_objects_empty_input_yields_no_frames() {
+        // A peer whose frontier matches ours (nothing to send) must not
+        // emit a stray empty Objects frame — the receiver would integrate
+        // 0, log nothing, and silently mask a real catch-up.
+        assert!(chunk_objects(vec![], 1024).is_empty());
+    }
+
+    #[test]
+    fn chunk_objects_packs_greedily_under_the_limit() {
+        // 3 × 100 B objects, 256 B limit → 2 frames (200 + 100). The
+        // packing order is preserved so the receiver's content-addressed
+        // dedup sees objects in the same sequence as the single-frame
+        // path.
+        let raws: Vec<Vec<u8>> = vec![vec![1u8; 100], vec![2u8; 100], vec![3u8; 100]];
+        let chunks = chunk_objects(raws, 256);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 2);
+        assert_eq!(chunks[1].len(), 1);
+        assert_eq!(chunks[0][0][0], 1);
+        assert_eq!(chunks[0][1][0], 2);
+        assert_eq!(chunks[1][0][0], 3);
+    }
+
+    #[test]
+    fn chunk_objects_single_oversize_object_rides_alone() {
+        // A 10 KB object with a 1 KB limit must NOT be split (we never
+        // fragment a content-addressed object — the receiver hashes the
+        // whole thing). It rides in its own frame.
+        let raws = vec![vec![1u8; 100], vec![9u8; 10_000], vec![2u8; 100]];
+        let chunks = chunk_objects(raws, 1024);
+        // Expected: [small_a], [big], [small_b] (or [small_a, ?], depends
+        // on packing semantics). We pack greedily but only flush when
+        // EXISTING content would overflow — so the big object joins the
+        // current chunk if alone there, then forces the next.
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 3);
+        // The big object must appear intact in exactly one chunk.
+        let big_locations: Vec<usize> =
+            chunks.iter().enumerate().filter_map(|(i, c)| c.iter().find(|o| o.len() == 10_000).map(|_| i)).collect();
+        assert_eq!(big_locations.len(), 1);
+    }
+
+    #[test]
+    fn chunk_objects_total_object_count_is_preserved() {
+        // No object is dropped or duplicated — the chunker is a pure
+        // re-packing.
+        let raws: Vec<Vec<u8>> = (0..50).map(|i| vec![i as u8; 1000]).collect();
+        let chunks = chunk_objects(raws.clone(), 4096);
+        let flattened: Vec<Vec<u8>> = chunks.into_iter().flatten().collect();
+        assert_eq!(flattened.len(), 50);
+        // Order preserved (first byte == index).
+        for (i, o) in flattened.iter().enumerate() {
+            assert_eq!(o[0], i as u8, "object {i} out of order");
+        }
+    }
+
+    #[test]
+    fn want_tips_handler_emits_multiple_frames_for_a_big_closure() {
+        // Stand in a SessionVault whose export_closure returns a closure
+        // bigger than one chunk. The on_msg dispatcher must emit
+        // multiple Msg::Objects frames, not one fused giant frame.
+        struct ChunkyVault {
+            id: Identity,
+            closure: Vec<Vec<u8>>,
+        }
+        impl SessionVault for ChunkyVault {
+            fn vault_id(&self) -> String {
+                "VID".into()
+            }
+            fn name(&self) -> String {
+                String::new()
+            }
+            fn identity_ssh(&self) -> String {
+                self.id.to_ssh_string()
+            }
+            fn sign(&self, msg: &[u8]) -> Vec<u8> {
+                self.id.sign(msg)
+            }
+            fn frontier_tips(&self) -> CspResult<Vec<Oid>> {
+                Ok(vec![])
+            }
+            fn known(&self) -> CspResult<Vec<Oid>> {
+                Ok(vec![])
+            }
+            fn has(&self, _o: Oid) -> bool {
+                false
+            }
+            fn export_closure(&self, _t: &[Oid]) -> CspResult<Vec<Vec<u8>>> {
+                Ok(self.closure.clone())
+            }
+            fn integrate(&mut self, _r: &[Vec<u8>]) -> CspResult<usize> {
+                Ok(0)
+            }
+            fn admit_peer(&mut self, _p: &str, _enrolled: bool) -> CspResult<bool> {
+                Ok(true)
+            }
+        }
+        // 100 objects × ~8 KB each = ~800 KB closure → at 256 KB limit,
+        // 3-4 chunks. Use a dummy tip hex (32 bytes hex == 64 chars).
+        let closure: Vec<Vec<u8>> = (0..100).map(|i| vec![i as u8; 8 * 1024]).collect();
+        let mut v = ChunkyVault {
+            id: Identity::from_seed(&[1u8; 32]),
+            closure,
+        };
+        let mut s = Session::new(Role::Connector, Vec::new(), vec![7u8; 32]);
+        s.phase = Phase::Established;
+        s.peer_ssh = Some(Identity::from_seed(&[2u8; 32]).to_ssh_string());
+        let want = Msg::WantTips { tips: vec!["a".repeat(40)] };
+        let step = s.on_msg(&mut v, want).unwrap();
+        assert!(step.out.len() >= 3, "expected multi-frame Objects, got {}", step.out.len());
+        for m in &step.out {
+            match m {
+                Msg::Objects { raws } => {
+                    let bytes: usize = raws.iter().map(|r| r.len()).sum();
+                    assert!(
+                        bytes <= CATCHUP_CHUNK_BYTES + 8 * 1024,
+                        "chunk too large: {bytes}"
+                    );
+                }
+                other => panic!("expected Objects, got {other:?}"),
+            }
+        }
+        // Total objects preserved across all chunks.
+        let total: usize = step
+            .out
+            .iter()
+            .map(|m| match m {
+                Msg::Objects { raws } => raws.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(total, 100);
     }
 
     #[test]

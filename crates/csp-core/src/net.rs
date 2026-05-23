@@ -40,6 +40,30 @@ use crate::session::{Session, SessionVault};
 
 /// Constant-time byte-string equality (defense against timing oracles when
 /// comparing auth keys at the WS upgrade).
+/// One-line description of an inbound/outbound `Msg` for the per-frame
+/// trace in [`run_session`]. The `Objects` / `Live` variants include the
+/// payload byte count (the diagnostic signal we actually want — frame
+/// size is the load-bearing input to "is this catch-up stalling").
+fn msg_kind(m: &crate::wire::Msg) -> String {
+    use crate::wire::Msg;
+    match m {
+        Msg::Hello { .. } => "Hello".into(),
+        Msg::AuthProof { .. } => "AuthProof".into(),
+        Msg::FrontierDigest { tips } => format!("FrontierDigest tips={}", tips.len()),
+        Msg::WantTips { tips } => format!("WantTips tips={}", tips.len()),
+        Msg::Objects { raws } => {
+            let bytes: usize = raws.iter().map(|r| r.len()).sum();
+            format!("Objects raws={} bytes={bytes}", raws.len())
+        }
+        Msg::Live { raws } => {
+            let bytes: usize = raws.iter().map(|r| r.len()).sum();
+            format!("Live raws={} bytes={bytes}", raws.len())
+        }
+        Msg::Ping => "Ping".into(),
+        Msg::Pong => "Pong".into(),
+    }
+}
+
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -682,12 +706,31 @@ async fn run_session(
                     tracing::info!("peer session ended");
                     return Ok(());
                 };
+                // Per-frame trace lets a Railway capture pin where a
+                // catch-up stalls — issue 0015 surfaced as "server logs
+                // `frontier advertised` then nothing for 50 s" because
+                // the post-handshake message exchange had no log path.
+                // Cheap (one log line per WS frame is rounding error
+                // vs. the wasm fold), high-leverage when diagnosing.
+                let in_kind = msg_kind(&msg);
+                tracing::info!("frame in {in_kind}");
                 let step = {
                     let mut v = node.vault.lock().await;
                     session.on_msg(&mut *v, msg)?
                 };
-                for m in &step.out {
-                    t.send(m).await?;
+                for (i, m) in step.out.iter().enumerate() {
+                    let out_kind = msg_kind(m);
+                    let n = step.out.len();
+                    tracing::info!("send {out_kind} ({}/{n})", i + 1);
+                    if let Err(e) = t.send(m).await {
+                        // The previous code propagated `?` and the
+                        // outer task ate the error without surfacing
+                        // it — so a `t.send` failure on a multi-MB
+                        // catch-up frame looked exactly like a clean
+                        // session-ended. Make it visible.
+                        tracing::warn!("send {out_kind} failed: {e}");
+                        return Err(e.into());
+                    }
                 }
                 if step.integrated > 0 {
                     let main = node
