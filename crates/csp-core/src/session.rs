@@ -118,6 +118,14 @@ pub struct Session {
     /// passed to `SessionVault::admit_peer`. Always `false` for connectors
     /// (the listener owns the admission decision).
     enrollment_authorized: bool,
+    /// In-flight chunks of a `Msg::ObjectsBatch` payload (v4, issue 0016).
+    /// Accumulated until the chunk with `is_last: true` arrives, then
+    /// passed to `integrate` as one atomic batch — splitting integrate
+    /// across chunks corrupts the known-set when a fold commit's parent
+    /// is in a later chunk (the 0.1.15 regression). Cleared on each
+    /// integrate, so a session that completes catch-up does not retain
+    /// raws.
+    pending_batch: Vec<Vec<u8>>,
 }
 
 impl Session {
@@ -129,6 +137,7 @@ impl Session {
             phase: Phase::AwaitHello,
             peer_ssh: None,
             enrollment_authorized: false,
+            pending_batch: Vec::new(),
         }
     }
 
@@ -316,29 +325,40 @@ impl Session {
                 let oids: Vec<Oid> = tips.iter().filter_map(|h| Oid::from_hex(h).ok()).collect();
                 let raws = v.export_closure(&oids)?;
                 // Chunk the catch-up payload into frames the smallest
-                // peer transport in the field can accept (issue 0015).
-                // A 450-file vault's full ancestral closure is tens of MB
-                // packed as one `Msg::Objects` — iOS WKWebView's
-                // WebSocket implementation silently stalls on a frame
-                // that large, manifesting as "server logs `frontier
-                // advertised` then nothing for ~50 s, then `peer session
-                // ended` from the TCP-level timeout". The receiver-side
-                // integrate is already incremental + content-addressed
-                // dedup, so splitting changes nothing semantically; only
-                // the wire shape changes.
+                // peer transport in the field can accept (issue 0015 /
+                // 0016). iOS WKWebView's WebSocket implementation
+                // silently stalls on a multi-MB frame; 256 KiB rides
+                // safely on every transport we've shipped against.
                 //
-                // 256 KiB per frame is comfortable for every transport
-                // we've shipped against (Electron, iOS WKWebView,
-                // Android WebView, the relay, the native tungstenite
-                // client). It also keeps the receive-side recompute
-                // amortized — recompute runs once per admitted Objects
-                // frame, but each frame's known-set delta is bounded
-                // and the fold cost stays linear.
-                for chunk in chunk_objects(raws, CATCHUP_CHUNK_BYTES) {
-                    step.out.push(Msg::Objects { raws: chunk });
+                // Atomicity matters (issue 0016): receiver MUST integrate
+                // the whole batch in one call. Splitting integrate across
+                // chunks corrupts the known-set — verify_fold_commit
+                // walks parent commits, and a fold in chunk N whose
+                // parent is in chunk N+1 fails verification, drops
+                // admission, and leaves the node with a partial known
+                // set that diverges from the sender's `main`. Mark every
+                // frame with `is_last`; the receiver accumulates and
+                // integrates atomically.
+                let chunks = chunk_objects(raws, CATCHUP_CHUNK_BYTES);
+                let n = chunks.len();
+                if n == 0 {
+                    // Nothing to send — emit a single empty terminator
+                    // so the receiver flushes its pending_batch (no-op
+                    // here, but correct for a peer that asked WantTips
+                    // after a state where we have nothing left to ship).
+                    step.out.push(Msg::ObjectsBatch { raws: Vec::new(), is_last: true });
+                } else {
+                    for (i, chunk) in chunks.into_iter().enumerate() {
+                        step.out.push(Msg::ObjectsBatch {
+                            raws: chunk,
+                            is_last: i + 1 == n,
+                        });
+                    }
                 }
             }
             Msg::Objects { raws } | Msg::Live { raws } => {
+                // Single-frame catch-up (small closures) and steady-state
+                // Live both integrate atomically as today.
                 let admitted = v.integrate(&raws)?;
                 step.integrated = admitted;
                 if admitted > 0 {
@@ -346,6 +366,26 @@ impl Session {
                     // gossip terminates. (Native full node only; the driver
                     // decides whether it has peers to relay to.)
                     step.relay = raws;
+                }
+            }
+            Msg::ObjectsBatch { raws, is_last } => {
+                // Multi-frame catch-up. Buffer the chunks; only integrate
+                // when the sender marks the final chunk. This preserves
+                // the single-call atomicity that `verify_fold_commit`
+                // depends on — every dependency for every fold in the
+                // batch is in the store before any verification runs.
+                self.pending_batch.extend(raws);
+                if is_last {
+                    let batch = std::mem::take(&mut self.pending_batch);
+                    let admitted = v.integrate(&batch)?;
+                    step.integrated = admitted;
+                    if admitted > 0 {
+                        // Relay the full batch, not just per-chunk slices.
+                        // A downstream relay peer must also integrate
+                        // atomically; sending each chunk would re-introduce
+                        // the same admission corruption one hop downstream.
+                        step.relay = batch;
+                    }
                 }
             }
             Msg::Ping => step.out.push(Msg::Pong),
@@ -614,17 +654,20 @@ mod tests {
         s.peer_ssh = Some(Identity::from_seed(&[2u8; 32]).to_ssh_string());
         let want = Msg::WantTips { tips: vec!["a".repeat(40)] };
         let step = s.on_msg(&mut v, want).unwrap();
-        assert!(step.out.len() >= 3, "expected multi-frame Objects, got {}", step.out.len());
-        for m in &step.out {
+        assert!(step.out.len() >= 3, "expected multi-frame batch, got {}", step.out.len());
+        // Every frame is an ObjectsBatch; only the last has is_last=true.
+        for (i, m) in step.out.iter().enumerate() {
             match m {
-                Msg::Objects { raws } => {
+                Msg::ObjectsBatch { raws, is_last } => {
                     let bytes: usize = raws.iter().map(|r| r.len()).sum();
                     assert!(
                         bytes <= CATCHUP_CHUNK_BYTES + 8 * 1024,
                         "chunk too large: {bytes}"
                     );
+                    let last = i + 1 == step.out.len();
+                    assert_eq!(*is_last, last, "is_last mismatch at chunk {i}");
                 }
-                other => panic!("expected Objects, got {other:?}"),
+                other => panic!("expected ObjectsBatch, got {other:?}"),
             }
         }
         // Total objects preserved across all chunks.
@@ -632,11 +675,117 @@ mod tests {
             .out
             .iter()
             .map(|m| match m {
-                Msg::Objects { raws } => raws.len(),
+                Msg::ObjectsBatch { raws, .. } => raws.len(),
                 _ => 0,
             })
             .sum();
         assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn objects_batch_buffers_until_is_last_then_integrates_atomically() {
+        // A 3-chunk batch must NOT call integrate until is_last=true.
+        // Integrate is called exactly once, with the concatenation of
+        // all chunks' raws in arrival order — that's the property
+        // verify_fold_commit relies on.
+        #[derive(Default)]
+        struct CountingVault {
+            id_seed: u8,
+            calls: Vec<usize>, // raws.len() per integrate call
+        }
+        impl SessionVault for CountingVault {
+            fn vault_id(&self) -> String {
+                "VID".into()
+            }
+            fn name(&self) -> String {
+                String::new()
+            }
+            fn identity_ssh(&self) -> String {
+                Identity::from_seed(&[self.id_seed; 32]).to_ssh_string()
+            }
+            fn sign(&self, msg: &[u8]) -> Vec<u8> {
+                Identity::from_seed(&[self.id_seed; 32]).sign(msg)
+            }
+            fn frontier_tips(&self) -> CspResult<Vec<Oid>> {
+                Ok(vec![])
+            }
+            fn known(&self) -> CspResult<Vec<Oid>> {
+                Ok(vec![])
+            }
+            fn has(&self, _o: Oid) -> bool {
+                false
+            }
+            fn export_closure(&self, _t: &[Oid]) -> CspResult<Vec<Vec<u8>>> {
+                Ok(vec![])
+            }
+            fn integrate(&mut self, raws: &[Vec<u8>]) -> CspResult<usize> {
+                self.calls.push(raws.len());
+                Ok(0)
+            }
+            fn admit_peer(&mut self, _p: &str, _enrolled: bool) -> CspResult<bool> {
+                Ok(true)
+            }
+        }
+        let mut v = CountingVault { id_seed: 1, calls: Vec::new() };
+        let mut s = Session::new(Role::Connector, Vec::new(), vec![7u8; 32]);
+        s.phase = Phase::Established;
+        s.peer_ssh = Some(Identity::from_seed(&[2u8; 32]).to_ssh_string());
+
+        let make = |n: u8, last: bool| Msg::ObjectsBatch {
+            raws: (0..3).map(|i| vec![n + i; 16]).collect(),
+            is_last: last,
+        };
+
+        let _ = s.on_msg(&mut v, make(10, false)).unwrap();
+        assert!(v.calls.is_empty(), "integrate fired on chunk 1; must defer");
+
+        let _ = s.on_msg(&mut v, make(20, false)).unwrap();
+        assert!(v.calls.is_empty(), "integrate fired on chunk 2; must defer");
+
+        let step = s.on_msg(&mut v, make(30, true)).unwrap();
+        assert_eq!(v.calls, vec![9], "integrate must run once with all 9 objects");
+        // pending_batch is drained — a follow-up batch starts fresh.
+        let _ = s.on_msg(&mut v, make(40, true)).unwrap();
+        assert_eq!(v.calls, vec![9, 3]);
+        // step from the final chunk should reflect the integrate
+        // outcome of the batch (admitted=0 here, but the call shape
+        // matches the single-frame Objects/Live path).
+        assert_eq!(step.integrated, 0);
+        assert!(step.relay.is_empty());
+    }
+
+    #[test]
+    fn objects_batch_empty_terminator_flushes_pending_buffer() {
+        // The WantTips→ObjectsBatch path emits a single empty
+        // `is_last=true` chunk when the closure is empty. The receiver
+        // must still call integrate (no-op for empty raws) so the
+        // session state machine advances; it must NOT leak pending_batch
+        // accumulated from a prior partial batch.
+        struct SimpleVault {
+            id: Identity,
+            calls: usize,
+        }
+        impl SessionVault for SimpleVault {
+            fn vault_id(&self) -> String { "VID".into() }
+            fn name(&self) -> String { String::new() }
+            fn identity_ssh(&self) -> String { self.id.to_ssh_string() }
+            fn sign(&self, msg: &[u8]) -> Vec<u8> { self.id.sign(msg) }
+            fn frontier_tips(&self) -> CspResult<Vec<Oid>> { Ok(vec![]) }
+            fn known(&self) -> CspResult<Vec<Oid>> { Ok(vec![]) }
+            fn has(&self, _o: Oid) -> bool { false }
+            fn export_closure(&self, _t: &[Oid]) -> CspResult<Vec<Vec<u8>>> { Ok(vec![]) }
+            fn integrate(&mut self, _raws: &[Vec<u8>]) -> CspResult<usize> {
+                self.calls += 1;
+                Ok(0)
+            }
+            fn admit_peer(&mut self, _p: &str, _enrolled: bool) -> CspResult<bool> { Ok(true) }
+        }
+        let mut v = SimpleVault { id: Identity::from_seed(&[1u8; 32]), calls: 0 };
+        let mut s = Session::new(Role::Connector, Vec::new(), vec![7u8; 32]);
+        s.phase = Phase::Established;
+        s.peer_ssh = Some(Identity::from_seed(&[2u8; 32]).to_ssh_string());
+        let _ = s.on_msg(&mut v, Msg::ObjectsBatch { raws: Vec::new(), is_last: true }).unwrap();
+        assert_eq!(v.calls, 1, "empty terminator must still call integrate");
     }
 
     #[test]

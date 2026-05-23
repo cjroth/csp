@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 /// channel binding (TLS cert fingerprint in the transcript); v3 made the
 /// binding **listener-advertised** (`Hello.cb`) and signed over that single
 /// agreed value, so a TLS-terminating front proxy no longer desynchronizes
-/// the two transcripts (§10).
-pub const PROTO_VERSION: u32 = 3;
+/// the two transcripts (§10). v4 introduces `Msg::ObjectsBatch` for atomic
+/// chunked catch-up — v3's experimental single-`Objects` chunking
+/// (0.1.15) broke catch-up admission ordering and is incompatible.
+pub const PROTO_VERSION: u32 = 4;
 
 fn proto_default() -> u32 {
     // An old peer's `Hello` has no `proto` field → 0 → reported as skew.
@@ -54,8 +56,29 @@ pub enum Msg {
         tips: Vec<String>,
     },
     /// Reachable closures of requested tips — verified, not trusted (§6.3).
+    /// Single-frame catch-up; the closure is sent atomically and the
+    /// receiver integrates it in one call. Used when the closure fits
+    /// comfortably in one WS frame; otherwise the sender uses
+    /// [`Msg::ObjectsBatch`] (v4+).
     Objects {
         raws: Vec<Vec<u8>>,
+    },
+    /// Chunked catch-up payload (issue 0016, v4). The receiver accumulates
+    /// `raws` from successive `ObjectsBatch` frames and integrates them as
+    /// a single atomic batch when it sees `is_last: true`. Splitting
+    /// `integrate` across frames is unsafe: `verify_fold_commit` walks
+    /// parent commits, and a synthetic fold in chunk N whose parent is
+    /// only in chunk N+1 fails verification with the wrong objects in
+    /// the store — admission is dropped for that chunk, leaving an
+    /// inconsistent known-set. Used by every catch-up response that
+    /// closure-by-bytes exceeds a per-frame budget — iOS WKWebView's
+    /// WebSocket implementation silently stalls on a multi-MB frame.
+    ObjectsBatch {
+        raws: Vec<Vec<u8>>,
+        /// `true` on the final chunk of a batch — triggers the receiver's
+        /// integrate over the accumulated buffer. `false` means "more
+        /// chunks coming; just stage these bytes in your buffer".
+        is_last: bool,
     },
     /// A live push of new primitive closures (§6.5).
     Live {

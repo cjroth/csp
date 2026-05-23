@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "csp-core"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "base64",
  "bytes",
@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "csp-e2e"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "csp-core",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "csp-wasm"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "console_error_panic_hook",
  "csp-core",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "ctx"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "base64",

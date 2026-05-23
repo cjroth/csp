@@ -55,6 +55,13 @@ fn msg_kind(m: &crate::wire::Msg) -> String {
             let bytes: usize = raws.iter().map(|r| r.len()).sum();
             format!("Objects raws={} bytes={bytes}", raws.len())
         }
+        Msg::ObjectsBatch { raws, is_last } => {
+            let bytes: usize = raws.iter().map(|r| r.len()).sum();
+            format!(
+                "ObjectsBatch raws={} bytes={bytes} is_last={is_last}",
+                raws.len()
+            )
+        }
         Msg::Live { raws } => {
             let bytes: usize = raws.iter().map(|r| r.len()).sum();
             format!("Live raws={} bytes={bytes}", raws.len())
