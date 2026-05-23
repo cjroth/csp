@@ -65,6 +65,21 @@ function inlinedWorkerSrc(): string {
   return typeof __ENGINE_WORKER_SRC__ === 'string' ? __ENGINE_WORKER_SRC__ : '';
 }
 
+/** Wall-clock prefix on every `[context]` console line — `HH:MM:SS.mmm` is
+ * enough to read a 30 s sync gap off the log unambiguously and to spot a
+ * disconnect / reconnect cycle hiding inside it. */
+function ctxTs(): string {
+  const d = new Date();
+  const pad = (n: number, w = 2) => String(n).padStart(w, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+}
+function ctxLog(m: string): void {
+  console.log(`[context ${ctxTs()}]`, m);
+}
+function ctxErr(m: string, ...rest: unknown[]): void {
+  console.error(`[context ${ctxTs()}]`, m, ...rest);
+}
+
 /** Decode the build-time inlined csp-core wasm (base64) into a Uint8Array
  * for `initCsp()`. esbuild errors at build time if the wasm is missing. */
 export function decodeInlinedWasm(b64: string): Uint8Array {
@@ -144,7 +159,7 @@ export default class ContextSyncPlugin extends Plugin {
             await this.controller?.start({ connect: !!this.settings.peerUrl });
           }
         } catch (err) {
-          console.error('[context] start failed:', err);
+          ctxErr('start failed:', err);
           new Notice(`Context: ${err}`);
         }
       })();
@@ -356,7 +371,10 @@ export default class ContextSyncPlugin extends Plugin {
         this.lastNotice = m;
         new Notice(m);
       },
-      log: (m) => console.log('[context]', m),
+      // Timestamp every `[context]` line — distinguishing a flat 30 s gap
+      // between events from a reconnect-cycle inside the gap is otherwise
+      // impossible to read off the console.
+      log: ctxLog,
     });
     this.controller.on((st) => this.statusBar?.set(st));
   }
@@ -370,7 +388,7 @@ export default class ContextSyncPlugin extends Plugin {
     if (!this.storage || !this.identity || !this.wasmBytes) {
       throw new Error('Context: engine worker prerequisites missing');
     }
-    console.log('[context] spawning engine worker', { mode: spec.mode, peerUrl: spec.peerUrl });
+    ctxLog(`spawning engine worker mode=${spec.mode} peerUrl=${spec.peerUrl ?? '-'}`);
     const blob = new Blob([inlinedWorkerSrc()], { type: 'application/javascript' });
     const url = URL.createObjectURL(blob);
     let worker: Worker;
@@ -388,12 +406,12 @@ export default class ContextSyncPlugin extends Plugin {
       const msg = `engine worker error: ${e.message || '(no message)'}${
         e.filename ? ` @ ${e.filename}:${e.lineno}:${e.colno}` : ''
       }`;
-      console.error('[context]', msg, e);
+      ctxErr(msg, e);
       this.lastNotice = msg;
       new Notice(`Context: ${msg}`);
     };
     worker.onmessageerror = (e) => {
-      console.error('[context] engine worker message decoding error', e);
+      ctxErr('engine worker message decoding error', e);
     };
     const port = workerPort<ToWorker, FromWorker>(worker);
     const v = await WorkerVault.start(port, this.storage, {
@@ -404,10 +422,9 @@ export default class ContextSyncPlugin extends Plugin {
       ...(spec.peerPubkey ? { peerPubkey: spec.peerPubkey } : {}),
       ...(spec.authKey ? { authKey: spec.authKey } : {}),
     });
-    console.log('[context] engine worker ready', {
-      filesAtBoot: v.listFiles().length,
-      identity: `${v.identityPubkeySsh().slice(0, 24)}…`,
-    });
+    ctxLog(
+      `engine worker ready filesAtBoot=${v.listFiles().length} identity=${v.identityPubkeySsh().slice(0, 24)}…`,
+    );
     return v;
   }
 
@@ -469,7 +486,7 @@ export default class ContextSyncPlugin extends Plugin {
    * any rejection. Without this a benign race (e.g. reading a file Obsidian
    * just deleted) would surface as an unhandled promise rejection. */
   private dispatch(what: string, p: Promise<void> | undefined): void {
-    p?.catch((err) => console.error(`[context] ${what} handler failed:`, err));
+    p?.catch((err) => ctxErr(`${what} handler failed:`, err));
   }
 
   private registerObsidianEventListeners(): void {
