@@ -338,11 +338,17 @@ export class RealVault implements Vault {
     try {
       const cb = conn.channelBinding() ?? new Uint8Array();
       await conn.send(this.engine.session_start(cb));
+      wkLog('recv loop start');
       for await (const frame of conn.recv()) {
         // Per-frame trace lets the host see where seconds actually go on
-        // the receive path — useful for the live-sync-latency hunt where
-        // the wall-clock gap between "frame in" and "tree-changed out"
-        // exposed an unexpectedly slow materialize+persist on the worker.
+        // the receive path. Logged BEFORE session_feed runs so the
+        // wall-clock gap between this line and the integrate/materialize
+        // pair is the engine's own CPU cost; logged AFTER with a summary
+        // so we can also read post-handshake catch-up traffic
+        // (FrontierDigest / WantTips / Objects-with-known) which all
+        // return `integrated=0` and were previously invisible — that's
+        // exactly the gap the mobile-no-sync capture revealed (issue
+        // 0014: only one frame logged before silence).
         const tFrame = wkTs();
         const step = JSON.parse(this.engine.session_feed(frame)) as {
           out: number[][];
@@ -350,6 +356,9 @@ export class RealVault implements Vault {
           established: boolean;
           peer_ssh?: string;
         };
+        wkLog(
+          `frame in ${frame.length}B → out=${step.out.length} integrated=${step.integrated} established=${step.established}`,
+        );
         for (const m of step.out) await conn.send(Uint8Array.from(m));
         if (step.established && !this.connected) {
           this.connected = true;
@@ -368,6 +377,11 @@ export class RealVault implements Vault {
           wkLog('persist done');
         }
       }
+      // The for-await ending is the recv loop terminating — almost always
+      // because the WS closed. A silent loop exit was previously
+      // indistinguishable from a stalled loop; logging the boundary makes
+      // "connected but nothing else" diagnosable.
+      wkLog('recv loop end');
     } finally {
       this.conn = null;
       await conn.close().catch(() => {});

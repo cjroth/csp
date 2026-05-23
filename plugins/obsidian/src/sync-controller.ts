@@ -243,7 +243,23 @@ export class SyncController {
   async resetLocalState(): Promise<void> {
     await this.stop();
     if (this.deps.fs) {
-      await removeDirRecursive(this.deps.fs, '.context');
+      // Loud about what was deleted + every error that occurred — issue
+      // 0014: on mobile, a silent reset that "succeeded" without
+      // actually removing `.context/` was indistinguishable from a real
+      // wipe, and the next start always picked `mode=open` from the
+      // stale state file. Surface the report so the user can see why a
+      // reset didn't take.
+      const report = await removeDirRecursive(this.deps.fs, '.context');
+      this.deps.log?.(
+        `resetLocalState removed files=${report.filesRemoved} folders=${report.foldersRemoved} errors=${report.errors.length}`,
+      );
+      for (const e of report.errors) this.deps.log?.(`  reset error: ${e}`);
+      if (report.errors.length > 0) {
+        this.deps.notice?.(
+          `Context: local state partially cleared — ${report.errors.length} error(s); see logs.`,
+        );
+        return;
+      }
     } else {
       // Fallback for callers that didn't wire `fs` (older tests). Best-effort
       // zero-out of the engine-owned blobs so the engine rebuilds on restart.
@@ -272,7 +288,15 @@ export class SyncController {
     // CSP §17); else a fresh offline-local vault (CSP §7 — won't converge
     // until a full node joins).
     const existing = await this.deps.storage.loadState();
+    const stateBytes = existing?.length ?? 0;
     const mode = existing && existing.length > 0 ? 'open' : peerUrl ? 'clone' : 'create';
+    // The mode-decision is load-bearing — a stale state file makes a
+    // freshly-installed peer choose `open` instead of `clone`, which
+    // bypasses catch-up and is the exact mobile-no-sync symptom (issue
+    // 0014). Log the inputs so the next capture pins it.
+    this.deps.log?.(
+      `openOrCreate mode=${mode} stateBytes=${stateBytes} peerUrl=${peerUrl || '-'} peerPubkey=${peerPubkey ? 'pinned' : '-'}`,
+    );
     const spec: VaultSpec = {
       mode,
       ...(peerUrl ? { peerUrl } : {}),
@@ -452,27 +476,60 @@ function sshPubkeyBytes(ssh: string): Uint8Array {
   }
 }
 
+/** Outcome of [`removeDirRecursive`] — counts every path the walk touched
+ * + the human-readable error string for any deletion that failed. The
+ * caller (resetLocalState) logs this so a half-succeeded wipe on iOS
+ * doesn't look like a clean wipe; without it, the next start picks
+ * `mode=open` from the stale state file and the user can't tell why
+ * (issue 0014). */
+interface RemoveReport {
+  filesRemoved: number;
+  foldersRemoved: number;
+  errors: string[];
+}
+
 /** Depth-first delete of every file + folder under `path`, then `path`
- * itself. Tolerates a missing root so callers can call it unconditionally. */
-async function removeDirRecursive(fs: MinimalDataAdapter, path: string): Promise<void> {
-  if (!(await fs.exists(path))) return;
+ * itself. Tolerates a missing root so callers can call it unconditionally.
+ * Returns a [`RemoveReport`] — errors are RECORDED, not thrown, because a
+ * partial wipe is still useful, but they must NOT be swallowed (issue
+ * 0014). */
+async function removeDirRecursive(fs: MinimalDataAdapter, path: string): Promise<RemoveReport> {
+  const report: RemoveReport = { filesRemoved: 0, foldersRemoved: 0, errors: [] };
+  if (!(await fs.exists(path))) return report;
   let children: { files: string[]; folders: string[] };
   try {
     children = await fs.list(path);
-  } catch {
+  } catch (e) {
     // Path exists but isn't listable (e.g. a stray file at the root): try to
-    // remove it directly below.
+    // remove it directly below. The list-error itself is diagnostic and
+    // gets recorded.
+    report.errors.push(`list(${path}): ${describeError(e)}`);
     children = { files: [], folders: [] };
   }
   for (const f of children.files) {
     try {
       await fs.remove(f);
-    } catch {}
+      report.filesRemoved++;
+    } catch (e) {
+      report.errors.push(`remove(${f}): ${describeError(e)}`);
+    }
   }
   for (const sub of children.folders) {
-    await removeDirRecursive(fs, sub);
+    const sub_report = await removeDirRecursive(fs, sub);
+    report.filesRemoved += sub_report.filesRemoved;
+    report.foldersRemoved += sub_report.foldersRemoved;
+    report.errors.push(...sub_report.errors);
   }
   try {
     await fs.remove(path);
-  } catch {}
+    report.foldersRemoved++;
+  } catch (e) {
+    report.errors.push(`remove(${path}): ${describeError(e)}`);
+  }
+  return report;
+}
+
+function describeError(e: unknown): string {
+  if (e instanceof Error) return `${e.name}: ${e.message}`;
+  return String(e);
 }

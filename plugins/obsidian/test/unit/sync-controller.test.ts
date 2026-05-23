@@ -185,6 +185,56 @@ describe('resetLocalState', () => {
     expect(vault.getAbstractFileByPath('x.md')).not.toBeNull();
   });
 
+  test('a partial wipe (fs.remove rejects for some path) is reported, not silently swallowed', async () => {
+    // Issue 0014: on iOS the WebView adapter's `remove` can reject (file
+    // locked / permission denied) yet the user-facing notice claimed
+    // success. After a failed wipe, `mode=open` would persist from the
+    // stale state file with no signal that's why. Force a deletion to
+    // throw and assert: a logged error per failure + a notice that
+    // tells the user "partially cleared".
+    const adapter = new FakeDataAdapter();
+    const vault = new FakeVault(adapter);
+    const storage = new ObsidianStorageAdapter(adapter);
+    const settings: CspSettings = { ...DEFAULT_SETTINGS, syncEnabled: true };
+    const notices: string[] = [];
+    const logs: string[] = [];
+    // Wrap the adapter so `.context/state` deletion fails — simulating
+    // a sandbox-locked file the user can see in Files.app but can't
+    // remove from inside Obsidian's webview. Plain method override
+    // (no Proxy) because the test only needs to intercept one method
+    // and keep the rest pointing at the underlying adapter.
+    const stuckAdapter = Object.create(adapter) as typeof adapter;
+    const origRemove = adapter.remove.bind(adapter);
+    stuckAdapter.remove = (path: string): Promise<void> => {
+      if (path === '.context/state') return Promise.reject(new Error('EPERM'));
+      return origRemove(path);
+    };
+    const controller = new SyncController({
+      storage,
+      fs: stuckAdapter,
+      vault,
+      settings,
+      identity: Identity.generate(),
+      saveSettings: async (s) => {
+        Object.assign(settings, s);
+      },
+      notice: (m) => notices.push(m),
+      log: (m) => logs.push(m),
+    });
+    await controller.prepare();
+    await vault.create('x.md', 'data\n');
+    await controller.resyncNow();
+
+    await controller.resetLocalState();
+
+    expect(logs.some((l) => /resetLocalState removed/.test(l) && /errors=1/.test(l))).toBe(true);
+    expect(logs.some((l) => /reset error.*\.context\/state/.test(l) && /EPERM/.test(l))).toBe(true);
+    expect(notices.some((n) => /partially cleared/.test(n))).toBe(true);
+    // The state file (which failed to delete) is still there — exactly
+    // the condition that would make the next start pick `mode=open`.
+    expect(await adapter.exists('.context/state')).toBe(true);
+  });
+
   test('without `fs`, falls back to zeroing the engine blobs', async () => {
     // Older callers may not pass `fs`. We still clear engine state so the next
     // start() rebuilds from scratch instead of silently re-opening.
@@ -261,6 +311,37 @@ describe('makeVault injection (issue 0010)', () => {
     await h.controller.prepare();
     expect(h.specs[0]?.mode).toBe('open');
     await h.controller.stop();
+  });
+
+  test('openOrCreate logs the mode decision with stateBytes + peerUrl (issue 0014)', async () => {
+    // The mode decision is the load-bearing input to "why isn't this
+    // peer syncing": a stale state file makes a fresh peer pick `open`
+    // instead of `clone`, bypassing catch-up. The log line is the only
+    // window into that decision when we're staring at a mobile capture.
+    const logs: string[] = [];
+    const adapter = new FakeDataAdapter();
+    const vault = new FakeVault(adapter);
+    const storage = new ObsidianStorageAdapter(adapter);
+    const settings: CspSettings = {
+      ...DEFAULT_SETTINGS,
+      syncEnabled: true,
+      peerUrl: 'wss://peer:7777',
+    };
+    const controller = new SyncController({
+      storage,
+      vault,
+      settings,
+      identity: Identity.generate(),
+      saveSettings: async () => {},
+      log: (m) => logs.push(m),
+      makeVault: async () =>
+        MockVault.create({ storage: memoryStorage(), identity: MockIdentity.generate() }),
+    });
+    await controller.prepare();
+    expect(
+      logs.some((l) => /openOrCreate/.test(l) && /mode=clone/.test(l) && /stateBytes=0/.test(l)),
+    ).toBe(true);
+    await controller.stop();
   });
 
   test('a pinned peer key is decoded to raw bytes in the spec', async () => {
