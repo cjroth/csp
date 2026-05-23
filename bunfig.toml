@@ -1,0 +1,19 @@
+# Root-level Bun config — present so `bun test` from the repo root
+# discovers BOTH the SDK and the plugin tests cleanly.
+#
+# The plugin's tests need a runtime shim for the `obsidian` import (the npm
+# package ships type declarations only). Without a preload, modules like
+# `src/main.ts` and `src/settings-tab.ts` fail to resolve `'obsidian'` and
+# every file that imports them aborts with an "Unhandled error between
+# tests". `plugins/obsidian/bunfig.toml` already preloads
+# `plugins/obsidian/test/setup.ts` for in-package runs; this mirrors the
+# same preload at the workspace root so a single `bun test` covers
+# everything. The shim is inert for tests that don't import `obsidian`.
+
+[install]
+# Match the plugin's supply-chain guard — don't auto-install npm releases
+# younger than 7 days.
+minimumReleaseAge = 604800
+
+[test]
+preload = ["./plugins/obsidian/test/setup.ts"]
