@@ -380,17 +380,22 @@ jobs:
         id: stage
         run: |
           mkdir -p extras
-          # CLI archives (one tar.gz/zip per OS) — best effort.
-          find artifacts -maxdepth 1 -type d -name 'ctx-*' \
-            -exec find {} -type f -exec cp {} extras/ \; \; 2>/dev/null || true
-          # SDK tarball — best effort.
+          # CLI archives (one tar.gz/zip per OS, in artifacts/ctx-<label>/).
+          # Best-effort: a missing leg (e.g. a failed Windows build) should
+          # not block the rest of the upload, but real find errors should
+          # surface — so we don't silence stderr here.
+          for d in artifacts/ctx-*; do
+            [ -d "$d" ] || continue
+            find "$d" -type f -exec cp {} extras/ \;
+          done
+          # SDK tarball.
           if [ -d artifacts/csp-sdk ]; then
-            find artifacts/csp-sdk -type f -exec cp {} extras/ \; 2>/dev/null || true
+            find artifacts/csp-sdk -type f -exec cp {} extras/ \;
           fi
-          # Desktop bundles — best effort, by extension, flat.
+          # Desktop bundles — flat, by extension.
           find artifacts -maxdepth 3 -type f \
             \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \
-            -o -name '*.msi' -o -name '*.exe' \) -exec cp {} extras/ \; 2>/dev/null || true
+            -o -name '*.msi' -o -name '*.exe' \) -exec cp {} extras/ \;
           ls -la extras/
           if [ -z "$(ls -A extras 2>/dev/null)" ]; then
             echo "have_extras=false" >> "$GITHUB_OUTPUT"
