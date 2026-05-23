@@ -323,6 +323,18 @@ impl WasmEngine {
         serde_json::to_string(&raws).map_err(je)
     }
 
+    /// Incremental Live-push wire form: only the new objects authored by
+    /// `prim_hex` (the new commit + new sub-trees + new blobs vs. its
+    /// parent's tree). The peer is assumed to already hold the ancestors,
+    /// which is true in steady state — both ends folded to the same `main`
+    /// on the prior edit. Used by the SDK's `commitNow` to keep the wire
+    /// size O(diff) instead of O(history) (issue 0012).
+    pub fn export_primitive(&self, prim_hex: &str) -> Result<String, JsError> {
+        let oid = Oid::from_hex(prim_hex).map_err(je)?;
+        let raws = self.inner.export_primitive(oid).map_err(je)?;
+        serde_json::to_string(&raws).map_err(je)
+    }
+
     // ---- The one sans-IO Session (§6/§10) — same code as `ctx` ----------
 
     /// Begin a session as connector (the plugin never listens — §7) and

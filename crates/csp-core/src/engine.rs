@@ -493,6 +493,50 @@ impl MemEngine {
         set.into_iter().map(|o| self.store.get_raw(o)).collect()
     }
 
+    /// Export ONLY the new objects authored by `prim_oid`: the primitive
+    /// commit itself, plus every (sub-)tree and blob in its tree that is
+    /// not also reachable from its parent's tree. Used by Live pushes — a
+    /// connected peer already has the parent (it folded to it from its own
+    /// known set), so re-shipping the ancestral closure on every edit is
+    /// the live-sync-latency killer (issue 0012: a single keystroke
+    /// authoring a primitive against an N-deep history was sending
+    /// O(N · |tree|) bytes via `export_closure`'s reachable-walk-with-
+    /// parents, megabytes per edit).
+    ///
+    /// Falls back gracefully for a parent-less primitive (genesis-only
+    /// case): the parent-tree blob set is empty, so the whole primitive's
+    /// tree is shipped.
+    pub fn export_primitive(&self, prim_oid: Oid) -> CspResult<Vec<Vec<u8>>> {
+        let prim_commit = match self.store.get(prim_oid)? {
+            GitObject::Commit(c) => c,
+            _ => return Err(CspError::Malformed("export_primitive: not a commit".into())),
+        };
+
+        // The set of oids the peer is assumed to already hold via the
+        // parent: every (sub-)tree and blob reachable from the parent's
+        // tree. The peer ran the same fold against the same known set, so
+        // it has them.
+        let mut parent_oids: BTreeSet<Oid> = BTreeSet::new();
+        if let Some(&parent_oid) = prim_commit.parents.first() {
+            if let GitObject::Commit(pc) = self.store.get(parent_oid)? {
+                collect_tree_objects(&self.store, pc.tree, &mut parent_oids)?;
+            }
+        }
+
+        // Oids reachable from the new primitive's tree.
+        let mut prim_set: BTreeSet<Oid> = BTreeSet::new();
+        collect_tree_objects(&self.store, prim_commit.tree, &mut prim_set)?;
+
+        // The new objects = prim_set - parent_oids, plus the commit itself.
+        // BTreeSet iteration is sorted, so the wire order is deterministic.
+        let mut raws = Vec::with_capacity(prim_set.len().saturating_sub(parent_oids.len()) + 1);
+        raws.push(self.store.get_raw(prim_oid)?);
+        for o in prim_set.difference(&parent_oids) {
+            raws.push(self.store.get_raw(*o)?);
+        }
+        Ok(raws)
+    }
+
     // ---- Authorization (§10): in-memory; host persists `authorized` text --
 
     /// Currently-valid authorized NodeIds (expired entries filtered out).
@@ -664,6 +708,37 @@ impl MemEngine {
 /// Wall-clock seconds. Native uses the system clock; wasm uses the JS clock
 /// via `js-sys`/the host (wasm-bindgen provides `Date.now`). Both are
 /// advisory only (§5.1: the logical counter is authoritative for order).
+/// Collect every (sub-)tree and blob oid reachable from `tree_oid` into
+/// `out`. The tree object itself is included; nested sub-trees recurse.
+/// Used by [`MemEngine::export_primitive`] to diff a new primitive's tree
+/// against its parent's tree (issue 0012).
+fn collect_tree_objects<S: Store>(
+    store: &S,
+    tree_oid: Oid,
+    out: &mut BTreeSet<Oid>,
+) -> CspResult<()> {
+    if !out.insert(tree_oid) {
+        return Ok(());
+    }
+    match store.get(tree_oid)? {
+        GitObject::Tree(entries) => {
+            for e in entries {
+                match store.get(e.oid)? {
+                    GitObject::Blob(_) => {
+                        out.insert(e.oid);
+                    }
+                    GitObject::Tree(_) => {
+                        collect_tree_objects(store, e.oid, out)?;
+                    }
+                    GitObject::Commit(_) => {} // commits never live in trees
+                }
+            }
+        }
+        GitObject::Blob(_) | GitObject::Commit(_) => {} // tree_oid wasn't a tree
+    }
+    Ok(())
+}
+
 fn now_unix() -> u64 {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -821,6 +896,118 @@ mod tests {
     }
 
     // ---- Incremental staging API (issue 0009) ----
+
+    // ---- Incremental Live export (issue 0012) ----
+
+    #[test]
+    fn export_primitive_is_much_smaller_than_export_closure_on_a_deep_history() {
+        // Two-window scenario in miniature: A authors many primitives, then
+        // one more; for the *last* edit the Live wire form (what `commitNow`
+        // sends on a steady-state edit) must be O(diff), not O(history).
+        let mut a = MemEngine::create(id(1), "v", "").unwrap();
+        // Seed a vault of ~30 files and ~10 edit rounds → real history depth.
+        for round in 0..10 {
+            let mut files = BTreeMap::new();
+            for i in 0..30 {
+                files.insert(format!("note-{i}.md"), format!("v{round}-content-{i}").into_bytes());
+            }
+            a.commit_from_files(&files).unwrap();
+        }
+        // The final, single-file edit on top.
+        let mut files = BTreeMap::new();
+        for i in 0..30 {
+            files.insert(format!("note-{i}.md"), format!("v9-content-{i}").into_bytes());
+        }
+        files.insert("note-7.md".into(), b"the only fresh byte".to_vec());
+        let prim = a.commit_from_files(&files).unwrap().expect("a real change");
+
+        let closure = a.export_closure(&[prim]).unwrap();
+        let incremental = a.export_primitive(prim).unwrap();
+
+        let closure_bytes: usize = closure.iter().map(|r| r.len()).sum();
+        let incr_bytes: usize = incremental.iter().map(|r| r.len()).sum();
+        assert!(
+            incr_bytes * 5 < closure_bytes,
+            "incremental export ({incr_bytes} B) must be at least 5× smaller than full closure ({closure_bytes} B)"
+        );
+        // It must contain the primitive itself.
+        assert!(!incremental.is_empty());
+    }
+
+    #[test]
+    fn export_primitive_round_trips_through_integrate_against_a_synced_peer() {
+        // The receiver must successfully admit a primitive shipped via
+        // `export_primitive` *iff* it already has the parent (the steady-
+        // state Live case: both ends folded to the same main on the prior
+        // edit). After integrate, the receiver's `main` matches the sender.
+        let mut a = MemEngine::create(id(1), "v", "").unwrap();
+        let mut b = MemEngine::create(id(2), "v", "").unwrap();
+        // Bootstrap B with A's history via the full closure (catch-up).
+        a.commit_from_files(&files(&[("a.md", "v1"), ("b.md", "v1")])).unwrap();
+        let bootstrap = a.export_closure(&a.known().unwrap()).unwrap();
+        let admitted = b.integrate(&bootstrap).unwrap();
+        assert!(admitted > 0, "catch-up must seed B with A's history");
+        assert_eq!(a.main(), b.main(), "peers converged after catch-up");
+
+        // Now A makes a tiny edit; the Live wire form is `export_primitive`.
+        let prim = a
+            .commit_from_files(&files(&[("a.md", "v2"), ("b.md", "v1")]))
+            .unwrap()
+            .expect("a real change");
+        let live = a.export_primitive(prim).unwrap();
+
+        // B integrates the incremental payload and ends at A's main.
+        let admitted_live = b.integrate(&live).unwrap();
+        assert_eq!(admitted_live, 1);
+        assert_eq!(b.main(), a.main(), "peers converged via incremental Live");
+
+        // And the materialize plan now writes the edited file.
+        let plan = b.materialize_plan(&BTreeMap::new()).unwrap();
+        assert!(plan.contains(&MaterializeOp::Write {
+            path: "a.md".into(),
+            content: b"v2".to_vec(),
+        }));
+    }
+
+    #[test]
+    fn export_primitive_omits_objects_already_in_the_parent_tree() {
+        // The unchanged blobs from the parent's tree must NOT appear in the
+        // incremental export — that's the whole point of issue 0012.
+        let mut a = MemEngine::create(id(1), "v", "").unwrap();
+        a.commit_from_files(&files(&[("kept.md", "stable"), ("edit.md", "v1")])).unwrap();
+        let parent = a.main().unwrap();
+        let parent_tree_oid = match a.store.get(parent).unwrap() {
+            GitObject::Commit(c) => c.tree,
+            _ => panic!("parent not a commit"),
+        };
+        let kept_blob_oid = match a.store.get(parent_tree_oid).unwrap() {
+            GitObject::Tree(t) => t
+                .iter()
+                .find(|e| e.name == "kept.md")
+                .expect("kept entry")
+                .oid,
+            _ => panic!("parent tree not a tree"),
+        };
+
+        let prim = a
+            .commit_from_files(&files(&[("kept.md", "stable"), ("edit.md", "v2")]))
+            .unwrap()
+            .unwrap();
+        let raws = a.export_primitive(prim).unwrap();
+        // Reconstruct the oids in the payload by hashing each raw.
+        let payload_oids: BTreeSet<Oid> = raws
+            .iter()
+            .map(|r| {
+                let obj = GitObject::decompress_and_parse(r).unwrap();
+                obj.oid()
+            })
+            .collect();
+        assert!(
+            !payload_oids.contains(&kept_blob_oid),
+            "unchanged blob must NOT ride along on the incremental wire form"
+        );
+        assert!(payload_oids.contains(&prim), "the new primitive itself rides");
+    }
 
     #[test]
     fn staged_write_then_commit_authors_a_primitive() {

@@ -483,12 +483,23 @@ export class RealVault implements Vault {
       return;
     }
     if (this.connected && this.conn) {
-      const closure = JSON.parse(this.engine.export_closure(JSON.stringify([prim]))) as number[][];
-      const live = wireEncode(JSON.stringify({ Live: { raws: closure } }));
+      // Issue 0012 — `export_closure([prim])` follows commit parents back
+      // to genesis, dragging the *entire* ancestral fold chain (every
+      // synthetic fold commit, its tree, every blob in that tree) onto
+      // the wire on every keystroke. For a 450-file vault that's
+      // multi-MB per edit, and the receive-side `session_feed` then
+      // re-parses + recompute-verifies the same payload. Switch to
+      // `export_primitive`, which ships ONLY the new commit + new sub-
+      // trees + blobs not present in the parent's tree. O(diff) instead
+      // of O(history); the peer already has the ancestors.
+      const incremental = JSON.parse(this.engine.export_primitive(prim)) as number[][];
+      const live = wireEncode(JSON.stringify({ Live: { raws: incremental } }));
       // Fire the live push immediately; persist runs after so a slow disk /
       // worker-boundary round-trip never delays a peer seeing the edit.
       await this.conn.send(live).catch(() => {});
-      wkLog(`commit live sent (prim=${prim.slice(0, 12)}…)`);
+      wkLog(
+        `commit live sent (prim=${prim.slice(0, 12)}… raws=${incremental.length} bytes=${incremental.reduce((n, r) => n + r.length, 0)})`,
+      );
     }
     await this.persist();
     wkLog('commit persist done');

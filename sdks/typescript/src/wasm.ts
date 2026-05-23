@@ -28,6 +28,10 @@ export interface WasmEngine {
    * `open()` to seed the host-side file cache. */
   working_files_json(): string;
   export_closure(tipsJson: string): string;
+  /** Incremental Live-push wire form: only the new objects vs. the
+   * primitive's parent's tree (issue 0012 — keeps Live wire size O(diff),
+   * not O(history)). */
+  export_primitive(primHex: string): string;
   frontier_tips(): string[];
   integrate(rawsJson: string): number;
   known(): string[];
