@@ -16,9 +16,12 @@
 use crate::config::VaultConfig;
 use crate::error::{CspError, CspResult};
 use crate::fold::{
-    compute_main, frontier, genesis, parse_primitive_meta, reachable, verify_fold_commit,
+    compute_main, frontier, genesis, most_recent_touch, parse_primitive_meta,
+    path_present_in_tree, reachable, verify_fold_commit, TouchKind,
 };
-use crate::identity::{build_primitive, parse_ssh_pubkey, verify_primitive, Identity};
+use crate::identity::{
+    build_primitive_with_readd, parse_ssh_pubkey, verify_primitive, Identity,
+};
 use crate::object::{read_tree_to_files, write_tree_from_files, GitObject};
 use crate::oid::Oid;
 use crate::order::NodeId;
@@ -32,9 +35,51 @@ fn blob_hash(content: &[u8]) -> String {
     GitObject::Blob(content.to_vec()).oid().to_hex()
 }
 
+/// Issue 0014: the in-vault quarantine directory. Layer 1 routes ghost-add
+/// files into `<vault>/.context/orphans/<utc-iso>/<path>`. The `.context/`
+/// prefix is the scope HARD INVARIANT exclusion (`scope.rs`), so the
+/// orphans folder is never re-ingested by the tree scan and never
+/// published. Each device curates its own quarantine — orphans are not
+/// synced.
+pub const CONTEXT_ORPHANS_DIR: &str = ".context/orphans";
+
+/// Format a UTC-iso bucket name for the orphans folder. Colon-free so it
+/// rides safely on every filesystem (NTFS and APFS disagree about colons).
+/// `t` is wall-clock seconds; the value is local-only and never sync'd, so
+/// using `now_unix()` is fine (no determinism constraint).
+fn orphans_bucket(t: u64) -> String {
+    // Naive RFC3339-ish formatter: avoids pulling `chrono` for one
+    // user-visible string. Year/month/day computed via the classic
+    // civil_from_days algorithm (Howard Hinnant). Stable on all targets.
+    let days = (t / 86_400) as i64;
+    let secs = (t % 86_400) as u32;
+    let (y, m, d) = civil_from_days(days);
+    let h = secs / 3600;
+    let mi = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{y:04}-{m:02}-{d:02}T{h:02}-{mi:02}-{s:02}Z")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 /// One materialize action the host must apply to its working tree (§5.6).
 /// `Defer` = a contended path: leave the user's bytes (they become a
-/// primitive on the next commit). The engine has already recorded the
+/// primitive on the next commit). `Quarantine` (issue 0014) = Layer 1 detected
+/// a ghost-add: move the on-disk file to `.context/orphans/<utc-iso>/<path>`
+/// instead of publishing it, so the DAG-deleted path stays deleted but the
+/// user's bytes are preserved locally. The engine has already recorded the
 /// last-materialized hash for `Write`/`Remove` (it assumes the host applies
 /// them atomically, exactly as the native `Vault::materialize` does).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +87,13 @@ pub enum MaterializeOp {
     Write { path: String, content: Vec<u8> },
     Remove { path: String },
     Defer { path: String },
+    /// Issue 0014 — Layer 1 ghost-add quarantine. The host moves the file at
+    /// `from` (in-vault) to `to` (under `.context/orphans/`). On move failure
+    /// (disk full, permission, Windows path-length), the host MUST NOT delete
+    /// `from` or publish the path: fail-closed by skipping the op and
+    /// retrying on the next materialize tick. The orphans folder is hard-
+    /// excluded from the tree scan, so it never re-publishes.
+    Quarantine { from: String, to: String },
 }
 
 /// Host-persisted engine snapshot (the SDK stores these opaque bytes via its
@@ -93,6 +145,14 @@ pub struct MemEngine {
     /// by the host's reconcile pass (the host vault is their source of
     /// truth), so the working set never needs to outlive a process.
     working: BTreeMap<String, Vec<u8>>,
+    /// Issue 0014 — Layer 1 ghost-add quarantines produced inside
+    /// `commit_scoped` (paths the engine dropped from the published tree
+    /// because the DAG already deleted them). Drained on the next
+    /// `materialize_plan` / `materialize_staged` so the host moves the
+    /// on-disk file to `.context/orphans/<utc-iso>/<path>` atomically with
+    /// the rest of the post-commit reconcile. Not persisted — recomputed by
+    /// the next commit if the host re-stages the same bytes.
+    pending_quarantines: Vec<MaterializeOp>,
 }
 
 impl MemEngine {
@@ -137,6 +197,7 @@ impl MemEngine {
             main: Some(m0),
             config,
             working: BTreeMap::new(),
+            pending_quarantines: Vec::new(),
         })
     }
 
@@ -172,6 +233,7 @@ impl MemEngine {
             main,
             config,
             working: BTreeMap::new(),
+            pending_quarantines: Vec::new(),
         };
         // Seed the incremental working set from the committed tree so the
         // first `commit_staged` after a restart has the right baseline (an
@@ -211,6 +273,30 @@ impl MemEngine {
     /// `.contextignore`; scope re-derives, §11).
     pub fn set_ignore(&mut self, ignore: Vec<String>) {
         self.scope = Self::rebuild_scope(&self.config, ignore);
+    }
+
+    /// Issue 0014 — Layer 2 entry point. Mark the engine as
+    /// `bootstrap_pending`: every subsequent `commit_scoped` returns
+    /// `Ok(None)` until [`Self::mark_bootstrap_complete`] is called (the
+    /// §13 / [[0007]] handshake-completion edge). Call this from `ctx join`
+    /// and from any state-loss recovery that reconstructs
+    /// `state.materialized` from `main`'s tree.
+    pub fn mark_bootstrap_pending(&mut self) {
+        self.state.bootstrap_pending = true;
+    }
+
+    /// Issue 0014 — Layer 2 unblock. The catch-up handshake completed; the
+    /// device's known-set covers the peer's frontier. After this Layer 1
+    /// takes over and `commit_scoped` resumes authoring primitives.
+    pub fn mark_bootstrap_complete(&mut self) {
+        self.state.bootstrap_pending = false;
+    }
+
+    /// Whether the engine is currently in bootstrap-pending mode (issue
+    /// 0014). Hosts can surface this in UI ("waiting for first catch-up")
+    /// or use it to gate commit-driving callers.
+    pub fn is_bootstrap_pending(&self) -> bool {
+        self.state.bootstrap_pending
     }
 
     pub fn main(&self) -> Option<Oid> {
@@ -298,8 +384,100 @@ impl MemEngine {
         &mut self,
         scoped: BTreeMap<String, Vec<u8>>,
     ) -> CspResult<Option<Oid>> {
+        // Layer 2 — explicit bootstrap mode (issue 0014). A `join`-created
+        // engine (or a state-loss recovery) blocks `commit_scoped` until the
+        // §13 handshake reports catch-up completion. Returning Ok(None) so
+        // the host doesn't lose work — it just retries on the next tick.
+        if self.state.bootstrap_pending {
+            return Ok(None);
+        }
+        // Layer 1 — pre-publish ghost-add guard (issue 0014). Classify each
+        // path against (a) the prospective parent's committed tree, (b) the
+        // §5.1-most-recent primitive in the parent's closure that touched
+        // it, and (c) `state.materialized` as the intent signal. Drop
+        // ghost-add paths from the published tree and record a
+        // `MaterializeOp::Quarantine` for the host's next reconcile.
+        let parent = match self.main {
+            Some(m) => m,
+            None => genesis(&mut self.store)?,
+        };
+        let parent_tree_oid = match self.store.get(parent)? {
+            GitObject::Commit(c) => c.tree,
+            _ => return Err(CspError::Malformed("main is not a commit".into())),
+        };
+        // Probe the parent tree one path at a time (`path_present_in_tree`)
+        // rather than reading every blob into a path→bytes map up front. A
+        // 200 KiB blob in the parent tree would otherwise be re-loaded on
+        // EVERY commit (debounce + safety tick on the host watcher),
+        // dragging the debounce window into a tail that races with rapid
+        // file edits.
+        let mut filtered: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut readds: Vec<Oid> = Vec::new();
+        let mut quarantines: Vec<MaterializeOp> = Vec::new();
+        let ts = orphans_bucket(now_unix());
+        for (path, bytes) in scoped.iter() {
+            if path_present_in_tree(&self.store, parent_tree_oid, path)? {
+                // p ∈ tree(parent) → no closure walk needed (the parent's
+                // tree already asserts the path exists; either a no-op or a
+                // genuine modify, both legitimate).
+                filtered.insert(path.clone(), bytes.clone());
+                continue;
+            }
+            // p ∉ tree(parent) → potential ghost-add. Walk the closure.
+            let touch = most_recent_touch(&self.store, parent, path)?;
+            match touch {
+                None => {
+                    // Never touched in this lineage → genuine novel add.
+                    filtered.insert(path.clone(), bytes.clone());
+                }
+                Some((_, TouchKind::Add)) => {
+                    // A previous add (with no subsequent delete) wins on
+                    // §5.1 ordering → re-emerged path, proceed.
+                    filtered.insert(path.clone(), bytes.clone());
+                }
+                Some((delete_oid, TouchKind::Delete)) => {
+                    // The §5.1-most-recent touch is a delete. Consult intent.
+                    if self.state.materialized.contains_key(path) {
+                        // This device had the path on disk before — it's
+                        // stale data, not new user intent. Quarantine.
+                        quarantines.push(MaterializeOp::Quarantine {
+                            from: path.clone(),
+                            to: format!("{CONTEXT_ORPHANS_DIR}/{ts}/{path}"),
+                        });
+                    } else {
+                        // No prior `materialized` record for this path →
+                        // user just created it fresh. Publish it AND emit a
+                        // `CSP-Readd: <delete-oid>` trailer so Layer 3 on
+                        // every peer exempts the primitive from the
+                        // closure-only ghost-add drop.
+                        filtered.insert(path.clone(), bytes.clone());
+                        if !readds.contains(&delete_oid) {
+                            readds.push(delete_oid);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Stash quarantines for the next materialize tick and drop the
+        // quarantined paths from local intent (working set + materialized)
+        // so a stale on-disk file doesn't keep ricocheting through the
+        // pipeline.
+        if !quarantines.is_empty() {
+            for op in &quarantines {
+                if let MaterializeOp::Quarantine { from, .. } = op {
+                    self.working.remove(from);
+                    self.state.materialized.remove(from);
+                }
+            }
+            self.pending_quarantines.extend(quarantines);
+        }
+
+        // Genuine-change detection runs on the *filtered* set, not the
+        // input. A commit that contained only ghost-add paths is a no-op
+        // (the quarantines are surfaced via `pending_quarantines`).
         let mut changed = false;
-        for (p, c) in &scoped {
+        for (p, c) in &filtered {
             if self.state.materialized.get(p) != Some(&blob_hash(c)) {
                 changed = true;
                 break;
@@ -307,7 +485,7 @@ impl MemEngine {
         }
         if !changed {
             for p in self.state.materialized.keys() {
-                if !scoped.contains_key(p) {
+                if !filtered.contains_key(p) {
                     changed = true;
                     break;
                 }
@@ -316,13 +494,17 @@ impl MemEngine {
         if !changed {
             return Ok(None);
         }
-        let tree = self.write_tree(&scoped)?;
-        let parent = match self.main {
-            Some(m) => m,
-            None => genesis(&mut self.store)?,
-        };
+        let tree = self.write_tree(&filtered)?;
         let counter = self.state.next_counter();
-        let prim = build_primitive(&self.identity, tree, parent, counter, now_unix(), "ctx edit");
+        let prim = build_primitive_with_readd(
+            &self.identity,
+            tree,
+            parent,
+            counter,
+            now_unix(),
+            "ctx edit",
+            &readds,
+        );
         let oid = self.store.put(&prim)?;
         self.state.add_known(oid);
         self.recompute()?;
@@ -334,7 +516,7 @@ impl MemEngine {
         // a whole folder) never produced a removal primitive. Mirrors what
         // `materialize_plan` and the native `Vault::materialize` already do.
         self.state.materialized.clear();
-        for (p, c) in &scoped {
+        for (p, c) in &filtered {
             self.state.materialized.insert(p.clone(), blob_hash(c));
         }
         Ok(Some(oid))
@@ -409,16 +591,20 @@ impl MemEngine {
         &mut self,
         on_disk: &BTreeMap<String, Vec<u8>>,
     ) -> CspResult<Vec<MaterializeOp>> {
+        // Issue 0014 — drain Layer 1's pending quarantines so the host
+        // applies them in the same reconcile pass as the Write/Remove/Defer
+        // plan. Done unconditionally (no `main` dependency); a join-pending
+        // engine never reaches commit_scoped, so this is empty for it.
+        let mut ops: Vec<MaterializeOp> = std::mem::take(&mut self.pending_quarantines);
         let main = match self.main {
             Some(m) => m,
-            None => return Ok(Vec::new()),
+            None => return Ok(ops),
         };
         let tree = match self.store.get(main)? {
             GitObject::Commit(c) => c.tree,
             _ => return Err(CspError::Malformed("main is not a commit".into())),
         };
         let want = read_tree_to_files(tree, &|o| self.store.get(o))?;
-        let mut ops = Vec::new();
 
         let prev: Vec<String> = self.state.materialized.keys().cloned().collect();
         for p in prev {
@@ -477,6 +663,13 @@ impl MemEngine {
                     self.working.remove(path);
                 }
                 MaterializeOp::Defer { .. } => {}
+                MaterializeOp::Quarantine { from, .. } => {
+                    // Layer 1 (issue 0014) already dropped this path from
+                    // `working` and `state.materialized` in commit_scoped.
+                    // Keep the staged set in step in case the host re-staged
+                    // the same path between commit and materialize.
+                    self.working.remove(from);
+                }
             }
         }
         Ok(ops)
@@ -785,6 +978,9 @@ impl SessionVault for MemEngine {
     }
     fn admit_peer(&mut self, peer_ssh: &str, enrollment_authorized: bool) -> CspResult<bool> {
         MemEngine::admit_peer(self, peer_ssh, enrollment_authorized)
+    }
+    fn mark_bootstrap_complete(&mut self) {
+        MemEngine::mark_bootstrap_complete(self)
     }
 }
 
@@ -1312,5 +1508,237 @@ mod tests {
         let e2 = MemEngine::from_bytes(id(7), &bytes, Vec::new()).unwrap();
         assert_eq!(e.main(), e2.main());
         assert_eq!(e2.config.vault_id, "v");
+    }
+
+    // ---- Issue 0014: ghost-add guard + bootstrap mode ----
+
+    /// Helper — read main's tree as a path map (host-observable). Avoids
+    /// poking the private store directly from outside the engine.
+    fn main_tree(e: &mut MemEngine) -> BTreeMap<String, Vec<u8>> {
+        e.materialize_staged().ok();
+        // After materialize_staged, working is in step with main.
+        e.working_files().clone()
+    }
+
+    /// Test helper — re-compute the oid of a CommitObj so a test can match
+    /// the right commit in a multi-object closure.
+    fn obj_oid(c: &crate::object::CommitObj) -> Oid {
+        crate::object::GitObject::Commit(c.clone()).oid()
+    }
+
+    #[test]
+    fn ghost_add_quarantined_when_disk_file_is_stale() {
+        // Acceptance: "A deletes foo, A↔B sync, then C (with foo on disk)
+        // joins — foo ends up deleted on every device, on-disk content is
+        // preserved in `.context/orphans/` on C." Simulated via two
+        // MemEngines: A authors create+delete, B integrates the closure,
+        // then B tries to publish a stale on-disk foo.md.
+        let mut a = MemEngine::create(id(1), "v", "").unwrap();
+        a.commit_from_files(&files(&[("foo.md", "hello")])).unwrap();
+
+        // B catches up to A's create, materializes → B.materialized[foo.md]
+        // records the prior on-disk state (the "stale device" precondition).
+        let mut b = MemEngine::create(id(2), "v", "").unwrap();
+        let tips_a = a.frontier_tips().unwrap();
+        let closure_a1 = a.export_closure(&tips_a).unwrap();
+        b.integrate(&closure_a1).unwrap();
+        let ops = b.materialize_staged().unwrap();
+        assert!(
+            ops.iter()
+                .any(|o| matches!(o, MaterializeOp::Write { path, .. } if path == "foo.md")),
+            "B should have written foo.md on first materialize"
+        );
+        assert_eq!(
+            b.working_files().get("foo.md"),
+            Some(&b"hello".to_vec()),
+            "foo.md present in B's working set after first materialize"
+        );
+
+        // A deletes foo.md and republishes; B integrates → B.main has no
+        // foo.md, but B.materialized still records it (we haven't run
+        // materialize_staged since the delete arrived).
+        a.commit_from_files(&files(&[])).unwrap();
+        let closure_a2 = a.export_closure(&a.frontier_tips().unwrap()).unwrap();
+        b.integrate(&closure_a2).unwrap();
+
+        // Stale device cadence: the user (or the host's reconcile pass) tries
+        // to commit foo.md back. Layer 1 must detect the ghost-add and
+        // quarantine instead of publishing.
+        let res = b.commit_from_files(&files(&[("foo.md", "hello")])).unwrap();
+        assert!(
+            res.is_none(),
+            "ghost-add must not produce a new primitive (got {res:?})"
+        );
+
+        // The next materialize plan must include a Quarantine op for the
+        // ghost-add path.
+        let ops = b.materialize_staged().unwrap();
+        let quarantined = ops.iter().any(|o| match o {
+            MaterializeOp::Quarantine { from, to } => {
+                from == "foo.md" && to.starts_with(".context/orphans/")
+            }
+            _ => false,
+        });
+        assert!(
+            quarantined,
+            "expected a Quarantine op for foo.md; got {ops:?}"
+        );
+
+        // After the dust settles, B.main agrees with A (no foo.md).
+        let final_tree = main_tree(&mut b);
+        assert!(
+            !final_tree.contains_key("foo.md"),
+            "foo.md must stay deleted on B"
+        );
+    }
+
+    #[test]
+    fn legitimate_readd_publishes_with_trailer() {
+        // Acceptance: "User legitimately re-creates a previously-deleted
+        // path on a synced device: file publishes, all peers see it."
+        let mut a = MemEngine::create(id(1), "v", "").unwrap();
+        a.commit_from_files(&files(&[("note.md", "v1")])).unwrap();
+        a.commit_from_files(&files(&[])).unwrap(); // delete
+
+        // After the delete, A.materialized no longer records note.md → a
+        // subsequent stage_write is treated as fresh user intent. Layer 1
+        // publishes a primitive carrying a CSP-Readd trailer naming the
+        // delete.
+        let oid = a
+            .commit_from_files(&files(&[("note.md", "v2")]))
+            .unwrap()
+            .expect("legitimate re-add must publish a primitive");
+        // Find the primitive itself in the closure — `pop()` returns the
+        // last raw which may be a tree/blob, not the commit we authored.
+        let c = a
+            .export_closure(&[oid])
+            .unwrap()
+            .into_iter()
+            .filter_map(|raw| {
+                let obj = crate::object::GitObject::decompress_and_parse(&raw).ok()?;
+                match obj {
+                    crate::object::GitObject::Commit(c) if obj_oid(&c) == oid => Some(c),
+                    _ => None,
+                }
+            })
+            .next()
+            .expect("re-add primitive missing from closure");
+        let readds = crate::fold::parse_primitive_readds(&c);
+        assert_eq!(
+            readds.len(),
+            1,
+            "legitimate re-add must carry exactly one CSP-Readd trailer"
+        );
+
+        // Verify a peer B integrating the closure sees note.md in main
+        // (Layer 3 must NOT drop a primitive whose trailer names a delete
+        // in its own closure).
+        let mut b = MemEngine::create(id(2), "v", "").unwrap();
+        let closure = a.export_closure(&a.frontier_tips().unwrap()).unwrap();
+        b.integrate(&closure).unwrap();
+        let tree = main_tree(&mut b);
+        assert_eq!(
+            tree.get("note.md"),
+            Some(&b"v2".to_vec()),
+            "legitimate re-add must propagate to B"
+        );
+    }
+
+    #[test]
+    fn layer3_drops_primitive_missing_readd_trailer() {
+        // Acceptance: "a primitive missing the readd trailer for a path
+        // whose closure contains a delete is dropped by Layer 3 on every
+        // peer." Construct the buggy author case directly: build a signed
+        // primitive that adds a path against a parent whose closure has a
+        // delete, with no trailer, and verify the fold drops it.
+        let mut a = MemEngine::create(id(1), "v", "").unwrap();
+        a.commit_from_files(&files(&[("foo.md", "hello")])).unwrap();
+        a.commit_from_files(&files(&[])).unwrap();
+        let post_delete_main = a.main().unwrap();
+
+        // Hand-author a primitive that adds foo.md again, parented on
+        // a.main, but WITHOUT a CSP-Readd trailer (simulating a pre-bump
+        // SDK or a buggy author). `write_tree` is private to MemEngine;
+        // the test reaches in (same module) to put the tree + blob into
+        // A's store so `export_closure` later finds them.
+        let id_bad = id(2);
+        let bad_tree = a
+            .write_tree(&files(&[("foo.md", "ghost")]))
+            .expect("write_tree");
+        let bad_prim = crate::identity::build_primitive(
+            &id_bad,
+            bad_tree,
+            post_delete_main,
+            a.state.observed + 1,
+            0,
+            "ctx edit",
+        );
+        // Put the bad primitive into A's store via the same put path the
+        // engine uses, so `export_closure(&[bad_oid])` walks back through
+        // its tree, blob and ancestors.
+        let bad_oid = a.store.put(&bad_prim).unwrap();
+
+        // A second engine B integrates a closure that includes the bad
+        // primitive AND the original post-delete closure. Layer 3 must
+        // drop the bad prim from the frontier so main stays at the
+        // deleted state.
+        let mut b = MemEngine::create(id(3), "v", "").unwrap();
+        let mut batch = a.export_closure(&a.frontier_tips().unwrap()).unwrap();
+        batch.extend(a.export_closure(&[bad_oid]).unwrap());
+        b.integrate(&batch).unwrap();
+        let tree = main_tree(&mut b);
+        assert!(
+            !tree.contains_key("foo.md"),
+            "Layer 3 must drop a ghost-add primitive lacking the readd trailer"
+        );
+    }
+
+    #[test]
+    fn ctx_init_publishes_immediately() {
+        // Acceptance: "ctx init on a brand-new device with files publishes
+        // them immediately (Layer 2 only blocks join-mode engines)." The
+        // MemEngine equivalent of init is `MemEngine::create`; it must NOT
+        // set bootstrap_pending.
+        let mut e = MemEngine::create(id(1), "v", "").unwrap();
+        assert!(!e.is_bootstrap_pending(), "fresh init must not be pending");
+        let oid = e
+            .commit_from_files(&files(&[("hello.md", "world")]))
+            .unwrap();
+        assert!(oid.is_some(), "fresh init must publish immediately");
+    }
+
+    #[test]
+    fn bootstrap_pending_blocks_commit_until_cleared() {
+        // Acceptance: "blocked commits return Ok(None) so the host doesn't
+        // lose work, just retries. The handshake-completion edge clears
+        // bootstrap_pending; Layer 1 then takes over."
+        let mut e = MemEngine::create(id(1), "v", "").unwrap();
+        e.mark_bootstrap_pending();
+        assert!(e.is_bootstrap_pending());
+        let res = e
+            .commit_from_files(&files(&[("x.md", "1")]))
+            .unwrap();
+        assert!(
+            res.is_none(),
+            "bootstrap_pending must short-circuit commit_scoped"
+        );
+        e.mark_bootstrap_complete();
+        assert!(!e.is_bootstrap_pending());
+        let res = e
+            .commit_from_files(&files(&[("x.md", "1")]))
+            .unwrap();
+        assert!(
+            res.is_some(),
+            "commit must resume once bootstrap_pending is cleared"
+        );
+    }
+
+    #[test]
+    fn protocol_version_bumped_to_v5() {
+        // Acceptance: "The §13 handshake refuses to peer with SDKs below the
+        // version that emits and respects the trailer". v4 → v5 across this
+        // issue. Pin the constant so a future accidental downgrade fails a
+        // test, not a deploy.
+        assert_eq!(crate::wire::PROTO_VERSION, 5);
     }
 }

@@ -138,6 +138,9 @@ enum OpJson {
     Write { path: String, content: Vec<u8> },
     Remove { path: String },
     Defer { path: String },
+    /// Issue 0014 — Layer 1 ghost-add quarantine. The host moves
+    /// `from` → `to` (under `<vault>/.context/orphans/`). Never published.
+    Quarantine { from: String, to: String },
 }
 
 #[derive(serde::Serialize)]
@@ -279,6 +282,7 @@ impl WasmEngine {
                 MaterializeOp::Write { path, content } => OpJson::Write { path, content },
                 MaterializeOp::Remove { path } => OpJson::Remove { path },
                 MaterializeOp::Defer { path } => OpJson::Defer { path },
+                MaterializeOp::Quarantine { from, to } => OpJson::Quarantine { from, to },
             })
             .collect();
         serde_json::to_string(&ops).map_err(je)

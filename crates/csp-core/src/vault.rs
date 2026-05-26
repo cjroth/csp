@@ -10,9 +10,12 @@ use crate::authkeys::{self, Expiry, KeyEntry};
 use crate::config::{VaultConfig, BUILTIN_DEFAULT_TTL_DAYS};
 use crate::error::{CspError, CspResult};
 use crate::fold::{
-    compute_main, frontier, genesis, parse_primitive_meta, reachable, verify_fold_commit,
+    compute_main, frontier, genesis, most_recent_touch, parse_primitive_meta,
+    path_present_in_tree, reachable, verify_fold_commit, TouchKind,
 };
-use crate::identity::{build_primitive, parse_ssh_pubkey, verify_primitive, Identity};
+use crate::identity::{
+    build_primitive_with_readd, parse_ssh_pubkey, verify_primitive, Identity,
+};
 use crate::object::{read_tree_to_files, write_tree_from_files, GitObject};
 use crate::oid::Oid;
 use crate::order::NodeId;
@@ -46,6 +49,32 @@ fn now_unix() -> u64 {
 
 fn blob_hash(content: &[u8]) -> String {
     GitObject::Blob(content.to_vec()).oid().to_hex()
+}
+
+/// Issue 0014 — UTC-iso bucket name for the `.context/orphans/<…>/<path>`
+/// quarantine folder. Colon-free so NTFS / APFS both accept the path.
+fn orphans_bucket(t: u64) -> String {
+    let days = (t / 86_400) as i64;
+    let secs = (t % 86_400) as u32;
+    let (y, m, d) = civil_from_days(days);
+    let h = secs / 3600;
+    let mi = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{y:04}-{m:02}-{d:02}T{h:02}-{mi:02}-{s:02}Z")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 impl Vault {
@@ -258,12 +287,101 @@ impl Vault {
     }
 
     pub fn commit_local_changes(&mut self) -> CspResult<Option<Oid>> {
+        // Layer 2 — explicit bootstrap mode (issue 0014). A `join`-created
+        // vault blocks `commit_local_changes` until the §13 handshake reports
+        // catch-up completion. Returning Ok(None) so the host doesn't lose
+        // work — it just retries on the next tick.
+        if self.state.bootstrap_pending {
+            return Ok(None);
+        }
         self.refresh_scope();
         let mut files = self.scan()?;
         self.inject_empty_dir_keeps(&mut files)?;
         let files = canonicalize_keeps(&files, &self.scope);
+
+        // Layer 1 — pre-publish ghost-add guard (issue 0014). Classify each
+        // path against the prospective parent's committed tree and its
+        // ancestor closure, using `state.materialized` as the intent signal
+        // to distinguish a stale on-disk file from genuine new user intent.
+        //
+        // Perf: the parent's tree is probed structurally one path at a time
+        // (`path_present_in_tree`) — never loaded as a flat path→bytes map.
+        // A 200 KiB blob in the parent tree would otherwise be read from
+        // the store on every commit tick.
+        let parent = self.repo.main().unwrap_or_else(|| {
+            // Should not happen (M₀ always set), but stay safe.
+            genesis(&mut self.repo.store).unwrap()
+        });
+        let parent_tree_oid = match self.repo.store.get(parent)? {
+            GitObject::Commit(c) => c.tree,
+            _ => return Err(CspError::Malformed("main is not a commit".into())),
+        };
+        let mut filtered: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut readds: Vec<Oid> = Vec::new();
+        let mut quarantines: Vec<(String, String)> = Vec::new();
+        let ts = orphans_bucket(now_unix());
+        for (path, bytes) in files.iter() {
+            if path_present_in_tree(&self.repo.store, parent_tree_oid, path)? {
+                filtered.insert(path.clone(), bytes.clone());
+                continue;
+            }
+            let touch = most_recent_touch(&self.repo.store, parent, path)?;
+            match touch {
+                None => {
+                    filtered.insert(path.clone(), bytes.clone());
+                }
+                Some((_, TouchKind::Add)) => {
+                    filtered.insert(path.clone(), bytes.clone());
+                }
+                Some((delete_oid, TouchKind::Delete)) => {
+                    if self.state.materialized.contains_key(path) {
+                        let to = format!("{CONTEXT_DIR}/orphans/{ts}/{path}");
+                        quarantines.push((path.clone(), to));
+                    } else {
+                        filtered.insert(path.clone(), bytes.clone());
+                        if !readds.contains(&delete_oid) {
+                            readds.push(delete_oid);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply quarantine moves to disk (fail-closed: if any move fails,
+        // skip that path's quarantine but still honor the delete on the
+        // published tree — i.e. drop the path from `filtered`, never
+        // publish the ghost-add, and never delete the source file).
+        for (from, to) in &quarantines {
+            let src = self.root.join(from);
+            let dst = self.root.join(to);
+            if let Some(parent_dir) = dst.parent() {
+                if std::fs::create_dir_all(parent_dir).is_err() {
+                    tracing::warn!(
+                        from = %from,
+                        to = %to,
+                        "ghost-add quarantine failed (mkdir); leaving file in place"
+                    );
+                    continue;
+                }
+            }
+            if let Err(e) = std::fs::rename(&src, &dst) {
+                tracing::warn!(
+                    from = %from,
+                    to = %to,
+                    err = %e,
+                    "ghost-add quarantine failed (rename); leaving file in place"
+                );
+                continue;
+            }
+            self.state.materialized.remove(from);
+        }
+        if !quarantines.is_empty() {
+            let count = quarantines.len();
+            tracing::info!(count, "quarantined {count} stale files");
+        }
+
         let mut changed = false;
-        for (p, c) in &files {
+        for (p, c) in &filtered {
             let h = blob_hash(c);
             if self.state.materialized.get(p) != Some(&h) {
                 changed = true;
@@ -273,28 +391,30 @@ impl Vault {
         if !changed {
             // A removal also counts as a change.
             for p in self.state.materialized.keys() {
-                if !files.contains_key(p) {
+                if !filtered.contains_key(p) {
                     changed = true;
                     break;
                 }
             }
         }
         if !changed {
+            if !quarantines.is_empty() {
+                // Quarantines mutated `materialized` — persist that even
+                // though we did not author a primitive.
+                self.state.save(&self.context)?;
+            }
             return Ok(None);
         }
-        let tree = self.write_tree(&files)?;
-        let parent = self.repo.main().unwrap_or_else(|| {
-            // Should not happen (M₀ always set), but stay safe.
-            genesis(&mut self.repo.store).unwrap()
-        });
+        let tree = self.write_tree(&filtered)?;
         let counter = self.state.next_counter();
-        let prim = build_primitive(
+        let prim = build_primitive_with_readd(
             &self.identity,
             tree,
             parent,
             counter,
             now_unix(),
             "ctx edit",
+            &readds,
         );
         let oid = self.repo.store.put(&prim)?;
         self.state.add_known(oid);
@@ -302,6 +422,29 @@ impl Vault {
         self.recompute_and_materialize()?;
         self.state.save(&self.context)?;
         Ok(Some(oid))
+    }
+
+    /// Issue 0014 — Layer 2 entry point. Mark the vault as
+    /// `bootstrap_pending`: every subsequent `commit_local_changes` returns
+    /// `Ok(None)` until [`Self::mark_bootstrap_complete`] is called. Wired
+    /// into `ctx join` / `ctx clone`.
+    pub fn mark_bootstrap_pending(&mut self) -> CspResult<()> {
+        self.state.bootstrap_pending = true;
+        self.state.save(&self.context)
+    }
+
+    /// Issue 0014 — Layer 2 unblock. Called by the session after a complete
+    /// catch-up batch integrates; clears the bootstrap flag so authoring
+    /// resumes.
+    pub fn mark_bootstrap_complete(&mut self) {
+        if self.state.bootstrap_pending {
+            self.state.bootstrap_pending = false;
+            let _ = self.state.save(&self.context);
+        }
+    }
+
+    pub fn is_bootstrap_pending(&self) -> bool {
+        self.state.bootstrap_pending
     }
 
     fn recompute_and_materialize(&mut self) -> CspResult<()> {
@@ -1079,7 +1222,7 @@ mod tests {
         // recompute, so the unresolved parent is never walked).
         let parent = b.main().expect("M₀ at create");
         let tree = parent; // any Oid; unused on the admit-rejection path
-        let prim_obj = build_primitive(&id(9), tree, parent, 1, 0, "ctx edit");
+        let prim_obj = crate::identity::build_primitive(&id(9), tree, parent, 1, 0, "ctx edit");
         let mut commit = match prim_obj {
             GitObject::Commit(c) => c,
             _ => panic!("build_primitive must return a Commit"),

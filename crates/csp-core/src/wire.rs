@@ -12,10 +12,16 @@ use serde::{Deserialize, Serialize};
 /// channel binding (TLS cert fingerprint in the transcript); v3 made the
 /// binding **listener-advertised** (`Hello.cb`) and signed over that single
 /// agreed value, so a TLS-terminating front proxy no longer desynchronizes
-/// the two transcripts (§10). v4 introduces `Msg::ObjectsBatch` for atomic
-/// chunked catch-up — v3's experimental single-`Objects` chunking
-/// (0.1.15) broke catch-up admission ordering and is incompatible.
-pub const PROTO_VERSION: u32 = 4;
+/// the two transcripts (§10). v4 introduced `Msg::ObjectsBatch` for atomic
+/// chunked catch-up — v3's experimental single-`Objects` chunking (0.1.15)
+/// broke catch-up admission ordering and is incompatible. v5 (issue 0014)
+/// introduces (a) the `CSP-Readd: <oid>` commit-message trailer that exempts
+/// legitimate re-adds from Layer 3 integrate-time ghost-add filtering, and
+/// (b) Layer 3 itself — peers below v5 don't emit the trailer, so a v5 peer
+/// folding their primitives would silently drop legitimate re-adds. The
+/// handshake therefore refuses to peer with sub-v5 SDKs; no mixed-version
+/// swarms, no fallback path.
+pub const PROTO_VERSION: u32 = 5;
 
 fn proto_default() -> u32 {
     // An old peer's `Hello` has no `proto` field → 0 → reported as skew.

@@ -68,9 +68,14 @@ function sshPubkeyToBytes(ssh: string): Uint8Array {
 }
 
 interface MatOp {
-  op: 'write' | 'remove' | 'defer';
-  path: string;
+  op: 'write' | 'remove' | 'defer' | 'quarantine';
+  path?: string;
   content?: number[];
+  // 'quarantine' (issue 0014) carries source + destination paths instead of
+  // a single `path`. The host moves `from` → `to` (both vault-relative); `to`
+  // is under `.context/orphans/<utc-iso>/...` and never re-published.
+  from?: string;
+  to?: string;
 }
 
 export class RealVault implements Vault {
@@ -529,13 +534,26 @@ export class RealVault implements Vault {
     const ops = JSON.parse(this.engine.materialize_staged()) as MatOp[];
     const changes: Array<{ path: string; content: string | null }> = [];
     for (const o of ops) {
-      if (o.op === 'write' && o.content) {
+      if (o.op === 'write' && o.content && o.path) {
         const content = dec.decode(Uint8Array.from(o.content));
         this.files.set(o.path, content);
         changes.push({ path: o.path, content });
-      } else if (o.op === 'remove') {
+      } else if (o.op === 'remove' && o.path) {
         this.files.delete(o.path);
         changes.push({ path: o.path, content: null });
+      } else if (o.op === 'quarantine' && o.from && o.to) {
+        // Issue 0014 — Layer 1 ghost-add quarantine. Move the in-memory
+        // file from `from` to `to` (which lives under `.context/orphans/`).
+        // The SDK's RealVault is the in-memory mirror of a host vault; the
+        // tree-changed event preserves recoverability by surfacing the move
+        // so the host can replay it on its real filesystem.
+        const content = this.files.get(o.from);
+        if (content !== undefined) {
+          this.files.delete(o.from);
+          this.files.set(o.to, content);
+          changes.push({ path: o.from, content: null });
+          changes.push({ path: o.to, content });
+        }
       } // 'defer' → leave the user's bytes (§5.6)
     }
     // Carry the exact change set with the event so a host doesn't have to

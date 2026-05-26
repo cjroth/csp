@@ -92,6 +92,12 @@ pub fn verify_detached(node: &NodeId, msg: &[u8], sig: &[u8]) -> CspResult<()> {
 }
 
 const SIG_TRAILER: &str = "CSP-Signature: ";
+/// Issue 0014: `CSP-Readd: <delete-prim-oid>` trailer naming the §5.1
+/// most-recent delete in this primitive's closure that the publisher is
+/// genuinely re-adding. Emitted automatically by Layer 1 when
+/// `state.materialized` confirmed the path is fresh user intent; consumed by
+/// Layer 3's integrate-time filter to exempt the primitive from drop.
+pub const READD_TRAILER: &str = "CSP-Readd: ";
 
 /// Build a **signed** primitive commit (§5.2). Parent is the synthetic fold
 /// commit the author held. The signature covers the entire pre-signature
@@ -106,11 +112,36 @@ pub fn build_primitive(
     wall_time: u64,
     subject: &str,
 ) -> GitObject {
+    build_primitive_with_readd(id, tree, parent, counter, wall_time, subject, &[])
+}
+
+/// Like [`build_primitive`] but also emits one `CSP-Readd: <delete-prim-oid>`
+/// trailer per entry in `readds` (issue 0014). The trailer is engine-emitted
+/// (Layer 1 detects the legitimate re-add of a previously-deleted path) and
+/// load-bearing for Layer 3 integrate-time filtering — primitives that re-add
+/// a path whose closure contains a delete are dropped unless they carry a
+/// trailer naming that delete. Under the trust model the trailer is a
+/// structural signal, not an authenticated one (no separate signing — it is
+/// covered by the ed25519 signature over the commit payload like every other
+/// trailer).
+#[allow(clippy::too_many_arguments)]
+pub fn build_primitive_with_readd(
+    id: &Identity,
+    tree: Oid,
+    parent: Oid,
+    counter: u64,
+    wall_time: u64,
+    subject: &str,
+    readds: &[Oid],
+) -> GitObject {
     let node = id.node_id();
-    let body = format!(
+    let mut body = format!(
         "{subject}\n\nCSP-Counter: {counter}\nCSP-Node: {}\n",
         node.to_hex()
     );
+    for r in readds {
+        body.push_str(&format!("{READD_TRAILER}{}\n", r.to_hex()));
+    }
     let unsigned = CommitObj {
         tree,
         parents: vec![parent],

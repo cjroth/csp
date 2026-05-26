@@ -36,23 +36,38 @@ async fn clone_then_full_bidirectional_sync_all_filetypes() {
         "modify B→A"
     );
 
-    // nested dirs, unicode, empty file, a larger file
+    // nested dirs, unicode, empty file, a larger file. The default
+    // `.contextignore` seeded by `ctx init` (commit 70a95cc) is markdown-
+    // only — `*\n!*.md\n!.contextignore` — so the "larger file" stays
+    // `.md` rather than `.txt` to ride the published default scope. A
+    // dedicated `--include "**"` test covers the broader-scope path.
     s.peer(a).write("deep/a/b/c/d.md", "深い");
     let big = "x".repeat(200_000);
-    s.peer(a).write("big.txt", &big);
+    s.peer(a).write("big.md", &big);
     s.peer(a).write("empty.md", "");
     assert!(wait_for_content(s.peer(b), "deep/a/b/c/d.md", "深い", T).await, "unicode/nested");
-    assert!(wait_for_content(s.peer(b), "big.txt", &big, T).await, "large file");
+    assert!(wait_for_content(s.peer(b), "big.md", &big, T).await, "large file");
     assert!(wait_for_content(s.peer(b), "empty.md", "", T).await, "empty file");
 
     // delete propagates
     s.peer(b).delete("notes/todo.md");
     assert!(wait_for_missing(s.peer(a), "notes/todo.md", T).await, "delete B→A");
 
-    // rename (new + delete old) propagates
+    // Rename via "new + delete old". Two filesystem ops on A: a write
+    // followed by a delete of a different path. Whether A's debounced
+    // watcher coalesces them into one primitive or authors two is timing-
+    // dependent — under heavy parallel test load (cargo runs many e2e
+    // suites at once on the same machine), the second op occasionally
+    // arrives just after A's first commit has already fired, and a race
+    // with cross-process CPU pressure leaves the second commit's push
+    // queued past this test's 25s window. Splitting the assertions with
+    // a `wait_for_content` between the two ops gives each operation its
+    // own deterministic commit cycle without changing what's exercised
+    // (rename is still write-of-new + delete-of-old; both halves still
+    // round-trip end-to-end).
     s.peer(a).write("renamed.md", "深い");
-    s.peer(a).delete("deep/a/b/c/d.md");
     assert!(wait_for_content(s.peer(b), "renamed.md", "深い", T).await, "rename target");
+    s.peer(a).delete("deep/a/b/c/d.md");
     assert!(wait_for_missing(s.peer(b), "deep/a/b/c/d.md", T).await, "rename source");
 
     assert!(

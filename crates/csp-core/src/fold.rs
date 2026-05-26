@@ -42,6 +42,23 @@ pub fn is_primitive(c: &CommitObj) -> bool {
     parse_primitive_meta(c).is_some()
 }
 
+/// Parse the (zero-or-more) `CSP-Readd: <oid>` trailers (issue 0014). Each
+/// trailer names a delete primitive whose closure-only-detected ghost-add the
+/// publisher is genuinely re-adding. Engine-emitted; user never sees it.
+/// Malformed trailers are skipped (defensive — a buggy / older SDK that
+/// stuffs garbage in this trailer should not crash integration).
+pub fn parse_primitive_readds(c: &CommitObj) -> Vec<Oid> {
+    let mut out = Vec::new();
+    for line in c.message.lines() {
+        if let Some(v) = line.strip_prefix(crate::identity::READD_TRAILER) {
+            if let Ok(o) = Oid::from_hex(v.trim()) {
+                out.push(o);
+            }
+        }
+    }
+    out
+}
+
 fn load_commit<S: Store>(store: &S, oid: Oid) -> CspResult<CommitObj> {
     match store.get(oid)? {
         GitObject::Commit(c) => Ok(c),
@@ -80,9 +97,299 @@ fn order_key<S: Store>(store: &S, oid: Oid) -> CspResult<OrderKey> {
     Ok(OrderKey { counter, node, sha: oid })
 }
 
+// ---- Issue 0014 — ghost-add classification --------------------------------
+//
+// A primitive P is a **ghost-add for path q** iff (1) q ∈ tree(P), (2)
+// q ∉ tree(parent(P)) (P is *adding* q against its own parent), and (3) the
+// §5.1 most-recent primitive in parent(P)'s ancestor closure that *touched*
+// q is a delete. "Touched" means q's presence-in-tree differs from the
+// commit's parent — an `absent → present` (add) or `present → absent`
+// (delete) transition.
+//
+// The predicate is content-only and node-independent — every node computes
+// the same answer from the same store. Layer 1 (engine-side, pre-publish)
+// additionally consults `state.materialized` to distinguish "stale on-disk
+// file" from "user genuinely re-creating the path"; Layer 3 (integrate-time
+// filter) MUST NOT (it would make the fold non-deterministic across nodes),
+// so legitimate re-adds emit a `CSP-Readd: <delete-oid>` trailer that
+// exempts the primitive from Layer 3 drop.
+
+/// Result of [`most_recent_touch`]: the §5.1-most-recent primitive in
+/// `parent`'s ancestor closure that toggled the presence of `path`, and
+/// whether that toggle was a delete (present → absent) or an add
+/// (absent → present).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchKind {
+    Add,
+    Delete,
+}
+
+/// Look up the `path` entry in a commit's tree. Returns `true` if the path
+/// is a file in this tree, `false` otherwise. Walks nested sub-trees
+/// segment-by-segment so very deep trees don't pay the cost of a full
+/// `read_tree_to_files` — load only the trees on the path, never blobs.
+/// `pub(crate)` so Layer 1 (`vault.rs` / `engine.rs`) can use the same
+/// structural walk for "is this path in the parent tree?" instead of
+/// reading every blob on every commit (the perf cliff that destabilized
+/// the e2e watcher on large vaults — a debounce that should coalesce
+/// rapid writes loses races when a single read_tree_to_files call drags
+/// in hundreds of KB of unrelated blob bytes).
+pub(crate) fn path_present_in_tree<S: Store>(
+    store: &S,
+    tree_oid: Oid,
+    path: &str,
+) -> CspResult<bool> {
+    let mut cur = tree_oid;
+    let mut it = path.split('/').peekable();
+    while let Some(seg) = it.next() {
+        let entries = match store.get(cur)? {
+            GitObject::Tree(e) => e,
+            _ => return Ok(false),
+        };
+        let Some(found) = entries.into_iter().find(|e| e.name == seg) else {
+            return Ok(false);
+        };
+        if it.peek().is_none() {
+            return Ok(found.mode != crate::object::TREE_MODE);
+        }
+        if found.mode != crate::object::TREE_MODE {
+            return Ok(false);
+        }
+        cur = found.oid;
+    }
+    Ok(false)
+}
+
+// Issue 0014 — Layer 1 most-recent-touch cache. Per-thread memoization
+// keyed on `(parent_oid, path)`. Both inputs are stable: `parent_oid` is
+// content-addressed, and the path is a string. The verdict is a pure
+// function of `(store, parent_oid, path)` and the store grows
+// monotonically, so a cached result stays correct. Without this, every
+// watcher tick's `commit_local_changes` walks the parent's full ancestor
+// closure for each "added" path — under parallel test load (17 e2e tests
+// spawning 34 ctx processes) the cumulative CPU pressure caused the
+// watcher's debounce window to race past file events. The cache flattens
+// the per-tick cost to O(1) for the steady-state case.
+thread_local! {
+    static MOST_RECENT_TOUCH_CACHE: std::cell::RefCell<HashMap<(Oid, String), Option<(Oid, TouchKind)>>>
+        = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Walk `start`'s ancestor closure (excluding `start`) and find the
+/// §5.1-most-recent primitive that *touched* `path` (toggled its presence
+/// across its parent edge). Returns `None` if no ancestor primitive ever
+/// touched `path`. Content-only — every node agrees.
+pub fn most_recent_touch<S: Store>(
+    store: &S,
+    start: Oid,
+    path: &str,
+) -> CspResult<Option<(Oid, TouchKind)>> {
+    if let Some(hit) =
+        MOST_RECENT_TOUCH_CACHE.with(|c| c.borrow().get(&(start, path.to_string())).copied())
+    {
+        return Ok(hit);
+    }
+    let result = most_recent_touch_uncached(store, start, path)?;
+    MOST_RECENT_TOUCH_CACHE
+        .with(|c| c.borrow_mut().insert((start, path.to_string()), result));
+    Ok(result)
+}
+
+fn most_recent_touch_uncached<S: Store>(
+    store: &S,
+    start: Oid,
+    path: &str,
+) -> CspResult<Option<(Oid, TouchKind)>> {
+    // Walk every commit reachable from `start`. For each primitive we visit,
+    // record (kind, order_key) iff it toggled `path`'s presence vs. its
+    // (sole) parent. Pick the max by §5.1 strict total order.
+    let mut best: Option<(OrderKey, Oid, TouchKind)> = None;
+    let mut seen: HashSet<Oid> = HashSet::new();
+    let mut stack: Vec<Oid> = vec![start];
+    let mut first = true;
+    while let Some(o) = stack.pop() {
+        if !first && !seen.insert(o) {
+            continue;
+        }
+        let c = load_commit(store, o)?;
+        if first {
+            first = false;
+        }
+        // We must traverse synthetic fold commits (they're how primitives
+        // are reached) but only classify primitives. A primitive has exactly
+        // one parent by construction (§5.2); a malformed multi-parent
+        // primitive is treated conservatively as "did not touch" — Layer 3
+        // is a backstop, not a structural enforcement layer.
+        if is_primitive(&c) {
+            if let (Some(&parent_oid), Some((counter, node))) =
+                (c.parents.first(), parse_primitive_meta(&c))
+            {
+                if c.parents.len() == 1 {
+                    let in_p = path_present_in_tree(store, c.tree, path)?;
+                    let parent_tree = load_commit(store, parent_oid)?.tree;
+                    let in_parent = path_present_in_tree(store, parent_tree, path)?;
+                    let kind = match (in_parent, in_p) {
+                        (false, true) => Some(TouchKind::Add),
+                        (true, false) => Some(TouchKind::Delete),
+                        _ => None,
+                    };
+                    if let Some(k) = kind {
+                        let key = OrderKey { counter, node, sha: o };
+                        match &best {
+                            Some((bk, _, _)) if *bk >= key => {}
+                            _ => best = Some((key, o, k)),
+                        }
+                    }
+                }
+            }
+        }
+        for p in c.parents {
+            if !seen.contains(&p) {
+                stack.push(p);
+            }
+        }
+    }
+    Ok(best.map(|(_, o, k)| (o, k)))
+}
+
+/// Paths that appear under `child_tree` but NOT under `parent_tree`. Walks
+/// both trees structurally — subtrees whose oid matches on both sides are
+/// pruned (content-addressed → identical subtrees), so the cost is
+/// proportional to the diff, not the tree size. Blobs are NEVER loaded; this
+/// is the key perf optimization for Layer 3 over big binaries.
+fn tree_paths_added<S: Store>(
+    store: &S,
+    prefix: &str,
+    parent_tree: Option<Oid>,
+    child_tree: Oid,
+    out: &mut Vec<String>,
+) -> CspResult<()> {
+    if Some(child_tree) == parent_tree {
+        return Ok(());
+    }
+    let child_entries = match store.get(child_tree)? {
+        GitObject::Tree(e) => e,
+        _ => return Ok(()),
+    };
+    let parent_entries: Vec<crate::object::TreeEntry> = match parent_tree {
+        Some(o) => match store.get(o)? {
+            GitObject::Tree(e) => e,
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    for ce in child_entries {
+        let path = format!("{prefix}{}", ce.name);
+        let pe = parent_entries.iter().find(|e| e.name == ce.name);
+        if ce.mode == crate::object::TREE_MODE {
+            let parent_sub = pe.and_then(|e| {
+                (e.mode == crate::object::TREE_MODE).then_some(e.oid)
+            });
+            tree_paths_added(store, &format!("{path}/"), parent_sub, ce.oid, out)?;
+        } else {
+            // Child is a blob. Path is "added" iff parent has nothing at this
+            // exact path (any kind). A directory-vs-file collision at the
+            // same name counts as a new path on the child side — same
+            // semantics as `merge_trees`.
+            let parent_has_file = pe.is_some_and(|e| e.mode != crate::object::TREE_MODE);
+            if !parent_has_file {
+                out.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+// Issue 0014 — Layer 3 verdict cache. Per-thread memoization of
+// `is_ghost_add_closure_only` keyed on the primitive oid. The predicate is
+// pure over `(store, oid)` and the store is monotonically growing (content-
+// addressed `put`s never invalidate prior content), so a cached verdict
+// stays correct for the life of the thread. Without this, `effective_known`
+// walks each primitive's full ancestor closure on every recompute → O(N²)
+// commit loads as the known set grows (the perf cliff the sync_regression
+// suite hit at 250-primitive catch-ups).
+thread_local! {
+    static GHOST_ADD_VERDICT: std::cell::RefCell<HashMap<Oid, bool>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Content-only ghost-add check for a primitive (Layer 3 — issue 0014).
+/// Returns `true` iff the primitive adds at least one path against its own
+/// parent for which the §5.1-most-recent primitive in the parent's closure
+/// that touched that path is a delete, AND the primitive carries no
+/// `CSP-Readd: <that-delete-oid>` trailer.
+///
+/// Synthetic fold commits and primitives without a (sole) parent return
+/// `false` — Layer 3 only catches actual ghost-add primitives; verification
+/// of fold commits is a separate axis (`verify_fold_commit`).
+pub fn is_ghost_add_closure_only<S: Store>(store: &S, prim_oid: Oid) -> CspResult<bool> {
+    if let Some(hit) = GHOST_ADD_VERDICT.with(|c| c.borrow().get(&prim_oid).copied()) {
+        return Ok(hit);
+    }
+    let result = is_ghost_add_closure_only_uncached(store, prim_oid)?;
+    GHOST_ADD_VERDICT.with(|c| c.borrow_mut().insert(prim_oid, result));
+    Ok(result)
+}
+
+fn is_ghost_add_closure_only_uncached<S: Store>(
+    store: &S,
+    prim_oid: Oid,
+) -> CspResult<bool> {
+    let c = match store.get(prim_oid)? {
+        GitObject::Commit(c) => c,
+        _ => return Ok(false),
+    };
+    if !is_primitive(&c) {
+        return Ok(false);
+    }
+    if c.parents.len() != 1 {
+        return Ok(false);
+    }
+    let parent_oid = c.parents[0];
+    let parent_commit = load_commit(store, parent_oid)?;
+    // Fast structural diff: enumerate only the paths *added* against parent.
+    // `tree_paths_added` walks tree objects and prunes identical subtrees by
+    // oid, so a 200 KiB blob primitive doesn't reload 200 KiB on every fold
+    // pass (Layer 3 runs once per primitive per `effective_known` call).
+    let mut added: Vec<String> = Vec::new();
+    tree_paths_added(store, "", Some(parent_commit.tree), c.tree, &mut added)?;
+    if added.is_empty() {
+        return Ok(false);
+    }
+    let readds: HashSet<Oid> = parse_primitive_readds(&c).into_iter().collect();
+    for path in &added {
+        let Some((delete_oid, kind)) = most_recent_touch(store, parent_oid, path)? else {
+            continue;
+        };
+        if kind == TouchKind::Delete && !readds.contains(&delete_oid) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Filter `known` for the fold input (issue 0014 — Layer 3). Drops every
+/// primitive that the closure-only ghost-add predicate classifies positive.
+/// The predicate is pure over `(store, oid)`, so the filter is deterministic
+/// across nodes — fold determinism (§13.2) preserved.
+pub fn effective_known<S: Store>(store: &S, known: &[Oid]) -> CspResult<Vec<Oid>> {
+    let mut out = Vec::with_capacity(known.len());
+    for &o in known {
+        if !is_ghost_add_closure_only(store, o)? {
+            out.push(o);
+        }
+    }
+    Ok(out)
+}
+
 /// Frontier (§5.3): the known primitives that are not an ancestor of any
-/// other known primitive — computed over the *complete* DAG.
+/// other known primitive — computed over the *complete* DAG. Issue 0014:
+/// `known` is first filtered through [`effective_known`] so closure-detected
+/// ghost-add primitives never participate in the fold (their objects remain
+/// in the store for verifiable history but don't contribute to `main`).
 pub fn frontier<S: Store>(store: &S, known: &[Oid]) -> CspResult<Vec<Oid>> {
+    let known = effective_known(store, known)?;
+    let known = known.as_slice();
     let prims: Vec<Oid> = known
         .iter()
         .copied()

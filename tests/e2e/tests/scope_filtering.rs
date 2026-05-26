@@ -13,6 +13,17 @@ async fn contextignore_and_binary_and_dotcontext_excluded() {
 
     // Synced .contextignore excludes *.secret and the build/ dir.
     s.peer(a).write(".contextignore", "*.secret\nbuild/\n");
+    // Issue 0014 / commit 70a95cc: `ctx init` now seeds a markdown-only
+    // default `.contextignore` on every vault. Without deleting B's local
+    // copy, B's disk has the default while main wants A's version — same
+    // bytes as B.materialized so the §5.6 no-clobber check isn't contended,
+    // BUT the §5.1 tiebreak between same-counter primitive_a0 and
+    // primitive_b0 is decided by NodeId byte order (random). Test result
+    // then depends on which random NodeId is bytewise larger. Removing B's
+    // seeded copy forces a clean materialize of A's version: B's scan
+    // sees nothing to author for `.contextignore`, A's first primitive
+    // wins by being the sole writer of that path.
+    s.peer(b).delete(".contextignore");
 
     s.peer_mut(a).start_watch(true, &[]).await.unwrap();
     let url = format!("ws://127.0.0.1:{}", s.peer(a).port.unwrap());

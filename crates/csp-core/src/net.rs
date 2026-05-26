@@ -640,6 +640,9 @@ impl SessionVault for Vault {
     fn admit_peer(&mut self, peer_ssh: &str, enrollment_authorized: bool) -> CspResult<bool> {
         Vault::admit_peer(self, peer_ssh, enrollment_authorized)
     }
+    fn mark_bootstrap_complete(&mut self) {
+        Vault::mark_bootstrap_complete(self)
+    }
 }
 
 /// Thin tokio driver over the sans-IO [`Session`] (§6). The session owns all

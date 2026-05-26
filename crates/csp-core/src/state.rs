@@ -31,6 +31,16 @@ pub struct EngineState {
     pub materialized: BTreeMap<String, String>,
     /// name -> snapshot record (frontier primitive set + label, §8).
     pub snapshots: BTreeMap<String, Snapshot>,
+    /// Issue 0014 — Layer 2 explicit bootstrap mode. `true` on a vault
+    /// created by `ctx join` (or a state-loss recovery that reconstructs
+    /// materialized from `main`'s tree), `false` on a fresh `ctx init`.
+    /// While true, `commit_scoped` / `commit_local_changes` returns Ok(None)
+    /// — the host's edits are deferred until the §13 / [[0007]] session
+    /// handshake reports catch-up completion (clears the flag). Defaults to
+    /// false so a legacy state file loads as a fresh-init engine (the §11
+    /// "no new mandatory fields in `.context/state`" rule).
+    #[serde(default)]
+    pub bootstrap_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

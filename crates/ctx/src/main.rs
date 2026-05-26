@@ -583,6 +583,14 @@ async fn run(cli: Cli) -> Result<()> {
             v.set_name(&vault_name)?;
             v.authorize(&server_ssh)?; // trust the bootstrap source
             seed_authorized(&v, &cli.authorized_keys)?;
+            // Issue 0014 — Layer 2 explicit bootstrap mode. A `ctx clone`
+            // is the §join entry point: every host edit is blocked from
+            // authoring a primitive until the session handshake reports
+            // catch-up completion (first complete `ObjectsBatch` integrate
+            // clears the flag, see `session.rs`). Without this gate, an on-
+            // disk file present at clone time could republish a path the
+            // swarm has already deleted (the resurrection bug, [[0012]]).
+            v.mark_bootstrap_pending()?;
             // Remember where we cloned from — like git's `origin`. A bare
             // `ctx watch` in this vault then reconnects automatically.
             if !v.config.peers.iter().any(|p| p == url) {

@@ -78,6 +78,14 @@ pub trait SessionVault {
     /// authorized set with a default TTL — see `Vault::admit_peer` for
     /// the full decision table.
     fn admit_peer(&mut self, peer_ssh: &str, enrollment_authorized: bool) -> CspResult<bool>;
+
+    /// Issue 0014 — Layer 2 unblock signal. Called by the session after the
+    /// peer's complete catch-up batch has been integrated; clears the
+    /// engine's `bootstrap_pending` flag so subsequent `commit_scoped`
+    /// calls resume authoring. Default = no-op (mock vaults in tests have
+    /// no bootstrap state). Cheaper than threading a separate "bootstrap
+    /// channel" through every transport.
+    fn mark_bootstrap_complete(&mut self) {}
 }
 
 enum Phase {
@@ -356,15 +364,26 @@ impl Session {
                     }
                 }
             }
-            Msg::Objects { raws } | Msg::Live { raws } => {
-                // Single-frame catch-up (small closures) and steady-state
-                // Live both integrate atomically as today.
+            Msg::Objects { raws } => {
+                // Single-frame catch-up: closure fits in one frame. After
+                // integration, the receiver has finished catching up from
+                // this peer's response to `WantTips` → safe to clear the
+                // Layer 2 bootstrap_pending flag (issue 0014).
                 let admitted = v.integrate(&raws)?;
                 step.integrated = admitted;
+                v.mark_bootstrap_complete();
                 if admitted > 0 {
                     // Relay onward (§6.1). Idempotent + admitted-gated, so
                     // gossip terminates. (Native full node only; the driver
                     // decides whether it has peers to relay to.)
+                    step.relay = raws;
+                }
+            }
+            Msg::Live { raws } => {
+                // Steady-state Live push integrates atomically as today.
+                let admitted = v.integrate(&raws)?;
+                step.integrated = admitted;
+                if admitted > 0 {
                     step.relay = raws;
                 }
             }
@@ -379,6 +398,14 @@ impl Session {
                     let batch = std::mem::take(&mut self.pending_batch);
                     let admitted = v.integrate(&batch)?;
                     step.integrated = admitted;
+                    // Layer 2 (issue 0014): a fully-received catch-up batch
+                    // means our known-set covers the peer's frontier. Clear
+                    // bootstrap_pending so commit_scoped resumes authoring.
+                    // `is_last: true` is the spec-honest signal here — the
+                    // pre-bump SDKs that send a single `Msg::Objects` are
+                    // gated out by the §13 protocol version refusal, so
+                    // every catch-up arrives via this path on the new wire.
+                    v.mark_bootstrap_complete();
                     if admitted > 0 {
                         // Relay the full batch, not just per-chunk slices.
                         // A downstream relay peer must also integrate
