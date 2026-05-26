@@ -430,10 +430,65 @@ export class SyncController {
           this.bridge?.scheduleApplyRemoteState();
         }
         break;
+      case 'quarantined':
+        // Issue 0014 — Layer 1 ghost-add. The engine detected that a
+        // host-staged path is a ghost-add against a DAG-deleted ancestor
+        // and routed the bytes to `<vault>/.context/orphans/<utc-iso>/`.
+        // The source delete arrives separately as a normal `tree-changed`
+        // entry. Write `to` via the host fs adapter (Obsidian's vault
+        // adapter reaches `.context/` even though Obsidian's tree view
+        // hides it). Without `deps.fs` (mock-mode tests), log + drop —
+        // mocks have nothing to quarantine to.
+        void this.applyQuarantine(e.from, e.to, e.content);
+        break;
       case 'error':
         this.setState('error');
         this.deps.notice?.(`Context: ${e.message}`);
         break;
+    }
+  }
+
+  /** Issue 0014 — Layer 1 quarantine. Writes the preserved bytes to
+   * `to` (under `<vault>/.context/orphans/`) via the host adapter. Fail-
+   * closed: a write failure leaves the source delete still applied (the
+   * tree stays consistent with the swarm's view), and the bytes survive
+   * in the engine's in-memory mirror until the next persist — but the
+   * on-disk recovery copy is missed. Logged so an operator can re-run
+   * sync from a peer to restore. Idempotent: identical destination
+   * content is a no-op. */
+  private async applyQuarantine(from: string, to: string, content: string): Promise<void> {
+    const fs = this.deps.fs;
+    if (!fs) {
+      this.deps.log?.(`quarantine (no fs adapter): ${from} → ${to}; bytes lost`);
+      return;
+    }
+    try {
+      // Ensure every directory component of `to` exists. Obsidian's
+      // `mkdir` is not recursive; walk the prefix and create each
+      // missing segment. Idempotent — `mkdir` of an existing dir is a
+      // no-op via `exists` check, which avoids the platform-specific
+      // EEXIST surface.
+      const parts = to.split('/').slice(0, -1);
+      let acc = '';
+      for (const seg of parts) {
+        acc = acc ? `${acc}/${seg}` : seg;
+        if (!(await fs.exists(acc))) {
+          await fs.mkdir(acc);
+        }
+      }
+      if (await fs.exists(to)) {
+        // Idempotent: skip write if content matches.
+        const existing = await fs.read(to);
+        if (existing === content) {
+          this.deps.log?.(`quarantine (already present): ${from} → ${to}`);
+          return;
+        }
+      }
+      await fs.write(to, content);
+      this.deps.log?.(`quarantined: ${from} → ${to}`);
+    } catch (err) {
+      const msg = (err as Error)?.message ?? String(err);
+      this.deps.log?.(`quarantine FAILED ${from} → ${to}: ${msg}`);
     }
   }
 }
@@ -454,6 +509,8 @@ function eventSummary(e: VaultEvent): string {
       const n = e.changes?.length ?? 0;
       return n > 0 ? ` (${n} path${n === 1 ? '' : 's'} via fast path)` : ' (no changeset)';
     }
+    case 'quarantined':
+      return ` (${e.from} → ${e.to})`;
     case 'error':
       return `: ${e.message}`;
   }

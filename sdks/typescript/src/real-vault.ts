@@ -533,6 +533,12 @@ export class RealVault implements Vault {
     // keeps it in step with the ops it returns (issue 0009).
     const ops = JSON.parse(this.engine.materialize_staged()) as MatOp[];
     const changes: Array<{ path: string; content: string | null }> = [];
+    // Issue 0014 — quarantine events are emitted SEPARATELY from
+    // `tree-changed` because the destination lives under `.context/`
+    // (HARD INVARIANT excluded from sync scope; the host's filter would
+    // also drop it from `tree-changed`). The source path's deletion DOES
+    // ride in `changes` since it's in-scope.
+    const quarantines: Array<{ from: string; to: string; content: string }> = [];
     for (const o of ops) {
       if (o.op === 'write' && o.content && o.path) {
         const content = dec.decode(Uint8Array.from(o.content));
@@ -542,17 +548,16 @@ export class RealVault implements Vault {
         this.files.delete(o.path);
         changes.push({ path: o.path, content: null });
       } else if (o.op === 'quarantine' && o.from && o.to) {
-        // Issue 0014 — Layer 1 ghost-add quarantine. Move the in-memory
-        // file from `from` to `to` (which lives under `.context/orphans/`).
-        // The SDK's RealVault is the in-memory mirror of a host vault; the
-        // tree-changed event preserves recoverability by surfacing the move
-        // so the host can replay it on its real filesystem.
+        // Layer 1 ghost-add: move the in-memory bytes from `from` to `to`
+        // (under `.context/orphans/`). Carry the bytes through to the
+        // host via a dedicated event so it can write them somewhere the
+        // sync scope can't reach.
         const content = this.files.get(o.from);
         if (content !== undefined) {
           this.files.delete(o.from);
           this.files.set(o.to, content);
           changes.push({ path: o.from, content: null });
-          changes.push({ path: o.to, content });
+          quarantines.push({ from: o.from, to: o.to, content });
         }
       } // 'defer' → leave the user's bytes (§5.6)
     }
@@ -560,6 +565,10 @@ export class RealVault implements Vault {
     // re-scan + re-read every file on every materialize (it was an O(vault)
     // postMessage burst across the engine-worker boundary on every sync).
     if (changes.length) this.emit({ kind: 'tree-changed', changes });
+    // Issue 0014 — one event per quarantined path. The host writes
+    // `content` to `to` (under its `.context/`); the source delete in
+    // `changes` already removed the original in-scope path.
+    for (const q of quarantines) this.emit({ kind: 'quarantined', ...q });
   }
 
   private async persist(): Promise<void> {

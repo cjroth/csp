@@ -50,6 +50,19 @@ export type VaultEvent =
       kind: 'tree-changed';
       changes?: Array<{ path: string; content: string | null }>;
     }
+  /** Issue 0014 — Layer 1 ghost-add quarantine. The engine detected that
+   * a host-staged path (`from`) is a ghost-add against a DAG-deleted
+   * ancestor and produced a `MaterializeOp::Quarantine`: the path is
+   * dropped from the published tree, and the bytes must be preserved on
+   * the host at `to` (which lives under `<vault>/.context/orphans/<utc-
+   * iso>/`). `from`'s deletion rides as a normal `tree-changed` entry
+   * (`content: null`); this event carries the destination write because
+   * `.context/` is hard-excluded from the in-scope tree and would
+   * otherwise be filtered out. Hosts apply this by writing `content` to
+   * `to` via whatever storage adapter reaches `.context/` (Node `fs` on
+   * desktop, the Obsidian `vault.adapter` on mobile/desktop). Idempotent:
+   * if `to` already exists with identical content, the write is a no-op. */
+  | { kind: 'quarantined'; from: string; to: string; content: string }
   | { kind: 'error'; message: string };
 
 /**
