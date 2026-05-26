@@ -348,22 +348,17 @@ mod tests {
         Some((negated, re))
     }
 
-    fn oracle(pat: &str, text: &str) -> Option<(bool, bool)> {
-        pattern_to_regex(pat).map(|(neg, re)| {
-            (neg, regex::Regex::new(&re).map(|r| r.is_match(text)).unwrap_or(false))
-        })
-    }
-
-    fn ours(pat: &str, text: &str) -> Option<(bool, bool)> {
-        compile(pat).map(|g| (g.negated, g.is_match(text)))
-    }
-
     #[test]
     fn differential_vs_regex_oracle() {
         // Pattern + path vocabulary chosen to exercise every construct: `*`,
         // `**` (leading/mid/trailing), `?`, literals, regex-metachar
         // literals (`.`/`+`/`(`/`[`), `!` negation, anchored vs basename,
         // trailing-`/` dir, leading-`/`, `#`/blank skips, multi-segment.
+        //
+        // Perf: ~35k (pattern, path) cases. Compile the oracle regex and
+        // our matcher ONCE per pattern (~200) instead of once per case —
+        // `regex::Regex::new` dominates debug-mode runtime; this brings
+        // the test from ~60s to <2s with identical coverage.
         let frags = [
             "*", "**", "?", "a", "ab", "x.log", "*.log", "keep.log", "tmp",
             "build", "secret.txt", "a*b", "?x", "a.b+c", "a(b)", "[x]", "a\\b",
@@ -400,9 +395,14 @@ mod tests {
             for f in frags {
                 for suf in suffixes {
                     let pat = format!("{pre}{f}{suf}");
+                    // Compile both sides once per pattern.
+                    let oracle = pattern_to_regex(&pat).and_then(|(neg, re)| {
+                        regex::Regex::new(&re).ok().map(|rx| (neg, rx))
+                    });
+                    let ours = compile(&pat);
                     for path in &paths {
-                        let o = oracle(&pat, path);
-                        let m = ours(&pat, path);
+                        let o = oracle.as_ref().map(|(neg, rx)| (*neg, rx.is_match(path)));
+                        let m = ours.as_ref().map(|g| (g.negated, g.is_match(path)));
                         assert_eq!(
                             o, m,
                             "MISMATCH pattern={pat:?} path={path:?}: regex-oracle={o:?} hand-rolled={m:?}"
