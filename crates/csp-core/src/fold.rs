@@ -302,12 +302,16 @@ fn tree_paths_added<S: Store>(
 
 // Issue 0014 — Layer 3 verdict cache. Per-thread memoization of
 // `is_ghost_add_closure_only` keyed on the primitive oid. The predicate is
-// pure over `(store, oid)` and the store is monotonically growing (content-
-// addressed `put`s never invalidate prior content), so a cached verdict
-// stays correct for the life of the thread. Without this, `effective_known`
-// walks each primitive's full ancestor closure on every recompute → O(N²)
-// commit loads as the known set grows (the perf cliff the sync_regression
-// suite hit at 250-primitive catch-ups).
+// pure over `(store, oid)` for verdicts derived from a *complete* closure
+// — content-addressed `put`s never invalidate prior content, so a cached
+// proven verdict stays correct. Fail-open verdicts (`ObjectNotFound`
+// swallowed mid-walk) are NOT cached: the store grows, so a missing object
+// may arrive later and flip the verdict; a stale cached `false` would
+// silently leak a real ghost-add into the fold once the closure completes.
+// Without the cache, `effective_known` walks each primitive's full
+// ancestor closure on every recompute → O(N²) commit loads as the known
+// set grows (the perf cliff the sync_regression suite hit at 250-primitive
+// catch-ups).
 thread_local! {
     static GHOST_ADD_VERDICT: std::cell::RefCell<HashMap<Oid, bool>> =
         std::cell::RefCell::new(HashMap::new());
@@ -322,13 +326,37 @@ thread_local! {
 /// Synthetic fold commits and primitives without a (sole) parent return
 /// `false` — Layer 3 only catches actual ghost-add primitives; verification
 /// of fold commits is a separate axis (`verify_fold_commit`).
+///
+/// **Partial closures fail open.** Closure-completeness is not a protocol
+/// invariant: `Msg::Live` admits a primitive without shipping its
+/// ancestors; catch-up backfills separately. A partial-store window is
+/// legitimate (mid-catch-up peer) and a partial-store steady state is
+/// recoverable (residue from the 0.1.15 admission-ordering bug, future
+/// GC, etc.). If any closure object is missing we cannot prove ghost-add,
+/// so we keep the primitive — conservative direction matches the trust-
+/// all-peers model (better to over-include than silently de-resurrect).
+/// `ObjectNotFound` is the only error swallowed; the fail-open verdict
+/// is NOT cached so a later-arriving object can flip the verdict; every
+/// swallow logs at WARN so persistent gaps stay visible.
 pub fn is_ghost_add_closure_only<S: Store>(store: &S, prim_oid: Oid) -> CspResult<bool> {
     if let Some(hit) = GHOST_ADD_VERDICT.with(|c| c.borrow().get(&prim_oid).copied()) {
         return Ok(hit);
     }
-    let result = is_ghost_add_closure_only_uncached(store, prim_oid)?;
-    GHOST_ADD_VERDICT.with(|c| c.borrow_mut().insert(prim_oid, result));
-    Ok(result)
+    match is_ghost_add_closure_only_uncached(store, prim_oid) {
+        Ok(result) => {
+            GHOST_ADD_VERDICT.with(|c| c.borrow_mut().insert(prim_oid, result));
+            Ok(result)
+        }
+        Err(CspError::ObjectNotFound(missing)) => {
+            tracing::warn!(
+                prim = %prim_oid,
+                missing,
+                "layer 3: closure incomplete, keeping primitive (cannot prove ghost-add)"
+            );
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn is_ghost_add_closure_only_uncached<S: Store>(
@@ -1147,5 +1175,89 @@ mod tests {
             );
         }
         verify_fold_commit(&mut store, main).unwrap();
+    }
+
+    /// Regression for the post-0.1.18 production hang: 43c1a6c's Layer 3
+    /// (`effective_known` in `frontier()`) walked tree contents via
+    /// `tree_paths_added` and `path_present_in_tree` — much deeper than
+    /// the pre-existing commit-DAG-only `ancestors()` walk. The old
+    /// `frontier()` tolerated missing TREES because it only loaded
+    /// commits; the new code dives into tree objects too. Any missing
+    /// tree in a primitive's parent closure propagated `ObjectNotFound`
+    /// up through `frontier_tips()` and killed the session ~29 ms after
+    /// handshake — clients reconnected in a tight loop and never made
+    /// progress. The Railway relay hit this on every connection because
+    /// its store carries residue (the 0.1.15 admission-ordering bug
+    /// admitted primitives whose closures didn't fully land; the 0.1.16
+    /// revert fixed the code but the on-disk state survived).
+    ///
+    /// Layer 3 is a backstop, not load-bearing — closure-completeness is
+    /// not a protocol invariant (`Msg::Live` admits without shipping
+    /// ancestors). Missing closure objects must NOT crash the session;
+    /// keep the primitive, log loudly, do not cache the fail-open verdict
+    /// (so a later-arriving closure object can flip the result).
+    ///
+    /// We construct a parent commit whose `tree` oid was never put into
+    /// the store. Parent commit exists (so `ancestors()` still works),
+    /// but `tree_paths_added` blows up when it tries to load the tree.
+    /// That's the exact shape the production server hit.
+    #[test]
+    fn layer3_fails_open_when_tree_missing_from_closure() {
+        use crate::object::{write_tree_from_files, CommitObj};
+
+        let mut store = MemStore::new();
+        let m0 = genesis(&mut store).unwrap();
+        let a = seed_id(42);
+
+        // Compute (don't store) the oid of a tree the parent commit will
+        // reference. `write_tree_from_files` returns the oid even when the
+        // `put` callback drops the bytes — the missing-tree-in-store shape
+        // the production server hit.
+        let absent_tree = write_tree_from_files(
+            &map(&[("ghost.txt", b"never-stored\n")]),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert!(!store.has(absent_tree), "tree must be absent from the store");
+
+        // Build a parent commit whose `tree` is the absent oid. Sign it as
+        // a primitive (via build_primitive) so it round-trips through the
+        // store cleanly. The commit object itself is present; only its
+        // referenced tree is missing.
+        let parent_prim = build_primitive(&a, absent_tree, m0, 1, 1, "stale-parent");
+        let parent_oid = store.put(&parent_prim).unwrap();
+        // Sanity: the parent commit loads fine; only the tree underneath
+        // is gone. This is exactly the pre-existing-corruption shape.
+        match store.get(parent_oid).unwrap() {
+            GitObject::Commit(CommitObj { tree, .. }) => assert_eq!(tree, absent_tree),
+            _ => panic!("parent should be a commit"),
+        }
+
+        // Child primitive: real tree, parents = [parent_oid]. Layer 3
+        // will load `parent_oid` (ok), then call `tree_paths_added` with
+        // `parent.tree = absent_tree` → `store.get(absent_tree)` → boom.
+        let child_tree = put_tree(&mut store, &map(&[("file.txt", b"hello\n")]));
+        let child = store
+            .put(&build_primitive(&a, child_tree, parent_oid, 2, 2, "edit"))
+            .unwrap();
+
+        // Pre-patch: errored with ObjectNotFound, killed the session.
+        // Post-patch: fail-open keeps the primitive.
+        let verdict = is_ghost_add_closure_only(&store, child)
+            .expect("layer 3 must fail-open on missing tree, not propagate");
+        assert!(
+            !verdict,
+            "fail-open verdict must be 'not a ghost-add' — keep the primitive in the fold"
+        );
+
+        // The full pipeline survives: effective_known includes the
+        // primitive, frontier returns it.
+        let ek = effective_known(&store, &[child])
+            .expect("effective_known must not error on missing tree");
+        assert_eq!(ek, vec![child], "fail-open primitive must remain in effective_known");
+
+        let f = frontier(&store, &[child])
+            .expect("frontier must not error on missing tree in primitive closure");
+        assert_eq!(f, vec![child], "fail-open primitive must remain in the frontier");
     }
 }
