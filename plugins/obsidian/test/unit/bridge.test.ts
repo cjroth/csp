@@ -418,15 +418,11 @@ describe('applyOneRemoteFile — cold metadata cache race', () => {
   test('recovers from "File already exists." by writing remote content', async () => {
     await sdk.writeTextFile('note.md', 'remote-content');
     const meta = sdk.listFiles().find((m) => m.path === 'note.md');
-    let getCalls = 0;
     const modifiedWith: string[] = [];
+    const coldCacheFile = new FakeTFile('note.md');
     const stub = {
-      getFiles: () => [],
-      getAbstractFileByPath: (p: string) => {
-        if (p !== 'note.md') return null;
-        getCalls += 1;
-        return getCalls === 1 ? null : new FakeTFile('note.md');
-      },
+      getFiles: () => [coldCacheFile],
+      getAbstractFileByPath: () => null,
       read: async () => '',
       create: async () => {
         throw new Error('File already exists.');
