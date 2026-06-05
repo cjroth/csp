@@ -141,6 +141,9 @@ impl Repo {
     /// never special-cased as garbage.
     pub fn gc(&self) -> CspResult<usize> {
         use std::collections::BTreeSet;
+        // Loose-object hygiene also means clearing any stray staging temps an
+        // interrupted write left behind (ENOSPC, crash mid-`put`).
+        let _ = self.store.sweep_stale_temps();
         let mut roots = Vec::new();
         if let Some(m) = self.main() {
             roots.push(m);
