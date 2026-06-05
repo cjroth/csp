@@ -548,7 +548,7 @@ export class ObsidianVaultBridge {
       // the create path and Obsidian throws "File already exists." Recover
       // by writing into the existing file. Real failures still propagate.
       if (!/already exists/i.test(String((e as Error)?.message ?? e))) throw e;
-      const f = this.deps.vault.getAbstractFileByPath(meta.path);
+      const f = this.resolveVaultFile(meta.path);
       if (f && this.isFile(f)) {
         await this.deps.vault.modify(f, content);
       } else {
