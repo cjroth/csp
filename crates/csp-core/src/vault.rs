@@ -41,6 +41,18 @@ pub struct Vault {
     scope: Scope,
     identity: Identity,
     pub config: VaultConfig,
+    /// In-memory dirty-detection cache for the native daemon (not persisted).
+    /// Maps each in-scope file → `(mtime_ns, size)` and each *empty* in-scope
+    /// dir → a sentinel, captured at the last full reconcile. Lets the 1 s
+    /// safety reconcile skip the O(vault) content read+hash when nothing in the
+    /// working tree has changed and `main` hasn't moved. `None` until the first
+    /// reconcile after `open` — that one always does a full content scan, so a
+    /// restart never misses edits made while `watch` was down. See §5.6.
+    scan_cache: Option<BTreeMap<String, (u64, u64)>>,
+    /// `main` SHA as of the last full reconcile. A change here (remote
+    /// integration) forces a full reconcile even with no local edits, so the
+    /// ghost-add guard / re-materialize logic still runs.
+    last_reconciled_main: Option<Oid>,
 }
 
 fn now_unix() -> u64 {
@@ -172,6 +184,8 @@ impl Vault {
             scope,
             identity,
             config,
+            scan_cache: None,
+            last_reconciled_main: None,
         })
     }
 
@@ -203,6 +217,8 @@ impl Vault {
             scope,
             identity,
             config,
+            scan_cache: None,
+            last_reconciled_main: None,
         })
     }
 
@@ -236,6 +252,59 @@ impl Vault {
             }
         }
         Ok(out)
+    }
+
+    /// Cheap stat-only fingerprint of the in-scope working tree: each in-scope
+    /// file → `(mtime_ns, size)`, plus each *empty* in-scope directory tracked
+    /// as `<dir>/` (so an offline `mkdir` of an empty in-scope folder still
+    /// re-authors its `.keep`). Reads **no file contents** — this is the fast
+    /// pre-check that gates the expensive content reconcile in
+    /// [`Self::commit_local_changes`].
+    fn stat_index(&self) -> CspResult<BTreeMap<String, (u64, u64)>> {
+        let mut idx = BTreeMap::new();
+        for entry in walkdir::WalkDir::new(&self.root)
+            .into_iter()
+            .filter_entry(|e| {
+                let rel = rel_path(&self.root, e.path());
+                rel != CONTEXT_DIR && !rel.starts_with(&format!("{CONTEXT_DIR}/"))
+            })
+        {
+            let entry = entry.map_err(|e| CspError::Io(e.to_string()))?;
+            let rel = rel_path(&self.root, entry.path());
+            if entry.file_type().is_file() {
+                if !self.scope.path_in_scope(&rel) {
+                    continue;
+                }
+                let md = entry.metadata().map_err(|e| CspError::Io(e.to_string()))?;
+                let mtime = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                idx.insert(rel, (mtime, md.len()));
+            } else if entry.file_type().is_dir() && !rel.is_empty() {
+                if !self.scope.path_in_scope(&rel) {
+                    continue;
+                }
+                let empty = std::fs::read_dir(entry.path())
+                    .map(|mut r| r.next().is_none())
+                    .unwrap_or(false);
+                if empty {
+                    idx.insert(format!("{rel}/"), (0, 0));
+                }
+            }
+        }
+        Ok(idx)
+    }
+
+    /// Snapshot the working-tree fingerprint + current `main` as the baseline
+    /// the next dirty-check compares against. Called after every full
+    /// reconcile (post-materialize, so self-writes don't read as dirty).
+    fn refresh_scan_cache(&mut self) -> CspResult<()> {
+        self.scan_cache = Some(self.stat_index()?);
+        self.last_reconciled_main = self.repo.main();
+        Ok(())
     }
 
     fn write_tree(&mut self, files: &BTreeMap<String, Vec<u8>>) -> CspResult<Oid> {
@@ -295,6 +364,22 @@ impl Vault {
             return Ok(None);
         }
         self.refresh_scope();
+
+        // Cheap dirty gate (perf, not correctness). Stat the working tree — no
+        // content reads — and compare to the last full reconcile. If nothing
+        // changed locally AND `main` hasn't moved (no remote integration),
+        // there is nothing to author, so skip the O(vault) content scan. The
+        // cache is `None` until the first reconcile after `open`, so a restart
+        // (and thus any edit made while `watch` was down) always gets one full
+        // content scan and is never missed. Any detected stat change falls back
+        // to the full content reconcile below, which remains the source of
+        // truth (mtime+size is only a fast-path hint).
+        let idx = self.stat_index()?;
+        if self.scan_cache.as_ref() == Some(&idx) && self.last_reconciled_main == self.repo.main()
+        {
+            return Ok(None);
+        }
+
         let mut files = self.scan()?;
         self.inject_empty_dir_keeps(&mut files)?;
         let files = canonicalize_keeps(&files, &self.scope);
@@ -403,6 +488,9 @@ impl Vault {
                 // though we did not author a primitive.
                 self.state.save(&self.context)?;
             }
+            // Re-baseline so the next tick is a cheap no-op (quarantine moves
+            // may have changed the on-disk fingerprint).
+            self.refresh_scan_cache()?;
             return Ok(None);
         }
         let tree = self.write_tree(&filtered)?;
@@ -421,6 +509,10 @@ impl Vault {
         self.repo.set_node_tip(&self.identity.node_id(), oid)?;
         self.recompute_and_materialize()?;
         self.state.save(&self.context)?;
+        // Re-baseline AFTER materialize: the files CSP just wrote get fresh
+        // mtimes, so capturing now keeps the next tick a cheap no-op instead of
+        // re-reading them as "changed".
+        self.refresh_scan_cache()?;
         Ok(Some(oid))
     }
 
@@ -1074,6 +1166,60 @@ mod tests {
         // (self-writes are non-events by construction).
         assert!(v.commit_local_changes().unwrap().is_none());
         assert!(v.commit_local_changes().unwrap().is_none());
+    }
+
+    #[test]
+    fn unchanged_tick_is_noop_but_edit_after_is_detected() {
+        let td = tempdir().unwrap();
+        let mut v = Vault::create(td.path(), id(1), "v").unwrap();
+        std::fs::write(td.path().join("a.md"), "v1").unwrap();
+        assert!(v.commit_local_changes().unwrap().is_some());
+        // Clean ticks short-circuit via the dirty gate.
+        assert!(v.commit_local_changes().unwrap().is_none());
+        assert!(v.commit_local_changes().unwrap().is_none());
+        // A real edit after a clean state is still detected (cache invalidated).
+        std::fs::write(td.path().join("a.md"), "v2").unwrap();
+        assert!(
+            v.commit_local_changes().unwrap().is_some(),
+            "edit after a clean tick must still commit"
+        );
+    }
+
+    /// The offline-edit guarantee: a change made while `watch` was down (cache
+    /// is gone) must be caught by the forced full scan on the first reconcile
+    /// after `open`.
+    #[test]
+    fn offline_edit_detected_on_reopen() {
+        let td = tempdir().unwrap();
+        {
+            let mut v = Vault::create(td.path(), id(1), "v").unwrap();
+            std::fs::write(td.path().join("note.md"), "online").unwrap();
+            assert!(v.commit_local_changes().unwrap().is_some());
+            assert!(v.commit_local_changes().unwrap().is_none());
+        }
+        // Edit while "down", then restart (fresh Vault → scan_cache = None).
+        std::fs::write(td.path().join("note.md"), "edited-while-down").unwrap();
+        let mut v = Vault::open(td.path(), id(1)).unwrap();
+        assert!(
+            v.commit_local_changes().unwrap().is_some(),
+            "offline edit must be caught by the forced full scan on open"
+        );
+    }
+
+    /// An empty in-scope dir created after a clean state must still trip the
+    /// gate (its `.keep` has to be authored), even though it has no files.
+    #[test]
+    fn empty_in_scope_dir_trips_dirty_gate() {
+        let td = tempdir().unwrap();
+        let mut v = Vault::create(td.path(), id(1), "v").unwrap();
+        std::fs::write(td.path().join("a.md"), "x").unwrap();
+        assert!(v.commit_local_changes().unwrap().is_some());
+        assert!(v.commit_local_changes().unwrap().is_none());
+        std::fs::create_dir(td.path().join("emptydir")).unwrap();
+        assert!(
+            v.commit_local_changes().unwrap().is_some(),
+            "empty-dir creation must trip the dirty gate"
+        );
     }
 
     #[test]
