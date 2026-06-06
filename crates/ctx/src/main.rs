@@ -9,6 +9,7 @@
 
 mod cli;
 mod gitpass;
+mod health;
 mod idstore;
 mod sshagent;
 
@@ -397,7 +398,18 @@ async fn run(cli: Cli) -> Result<()> {
             let tips: Vec<String> = v.frontier_tips()?.iter().map(|o| o.to_hex()).collect();
             let known = v.known()?.len();
             let auth = v.authorized_node_ids()?.len();
+            let health = health::read(v.context_dir()).filter(|h| h.degraded);
             if *json {
+                let health_json = match &health {
+                    Some(h) => serde_json::json!({
+                        "degraded": true,
+                        "last_error": h.last_error,
+                        "since_unix": h.since_unix,
+                        "last_unix": h.last_unix,
+                        "fail_count": h.fail_count,
+                    }),
+                    None => serde_json::json!({ "degraded": false }),
+                };
                 let obj = serde_json::json!({
                     "vault_id": v.vault_id(),
                     "name": v.name(),
@@ -409,6 +421,7 @@ async fn run(cli: Cli) -> Result<()> {
                     "authorized_keys": auth,
                     "peers": v.config.peers,
                     "listen": v.config.listen,
+                    "health": health_json,
                 });
                 println!("{}", serde_json::to_string_pretty(&obj)?);
             } else {
@@ -421,6 +434,17 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("frontier {} tip(s)", tips.len());
                 println!("known    {known} primitive(s)");
                 println!("authorized {auth} key(s)");
+                if let Some(h) = &health {
+                    let secs = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                        .saturating_sub(h.since_unix);
+                    println!(
+                        "health   DEGRADED — commits failing for {}s (x{}): {}",
+                        secs, h.fail_count, h.last_error
+                    );
+                }
             }
         }
 
@@ -749,9 +773,15 @@ async fn watch_run(
     }
 
     // Establish the watcher first, then the initial reconcile picks up
-    // pre-existing edits.
-    spawn_watcher(node.clone(), root.clone(), debounce_ms);
-    node.commit_and_publish().await.ok();
+    // pre-existing edits (including anything changed while `watch` was down).
+    spawn_watcher(node.clone(), root.clone(), context_dir.clone(), debounce_ms);
+    match node.commit_and_publish().await {
+        Ok(_) => health::record_success(&context_dir),
+        Err(e) => {
+            tracing::warn!("startup reconcile failed: {e}");
+            health::record_failure(&context_dir, &e.to_string());
+        }
+    }
 
     tokio::signal::ctrl_c().await.ok();
     tracing::info!("shutting down");
@@ -761,7 +791,7 @@ async fn watch_run(
 /// Filesystem watcher with debounced auto-commit. Self-write suppression is
 /// content-hash based inside the engine; the watcher only needs to debounce
 /// and ignore the `.context/` subtree.
-fn spawn_watcher(node: Node, root: PathBuf, debounce_ms: u64) {
+fn spawn_watcher(node: Node, root: PathBuf, context_dir: PathBuf, debounce_ms: u64) {
     use notify::{RecursiveMode, Watcher};
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let root_for_filter = root.clone();
@@ -813,9 +843,19 @@ fn spawn_watcher(node: Node, root: PathBuf, debounce_ms: u64) {
                 }
             }
             match node.commit_and_publish().await {
-                Ok(Some(p)) => tracing::info!("committed {}", &p[..12]),
-                Ok(None) => {}
-                Err(e) => tracing::warn!("commit failed: {e}"),
+                Ok(Some(p)) => {
+                    tracing::info!("committed {}", &p[..12]);
+                    health::record_success(&context_dir);
+                }
+                Ok(None) => health::record_success(&context_dir),
+                Err(e) => {
+                    tracing::warn!("commit failed: {e}");
+                    // Persist a degraded marker so a *sustained* failure (e.g. a
+                    // full disk) is visible in `ctx status` instead of only a
+                    // scrolling warn — and gets cleared the moment a commit
+                    // succeeds again.
+                    health::record_failure(&context_dir, &e.to_string());
+                }
             }
         }
     });
